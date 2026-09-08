@@ -42,13 +42,11 @@ jobs:
         with:
           persist-credentials: false
 
-      - name: Configure private dependency access
+      - name: Configure private bundle source access
         uses: ./.github/actions/private-dependencies
         with:
-          sandbox-driver-key: ${{ secrets.SANDBOX_DRIVER_DEPLOY_KEY }}
-          pebble-key: ${{ secrets.PEBBLE_DEPLOY_KEY }}
-          lithos-llm-key: ${{ secrets.LITHOS_LLM_DEPLOY_KEY }}
-          # The two private Fabro bundle sources (scripts/corpus-fetch-fabro-bundles.sh).
+          # The Rust dependencies are public and need no key. These are the
+          # two private Fabro bundle sources (scripts/corpus-fetch-fabro-bundles.sh).
           # Until the owner creates these read-only deploy keys the bundle
           # fetch fails with a message naming them; it never skips a bundle.
           code-review-key: ${{ secrets.CODE_REVIEW_DEPLOY_KEY }}
@@ -203,13 +201,11 @@ jobs:
         with:
           persist-credentials: false
 
-      - name: Configure private dependency access
+      - name: Configure private bundle source access
         uses: ./.github/actions/private-dependencies
         with:
-          sandbox-driver-key: ${{ secrets.SANDBOX_DRIVER_DEPLOY_KEY }}
-          pebble-key: ${{ secrets.PEBBLE_DEPLOY_KEY }}
-          lithos-llm-key: ${{ secrets.LITHOS_LLM_DEPLOY_KEY }}
-          # The two private Fabro bundle sources (scripts/corpus-fetch-fabro-bundles.sh).
+          # The Rust dependencies are public and need no key. These are the
+          # two private Fabro bundle sources (scripts/corpus-fetch-fabro-bundles.sh).
           # Until the owner creates these read-only deploy keys the bundle
           # fetch fails with a message naming them; it never skips a bundle.
           code-review-key: ${{ secrets.CODE_REVIEW_DEPLOY_KEY }}

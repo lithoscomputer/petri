@@ -68,10 +68,10 @@ absolute_paths = "warn"
 
 [workspace.dependencies]
 # Native agent runtime, pinned with the prompt-report and session-scope APIs.
-pebble-coding-agent = { git = "ssh://git@github.com/lithoscomputer/pebble.git", rev = "a7a1302a896436aec5475ca1ba574488604d4fe3" }
+pebble-coding-agent = { git = "https://github.com/lithoscomputer/pebble.git", rev = "2593acbc0ac63122d4f92678b86809f227e38b00" }
 # The tool middleware trait Petri implements for Fabro tool hooks; the coding agent does not re-export it.
-pebble-agent = { git = "ssh://git@github.com/lithoscomputer/pebble.git", rev = "a7a1302a896436aec5475ca1ba574488604d4fe3" }
-lithos-llm = { git = "ssh://git@github.com/lithoscomputer/lithos-llm", rev = "4aab27d7d42e7f762a8b6a3871c3db86816b0721", default-features = false }
+pebble-agent = { git = "https://github.com/lithoscomputer/pebble.git", rev = "2593acbc0ac63122d4f92678b86809f227e38b00" }
+lithos-llm = { git = "https://github.com/lithoscomputer/lithos-llm", rev = "4aab27d7d42e7f762a8b6a3871c3db86816b0721", default-features = false }
 globset = "0.4"
 ir = { package = "petri-ir", path = "crates/core/ir" }
 engine = { package = "petri-engine", path = "crates/core/engine" }
@@ -81,10 +81,10 @@ executor-sandbox = { package = "petri-executor-sandbox", path = "crates/core/exe
 # revision. To develop the two together, point these at the sibling checkout
 # with a `[patch]` section in a local, untracked Cargo config, and move the pin
 # forward once the matching sandbox-driver commit is pushed.
-sandbox-driver = { git = "ssh://git@github.com/lithoscomputer/sandbox-driver.git", rev = "5b9f9dae506560f030ca4ef43d0facbe7baa99dc" }
-sandbox-driver-protocol = { git = "ssh://git@github.com/lithoscomputer/sandbox-driver.git", rev = "5b9f9dae506560f030ca4ef43d0facbe7baa99dc" }
-sandbox-driver-docker-config = { git = "ssh://git@github.com/lithoscomputer/sandbox-driver.git", rev = "5b9f9dae506560f030ca4ef43d0facbe7baa99dc" }
-sandbox-driver-daytona-config = { git = "ssh://git@github.com/lithoscomputer/sandbox-driver.git", rev = "5b9f9dae506560f030ca4ef43d0facbe7baa99dc" }
+sandbox-driver = { git = "https://github.com/lithoscomputer/sandbox-driver.git", rev = "5b9f9dae506560f030ca4ef43d0facbe7baa99dc" }
+sandbox-driver-protocol = { git = "https://github.com/lithoscomputer/sandbox-driver.git", rev = "5b9f9dae506560f030ca4ef43d0facbe7baa99dc" }
+sandbox-driver-docker-config = { git = "https://github.com/lithoscomputer/sandbox-driver.git", rev = "5b9f9dae506560f030ca4ef43d0facbe7baa99dc" }
+sandbox-driver-daytona-config = { git = "https://github.com/lithoscomputer/sandbox-driver.git", rev = "5b9f9dae506560f030ca4ef43d0facbe7baa99dc" }
 steps = { package = "petri-steps", path = "crates/core/steps" }
 driver = { package = "petri-driver", path = "crates/core/driver" }
 execution = { package = "petri-execution", path = "crates/core/execution" }

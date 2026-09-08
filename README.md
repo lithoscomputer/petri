@@ -261,7 +261,7 @@ before Petri moves its pin; then the manifests, the contract's pin table, and
 the affected evidence records move together, and the relevant Petri scenarios
 run again through the shipped binary. A library test pass never replaces a
 required Petri scenario. The current pins are in the contract's "Pinned
-revisions" table (Pebble `a7a1302a`, lithos-llm `4aab27d`, sandbox-driver
+revisions" table (Pebble `2593acbc`, lithos-llm `4aab27d`, sandbox-driver
 `5b9f9da`, twins `fedab8e`, Fabro `b648291`, the runner image
 `df708f910111`); `mise run check:pins` keeps every citation in agreement.
 The library batch the readiness work asked for landed on
@@ -321,10 +321,11 @@ been run against the hosted preview service.
 Release archives bundle the Docker, Host, and Daytona plugin executables from
 the pinned revision. Petri embeds their SHA-256 digests at release build time.
 `scripts/release-verify.sh` checks the archive, runs Host and Docker workflows
-without development mode, and verifies rejection of modified plugins. The CI,
-nightly, and release jobs use separate read-only deploy keys for sandbox-driver,
-Pebble, and lithos-llm from the `sandbox-driver-read` environment. See
-[private dependency setup](DEVELOPING.md#private-dependencies).
+without development mode, and verifies rejection of modified plugins.
+sandbox-driver, Pebble, and lithos-llm are public repositories, so Cargo
+fetches them over HTTPS with no credentials; only the two private Fabro bundle
+sources need deploy keys. See
+[dependencies and bundle sources](DEVELOPING.md#dependencies-and-bundle-sources).
 
 Fabro agent nodes can use Pebble directly as a Rust library. Set
 `backend="api"` and `model="provider/model"` on the node, or set graph

@@ -9,7 +9,6 @@ permissions: {}
 jobs:
   build:
     name: build (${{ matrix.target }})
-    environment: sandbox-driver-read
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 45
     permissions:
@@ -29,13 +28,6 @@ jobs:
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
           persist-credentials: false
-
-      - name: Configure private dependency access
-        uses: ./.github/actions/private-dependencies
-        with:
-          sandbox-driver-key: ${{ secrets.SANDBOX_DRIVER_DEPLOY_KEY }}
-          pebble-key: ${{ secrets.PEBBLE_DEPLOY_KEY }}
-          lithos-llm-key: ${{ secrets.LITHOS_LLM_DEPLOY_KEY }}
 
       - name: Install locked tools
         uses: jdx/mise-action@dad1bfd3df957f44999b559dd69dc1671cb4e9ea # v4.2.1

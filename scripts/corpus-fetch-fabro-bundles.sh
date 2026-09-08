@@ -58,7 +58,7 @@ if [ "$VERIFY_ONLY" -eq 0 ]; then
         echo "  access: $access"
         if [ "$visibility" = private ]; then
           echo "  In CI, pass the matching *-key input of .github/actions/private-dependencies from"
-          echo "  the repository secret named above (DEVELOPING.md, \"Private dependencies\")."
+          echo "  the repository secret named above (DEVELOPING.md, \"Dependencies and bundle sources\")."
           echo "  Locally, use an SSH agent with read access, or set $env_name to a checkout."
         fi
         echo "  The bundle set is required: no bundle is skipped."

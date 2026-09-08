@@ -25,36 +25,35 @@ scripts/corpus-fetch-actions.sh
 The corpus uses the commits in `crates/github/corpus-pins.txt`. Do not use
 `--repin` during a routine fetch.
 
-## Private dependencies
+## Dependencies and bundle sources
 
-The workspace pins sandbox-driver, Pebble, and lithos-llm by Git revision.
-Local Cargo builds use your Git SSH credentials. Each account needs read access
-to all three repositories. Use a local, untracked Cargo `[patch]` config when
-working across sibling checkouts; commit a pushed revision in `Cargo.toml` and
-regenerate `Cargo.lock` before sharing the integration.
+The workspace pins sandbox-driver, Pebble, lithos-llm, and the twins by Git
+revision. All four repositories are public, so Cargo fetches them over HTTPS
+with no credentials, locally and in CI. Use a local, untracked Cargo `[patch]`
+config when working across sibling checkouts; commit a pushed revision in
+`Cargo.toml` and regenerate `Cargo.lock` before sharing the integration.
 
-CI, nightly, and release workflows use `.github/actions/private-dependencies`.
-The `sandbox-driver-read` GitHub environment must contain these secrets:
+Two Fabro black box bundle sources are not public. CI and nightly workflows
+use `.github/actions/private-dependencies` to reach them. The
+`sandbox-driver-read` GitHub environment holds these secrets:
 
-- `SANDBOX_DRIVER_DEPLOY_KEY`: read-only deploy key on `lithoscomputer/sandbox-driver`.
-- `PEBBLE_DEPLOY_KEY`: read-only deploy key on `lithoscomputer/pebble`.
-- `LITHOS_LLM_DEPLOY_KEY`: read-only deploy key on `lithoscomputer/lithos-llm`.
-- `CODE_REVIEW_DEPLOY_KEY`: read-only deploy key on `lithoscomputer/code-review`,
-  a Fabro black box bundle source.
+- `CODE_REVIEW_DEPLOY_KEY`: read-only deploy key on `lithoscomputer/code-review`.
 - `FACTORY_DEPLOY_KEY`: read-only deploy key on `veniceai/factory`, the
   `fix-ci` bundle source.
 
-The last two do not exist yet. Owner action: create one read-only deploy key
-pair per repository (`ssh-keygen -t ed25519 -N '' -f code-review` and the
-same for `factory`), add each public key as a read-only deploy key on its
-repository, and add each private key as the named secret in the
-`sandbox-driver-read` environment. Until then the "Fetch and verify the Fabro
-bundles" step fails with a message naming the key; it never skips a bundle.
-The twins (`lithoscomputer/twins`) are public and need no key.
+Neither exists yet. Owner action: create one read-only deploy key pair per
+repository (`ssh-keygen -t ed25519 -N '' -f code-review` and the same for
+`factory`), add each public key as a read-only deploy key on its repository,
+and add each private key as the named secret in the `sandbox-driver-read`
+environment. Until then the "Fetch and verify the Fabro bundles" step fails
+with a message naming the key; it never skips a bundle. The environment keeps
+its historical name; the `SANDBOX_DRIVER_DEPLOY_KEY` secret it still holds is
+no longer read and can be deleted.
 
 Use a different key pair for each repository. The action selects each key with
 an SSH host alias and checks GitHub's pinned host key. Each workflow removes
-the temporary credentials when its job finishes.
+the temporary credentials when its job finishes. The release workflow fetches
+no bundles and uses neither the action nor the environment.
 
 Native Pebble tests use a scripted model and real execution scopes. They need
 no provider credentials. `crates/fabro/steps/tests/pebble.rs` covers tool

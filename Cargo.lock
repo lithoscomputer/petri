@@ -541,7 +541,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "39cab71617ae0d63f51a36d69f866391735b51691dbda63cf6f96d042b63efeb"
 dependencies = [
  "libc",
- "windows-sys 0.52.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -1223,7 +1223,7 @@ checksum = "47d9d19d1d6efa0109d2f65ff4c85cddd50bd572e5a00127ab10987290bcefae"
 [[package]]
 name = "lithos-llm"
 version = "0.1.0"
-source = "git+ssh://git@github.com/lithoscomputer/lithos-llm?rev=4aab27d7d42e7f762a8b6a3871c3db86816b0721#4aab27d7d42e7f762a8b6a3871c3db86816b0721"
+source = "git+https://github.com/lithoscomputer/lithos-llm?rev=4aab27d7d42e7f762a8b6a3871c3db86816b0721#4aab27d7d42e7f762a8b6a3871c3db86816b0721"
 dependencies = [
  "async-trait",
  "futures-core",
@@ -1473,7 +1473,7 @@ dependencies = [
 [[package]]
 name = "pebble-agent"
 version = "0.1.0"
-source = "git+ssh://git@github.com/lithoscomputer/pebble.git?rev=a7a1302a896436aec5475ca1ba574488604d4fe3#a7a1302a896436aec5475ca1ba574488604d4fe3"
+source = "git+https://github.com/lithoscomputer/pebble.git?rev=2593acbc0ac63122d4f92678b86809f227e38b00#2593acbc0ac63122d4f92678b86809f227e38b00"
 dependencies = [
  "async-trait",
  "futures-util",
@@ -1490,7 +1490,7 @@ dependencies = [
 [[package]]
 name = "pebble-coding-agent"
 version = "0.1.0"
-source = "git+ssh://git@github.com/lithoscomputer/pebble.git?rev=a7a1302a896436aec5475ca1ba574488604d4fe3#a7a1302a896436aec5475ca1ba574488604d4fe3"
+source = "git+https://github.com/lithoscomputer/pebble.git?rev=2593acbc0ac63122d4f92678b86809f227e38b00#2593acbc0ac63122d4f92678b86809f227e38b00"
 dependencies = [
  "async-trait",
  "futures-util",
@@ -2034,7 +2034,7 @@ dependencies = [
  "once_cell",
  "socket2",
  "tracing",
- "windows-sys 0.52.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -2297,7 +2297,7 @@ dependencies = [
  "errno",
  "libc",
  "linux-raw-sys",
- "windows-sys 0.52.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -2354,7 +2354,7 @@ dependencies = [
  "security-framework",
  "security-framework-sys",
  "webpki-root-certs",
- "windows-sys 0.52.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -2411,7 +2411,7 @@ dependencies = [
 [[package]]
 name = "sandbox-driver"
 version = "0.1.0"
-source = "git+ssh://git@github.com/lithoscomputer/sandbox-driver.git?rev=5b9f9dae506560f030ca4ef43d0facbe7baa99dc#5b9f9dae506560f030ca4ef43d0facbe7baa99dc"
+source = "git+https://github.com/lithoscomputer/sandbox-driver.git?rev=5b9f9dae506560f030ca4ef43d0facbe7baa99dc#5b9f9dae506560f030ca4ef43d0facbe7baa99dc"
 dependencies = [
  "async-trait",
  "globset",
@@ -2427,7 +2427,7 @@ dependencies = [
 [[package]]
 name = "sandbox-driver-daytona-config"
 version = "0.1.0"
-source = "git+ssh://git@github.com/lithoscomputer/sandbox-driver.git?rev=5b9f9dae506560f030ca4ef43d0facbe7baa99dc#5b9f9dae506560f030ca4ef43d0facbe7baa99dc"
+source = "git+https://github.com/lithoscomputer/sandbox-driver.git?rev=5b9f9dae506560f030ca4ef43d0facbe7baa99dc#5b9f9dae506560f030ca4ef43d0facbe7baa99dc"
 dependencies = [
  "sandbox-driver-docker-config",
  "serde",
@@ -2437,7 +2437,7 @@ dependencies = [
 [[package]]
 name = "sandbox-driver-docker-config"
 version = "0.1.0"
-source = "git+ssh://git@github.com/lithoscomputer/sandbox-driver.git?rev=5b9f9dae506560f030ca4ef43d0facbe7baa99dc#5b9f9dae506560f030ca4ef43d0facbe7baa99dc"
+source = "git+https://github.com/lithoscomputer/sandbox-driver.git?rev=5b9f9dae506560f030ca4ef43d0facbe7baa99dc#5b9f9dae506560f030ca4ef43d0facbe7baa99dc"
 dependencies = [
  "serde",
  "serde_json",
@@ -2446,7 +2446,7 @@ dependencies = [
 [[package]]
 name = "sandbox-driver-protocol"
 version = "0.1.0"
-source = "git+ssh://git@github.com/lithoscomputer/sandbox-driver.git?rev=5b9f9dae506560f030ca4ef43d0facbe7baa99dc#5b9f9dae506560f030ca4ef43d0facbe7baa99dc"
+source = "git+https://github.com/lithoscomputer/sandbox-driver.git?rev=5b9f9dae506560f030ca4ef43d0facbe7baa99dc#5b9f9dae506560f030ca4ef43d0facbe7baa99dc"
 dependencies = [
  "async-trait",
  "base64",
@@ -2770,10 +2770,10 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "32497e9a4c7b38532efcdebeef879707aa9f794296a4f0244f6f69e9bc8574bd"
 dependencies = [
  "fastrand",
- "getrandom 0.3.4",
+ "getrandom 0.4.3",
  "once_cell",
  "rustix",
- "windows-sys 0.52.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -3363,7 +3363,7 @@ version = "0.1.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c2a7b1c03c876122aa43f3020e6c3c3ee5c05081c9a00739faf7503aeba10d22"
 dependencies = [
- "windows-sys 0.52.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]

@@ -1,19 +1,20 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Each GitHub deploy key belongs to one repository. SSH aliases ensure Git
-# offers the correct key, even when several keys authenticate to github.com.
-: "${SANDBOX_DRIVER_DEPLOY_KEY:?SANDBOX_DRIVER_DEPLOY_KEY is required}"
-: "${PEBBLE_DEPLOY_KEY:?PEBBLE_DEPLOY_KEY is required}"
-: "${LITHOS_LLM_DEPLOY_KEY:?LITHOS_LLM_DEPLOY_KEY is required}"
+# The Rust dependencies (sandbox-driver, Pebble, lithos-llm, the twins) are
+# public and resolve over HTTPS with no credentials. Only the two private
+# Fabro black box bundle sources (scripts/corpus-fetch-fabro-bundles.sh) need
+# a key. Each GitHub deploy key belongs to one repository, so an SSH alias
+# per repository ensures Git offers the correct key.
 : "${RUNNER_TEMP:?RUNNER_TEMP is required}"
 : "${ACTION_PATH:?ACTION_PATH is required}"
+if [ -z "${CODE_REVIEW_DEPLOY_KEY:-}" ] && [ -z "${FACTORY_DEPLOY_KEY:-}" ]; then
+  echo "No bundle source deploy keys are configured; the bundle fetch will name the missing key."
+  exit 0
+fi
 umask 077
 credentials="$RUNNER_TEMP/petri-dependencies"
 mkdir -p "$credentials"
-printf '%s\n' "$SANDBOX_DRIVER_DEPLOY_KEY" > "$credentials/sandbox-driver"
-printf '%s\n' "$PEBBLE_DEPLOY_KEY" > "$credentials/pebble"
-printf '%s\n' "$LITHOS_LLM_DEPLOY_KEY" > "$credentials/lithos-llm"
 : > "$credentials/ssh_config"
 configure() {
   local owner="$1" repository="$2"
@@ -31,11 +32,6 @@ CONFIG
   git config --global "url.ssh://git@petri-$repository/$owner/$repository.insteadOf" \
     "ssh://git@github.com/$owner/$repository"
 }
-for repository in sandbox-driver pebble lithos-llm; do
-  configure lithoscomputer "$repository"
-done
-# The Fabro black box bundle sources (scripts/corpus-fetch-fabro-bundles.sh).
-# Optional: a job that does not fetch bundles leaves these keys empty.
 if [ -n "${CODE_REVIEW_DEPLOY_KEY:-}" ]; then
   printf '%s\n' "$CODE_REVIEW_DEPLOY_KEY" > "$credentials/code-review"
   configure lithoscomputer code-review
