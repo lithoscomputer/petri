@@ -68,9 +68,9 @@ absolute_paths = "warn"
 
 [workspace.dependencies]
 # Native agent runtime, pinned with the prompt-report and session-scope APIs.
-pebble-coding-agent = { git = "https://github.com/lithoscomputer/pebble.git", rev = "2593acbc0ac63122d4f92678b86809f227e38b00" }
+pebble-coding-agent = { git = "https://github.com/lithoscomputer/pebble.git", rev = "408638fe982ace5b570e04ba808be3a32d4001f7" }
 # The tool middleware trait Petri implements for Fabro tool hooks; the coding agent does not re-export it.
-pebble-agent = { git = "https://github.com/lithoscomputer/pebble.git", rev = "2593acbc0ac63122d4f92678b86809f227e38b00" }
+pebble-agent = { git = "https://github.com/lithoscomputer/pebble.git", rev = "408638fe982ace5b570e04ba808be3a32d4001f7" }
 lithos-llm = { git = "https://github.com/lithoscomputer/lithos-llm", rev = "4aab27d7d42e7f762a8b6a3871c3db86816b0721", default-features = false }
 globset = "0.4"
 ir = { package = "petri-ir", path = "crates/core/ir" }
