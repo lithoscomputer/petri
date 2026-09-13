@@ -25,7 +25,8 @@ the Pebble revision Petri pins (`6996942`), with Pebble's events as the
 agent contract and Pebble's `SessionProjection` as its stage view, so the
 differential matrix compares like with like. The corpus holds 46 workflows
 (`.fabro` files under `.fabro/` and `docs/`, `.dot` files under
-`test/attractor/`) at both revisions, the same set; every one lowers.
+`test/attractor/`) at both revisions, the same set, with the same lowering
+results (`crates/fabro/corpus/REPORT.md`).
 
 Rules:
 
