@@ -1,9 +1,0 @@
-id = "subagent-mcp-tools"
-title = "A sub-agent inherits the workflow's MCP tools"
-scenarios = ["*"]
-bundles = ["*"]
-fabro = "A child session has no MCP tools."
-petri = "A child inherits `[run.agent.mcps]` tools through the parent's connection."
-user_visible_effect = "A child can call an MCP tool on Petri."
-reason = "Readiness items 9b and 9d ask for inherited tools."
-acceptance = "A scenario where a child calls an MCP tool has more tool effects on Petri; scoped `count` differences must be listed here when such a scenario lands."

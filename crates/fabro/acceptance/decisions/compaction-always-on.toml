@@ -1,9 +1,0 @@
-id = "compaction-always-on"
-title = "Context compaction is always on with Fabro's values"
-scenarios = ["*"]
-bundles = ["*"]
-fabro = "Identical values (80 percent trigger, six preserved turns), self-contained in `fabro-agent`."
-petri = "Pebble's automatic compaction with the same values; Petri never rewrites the history."
-user_visible_effect = "The same trigger; the summary text differs by agent library."
-reason = "Task 16."
-acceptance = "Request sequences around a compaction boundary use engine-specific matchers (`request`, scoped to compaction scenarios)."

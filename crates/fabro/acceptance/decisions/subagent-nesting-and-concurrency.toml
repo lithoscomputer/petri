@@ -1,9 +1,0 @@
-id = "subagent-nesting-and-concurrency"
-title = "Sub-agent nesting and concurrency follow Pebble"
-scenarios = ["*"]
-bundles = ["*"]
-fabro = "One level only; no bound on concurrent children."
-petri = "A child may delegate again; one tree holds at most 4 open sessions."
-user_visible_effect = "Deeper delegation works on Petri; a fifth concurrent child is refused."
-reason = "Task 15; Pebble's supervisor."
-acceptance = "Request sequences from children use engine-specific matchers, scoped to sub-agent scenarios."

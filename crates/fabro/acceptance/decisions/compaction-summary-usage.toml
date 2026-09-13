@@ -1,9 +1,0 @@
-id = "compaction-summary-usage"
-title = "Compaction summary usage is reported separately"
-scenarios = ["*"]
-bundles = ["*"]
-fabro = "The summary usage is dropped (`compact_context` discards `response.usage`)."
-petri = "Pebble bills the summary call to the prompt that compacted, so `pebble.usage` and `pebble.cost_usd_micros` include it; a `fabro.compaction` event and the `pebble.compaction_*` metrics break out the same share, read from Pebble's history."
-user_visible_effect = "Petri reports more usage than Fabro for the same run."
-reason = "A summary call is a model call the run paid for, so Petri reports it. Fabro drops it."
-acceptance = "Usage is not compared; the request count at the twin is."
