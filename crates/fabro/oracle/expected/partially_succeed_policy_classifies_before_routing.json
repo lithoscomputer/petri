@@ -1,6 +1,6 @@
 {
   "schema_version": 2,
-  "fabro_commit": "b6482910e517d00dfc3c4a2f2d3e417c9348f7f6",
+  "fabro_commit": "05ebd0fd1beec214b558f4b478e36bd08b507dc7",
   "harness": {
     "source": "fabro binary through the CLI and server API; see crates/fabro/oracle/harness/",
     "realization": {
