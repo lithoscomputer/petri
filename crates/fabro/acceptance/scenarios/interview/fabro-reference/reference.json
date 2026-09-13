@@ -2,9 +2,9 @@
   "schema_version": 1,
   "scenario": "interview",
   "fabro_repository": "https://github.com/fabro-sh/fabro",
-  "fabro_revision": "b6482910e517d00dfc3c4a2f2d3e417c9348f7f6",
-  "fabro_version": "fabro 0.347.0-nightly.0 (b648291 2026-09-08 debug)",
-  "captured_on": "2026-09-08",
+  "fabro_revision": "05ebd0fd1beec214b558f4b478e36bd08b507dc7",
+  "fabro_version": "fabro 0.355.0-nightly.0 (05ebd0f 2026-09-13 debug)",
+  "captured_on": "2026-09-13",
   "captured_by": "crates/petri/cli/tests/fabro_differential.rs through tests/support/fabro/fabro_adapter.rs",
   "bundle_digest": "0000ae314d6a9b17515708d54321069d60c97485b0723fc1ebe19ebe1d4f6c06",
   "twins": [

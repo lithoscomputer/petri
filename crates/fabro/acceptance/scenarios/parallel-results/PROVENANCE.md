@@ -54,11 +54,11 @@ Inputs: `helper` (absolute path to `helper/code_review.py`), `level` (`high`),
 | Field | Value |
 | --- | --- |
 | Fabro repository | `https://github.com/fabro-sh/fabro` |
-| Revision | `b6482910e517d00dfc3c4a2f2d3e417c9348f7f6` (the compatibility target) |
-| Where it was fetched from | `refs/pull/844/head`; on 2026-09-06 the commit was also an ancestor of `origin/main` (`2f326a1`, 0.348.0-nightly.0) |
-| Build | `cargo build --locked -p fabro-cli` in a confined clone; version string `fabro 0.347.0-nightly.0 (b648291 2026-09-06 debug)` |
-| PATH `fabro` | not used (`/opt/homebrew/bin/fabro` is `0.339.0-nightly.1 (775b62b)`) |
-| Capture date | 2026-09-06 |
+| Revision | `05ebd0fd1beec214b558f4b478e36bd08b507dc7` (the compatibility target, `crates/fabro/corpus-pin.txt`) |
+| Where it was fetched from | `main` (the merge of fabro-sh/fabro#867, 2026-09-13); `scripts/corpus-fetch-fabro.sh` fetches it at the pin |
+| Build | `cargo build --locked -p fabro-cli` from the fetched corpus checkout through `scripts/fabro-provision.sh`; version string `fabro 0.355.0-nightly.0 (05ebd0f 2026-09-13 debug)` |
+| PATH `fabro` | not used |
+| Capture date | 2026-09-13 (first captured 2026-09-06 at `b6482910`, before Fabro moved onto Pebble; the re-capture at this revision produced the same branch envelopes, stage order, report and final context) |
 | Capture script | `fabro-reference/capture.sh` |
 
 Files:
@@ -71,8 +71,10 @@ Files:
 - `raw/report.md`: the helper's report as printed by the `report` node.
 - `raw/run-stderr.txt`, `raw/run.log`: the CLI progress and the worker log.
 - `raw/probe-parallel_results.json`, `raw/probe-inspect-stdout.txt`: the same
-  capture for the original `probe.fabro` from
-  `.ai/reviews/fabro-readiness-2026-09-06` (branches `a` and `b`).
+  capture for a two-branch probe graph (a `component` node fanning out to
+  static command branches `a` and `b`, each writing `output.finder.finding`),
+  a reconstruction of the original `probe.fabro` from
+  `.ai/reviews/fabro-readiness-2026-09-06`.
 - `normalized.json`: the branch envelopes, stage order, report, and final
   context with run ids, blob references, and paths replaced by placeholders.
 

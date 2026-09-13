@@ -1,27 +1,27 @@
-    Run: 01M1VSCQ1K6XFYA967BEHRRQZP
-    Sandbox: local (ready in 4ms)
+    Run: 01M2DNG4F0Z25X44QZTXJGRGPQ
+    Sandbox: local (ready in 112ms)
     ✓ start  0ms
-    ✓ setup  31ms
-    ✓ prepare  69ms
-    ✓ scope  5ms
-    ✓ merge_scope  40ms
-        ✓ finder_a  5ms
-        ✓ finder_b  6ms
-    ✓ Finders  7ms
+    ✓ setup  70ms
+    ✓ prepare  112ms
+    ✓ scope  36ms
+    ✓ merge_scope  72ms
+        ✓ finder_b  35ms
+        ✓ finder_a  35ms
+    ✓ Finders  35ms
     ✓ Gather finder candidates  0ms
-    ✓ merge_find  41ms
+    ✓ merge_find  69ms
     ✓ Any candidates to verify?  0ms
-        ✓ verifier_a  5ms
-        ✓ verifier_b  9ms
-    ✓ Verify locations  11ms
-    ✓ Gather verdicts  1ms
-    ✓ merge_verify  42ms
-    ✓ tally  42ms
-    ✓ finalize  42ms
-    ✓ report  7ms
+        ✓ verifier_b  36ms
+        ✓ verifier_a  37ms
+    ✓ Verify locations  38ms
+    ✓ Gather verdicts  0ms
+    ✓ merge_verify  72ms
+    ✓ tally  70ms
+    ✓ finalize  73ms
+    ✓ report  35ms
     ✓ exit  0ms
 
 === Run Result ===
-Run:       01M1VSCQ1K6XFYA967BEHRRQZP
+Run:       01M2DNG4F0Z25X44QZTXJGRGPQ
 Status:    SUCCEEDED
-Duration:  0 seconds
+Duration:  1 second

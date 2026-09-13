@@ -1,11 +1,11 @@
 {
   "provenance": {
     "fabro_repository": "https://github.com/fabro-sh/fabro",
-    "fabro_revision": "b6482910e517d00dfc3c4a2f2d3e417c9348f7f6",
-    "fabro_revision_ref": "refs/pull/844/head (also on origin/main as of 2026-09-06)",
-    "fabro_version_string": "fabro 0.347.0-nightly.0 (b648291 2026-09-06 debug)",
-    "built_with": "cargo build --locked -p fabro-cli (debug profile) from a confined clone; PATH's fabro was never used",
-    "captured_on": "2026-09-06",
+    "fabro_revision": "05ebd0fd1beec214b558f4b478e36bd08b507dc7",
+    "fabro_revision_ref": "main (the merge of fabro-sh/fabro#867, 2026-09-13)",
+    "fabro_version_string": "fabro 0.355.0-nightly.0 (05ebd0f 2026-09-13 debug)",
+    "built_with": "cargo build --locked -p fabro-cli (debug profile) from the fetched corpus checkout through scripts/fabro-provision.sh; PATH's fabro was never used",
+    "captured_on": "2026-09-13",
     "capture_script": "capture.sh (this directory)",
     "commands": [
       "fabro server start --foreground --no-web --bind 127.0.0.1:<port>  (HOME=<private dir>, FABRO_DEV_TOKEN, SESSION_SECRET set; settings.toml has [server.auth] methods=[\"dev-token\"])",
@@ -52,28 +52,28 @@
       "branches": [
         {
           "event": "parallel.branch.started",
-          "branch": "finder_b",
-          "parallel_branch_id": "find@1:1",
-          "index": 1
-        },
-        {
-          "event": "parallel.branch.started",
           "branch": "finder_a",
           "parallel_branch_id": "find@1:0",
           "index": 0
         },
         {
-          "event": "parallel.branch.completed",
-          "branch": "finder_a",
-          "parallel_branch_id": "find@1:0",
-          "index": 0,
-          "status": "succeeded"
+          "event": "parallel.branch.started",
+          "branch": "finder_b",
+          "parallel_branch_id": "find@1:1",
+          "index": 1
         },
         {
           "event": "parallel.branch.completed",
           "branch": "finder_b",
           "parallel_branch_id": "find@1:1",
           "index": 1,
+          "status": "succeeded"
+        },
+        {
+          "event": "parallel.branch.completed",
+          "branch": "finder_a",
+          "parallel_branch_id": "find@1:0",
+          "index": 0,
           "status": "succeeded"
         }
       ],
@@ -171,28 +171,28 @@
       "branches": [
         {
           "event": "parallel.branch.started",
-          "branch": "verifier_b",
-          "parallel_branch_id": "verify@1:1",
-          "index": 1
-        },
-        {
-          "event": "parallel.branch.started",
           "branch": "verifier_a",
           "parallel_branch_id": "verify@1:0",
           "index": 0
         },
         {
-          "event": "parallel.branch.completed",
-          "branch": "verifier_a",
-          "parallel_branch_id": "verify@1:0",
-          "index": 0,
-          "status": "succeeded"
+          "event": "parallel.branch.started",
+          "branch": "verifier_b",
+          "parallel_branch_id": "verify@1:1",
+          "index": 1
         },
         {
           "event": "parallel.branch.completed",
           "branch": "verifier_b",
           "parallel_branch_id": "verify@1:1",
           "index": 1,
+          "status": "succeeded"
+        },
+        {
+          "event": "parallel.branch.completed",
+          "branch": "verifier_a",
+          "parallel_branch_id": "verify@1:0",
+          "index": 0,
           "status": "succeeded"
         }
       ],
@@ -280,7 +280,7 @@
       "branch_count_context": 2
     }
   ],
-  "report_md": "# Code review (high)\n\nTarget: review-fixture\nDiff command: git diff main...HEAD\n\nSynthesis step was skipped or its decisions were unusable — returning verified findings ranked, unmerged.\n\n## Findings (2)\n\n### 1. src/pager.py:12 (CONFIRMED)\n\npage_count drops the final partial page\n\nFailure scenario: 7 items with page size 3 reports 2 pages, so item 7 is unreachable\n\n### 2. src/render.py:40 (PLAUSIBLE)\n\nrender escapes the title twice\n\nFailure scenario: a title containing & renders as &amp;amp;\n\n## Refuted candidates (0)\n\n\n## Stats\n\n- candidates: 2\n- finders: 4\n- level: high\n- refuted: 0\n- reported: 2\n- verified: 2\n- verifierAgents: 2\n",
+  "report_md": "# Code review (high)\n\nTarget: review-fixture\nDiff command: git diff main...HEAD\n\nSynthesis step was skipped or its decisions were unusable \u2014 returning verified findings ranked, unmerged.\n\n## Findings (2)\n\n### 1. src/pager.py:12 (CONFIRMED)\n\npage_count drops the final partial page\n\nFailure scenario: 7 items with page size 3 reports 2 pages, so item 7 is unreachable\n\n### 2. src/render.py:40 (PLAUSIBLE)\n\nrender escapes the title twice\n\nFailure scenario: a title containing & renders as &amp;amp;\n\n## Refuted candidates (0)\n\n\n## Stats\n\n- candidates: 2\n- finders: 4\n- level: high\n- refuted: 0\n- reported: 2\n- verified: 2\n- verifierAgents: 2\n",
   "final_context": {
     "candidate_count": 2,
     "command.output": "<BLOB_REF>",
@@ -375,7 +375,7 @@
     ]
   },
   "original_probe": {
-    "workflow": "probe.fabro from .ai/reviews/fabro-readiness-2026-09-06 (branches a, b write output.finder.finding)",
+    "workflow": "probe.fabro: a `component` node fanning out to two static command branches `a` and `b`, each writing output.finder.finding (a reconstruction of the 2026-09-06 review probe, run through capture.sh at this revision)",
     "parallel_results": [
       {
         "id": "a",
