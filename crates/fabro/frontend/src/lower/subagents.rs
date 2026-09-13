@@ -3,11 +3,12 @@
 //! The pinned Fabro gives every API-backend agent the sub-agent tools
 //! (`spawn_agent`, `send_input`, `wait`, `close_agent`) and has no setting
 //! that turns them on or off: `[run.agent]` has no such key and its parser
-//! refuses one, and no node attribute exists either. The only knob is a
-//! Rust-level default (`max_subagent_depth = 1`) no caller changes. Petri
-//! keeps the same shape: every `fabro/agent` node carries this configuration
-//! with the reference defaults, the `subagents` key stays refused, and what
-//! Petri decides is the bound Pebble's agent tree runs under.
+//! refuses one, and no node attribute exists either. It hands Pebble
+//! `SubagentOptions::enabled()` with Pebble's defaults (no depth limit, four
+//! open sessions per tree). Petri keeps the same shape: every `fabro/agent`
+//! node carries this configuration with those defaults, the `subagents` key
+//! stays refused, and what Petri decides is the bound Pebble's agent tree
+//! runs under.
 //!
 //! An ACP agent owns its own tools, so the configuration reaches native
 //! (`backend="api"`) sessions only, as in Fabro.

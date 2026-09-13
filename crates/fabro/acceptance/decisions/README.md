@@ -53,6 +53,7 @@ Rules:
   record's failed assertion as expected and names the record in its note.
   A failed Fabro assertion no record lists fails the cell. A record may
   also let the comparison name the resulting artifact or request
-  difference (example: `fallback-repeated-tool-effect`).
+  difference (the retired `fallback-repeated-tool-effect` record did, while
+  the reference at `b648291` repeated a tool effect on failover).
 - Neither test execution nor a baseline refresh changes a record. A new
   difference needs a new record in the same change that introduces it.

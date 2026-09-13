@@ -1066,9 +1066,10 @@ async fn fallback_failover_matches_the_pinned_fabro() {
         expect:      expect_fallback_failover,
         home_skills: None,
         probe:       None,
-        // The pinned Fabro re-runs the prompt from scratch on the fallback
-        // route and repeats the append (decision
-        // `fallback-repeated-tool-effect`); Petri must not.
+        // Both engines run the failover in Pebble and keep the session, so
+        // the append runs once on each; the reference before `05ebd0f`
+        // re-ran the prompt from scratch and repeated it (the retired
+        // `fallback-repeated-tool-effect` record).
     })
     .await;
 }

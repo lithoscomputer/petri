@@ -7,12 +7,13 @@
 //! and every route fact is Pebble's own event (`SessionStarted`,
 //! `RouteFailover`, `RouteFailoverStopped`, `AssistantMessage`).
 //!
-//! The expected request sequences are derived from the pinned Fabro's
-//! source (`handler/llm/api.rs` at `b6482910`: `fallback_plan`,
-//! `failover_agent_session`, `complete_one_shot_request`); the reference
-//! binary was not run against the twins. Where Petri keeps the conversation
-//! across a model change (Fabro rebuilds the session from the original
-//! prompt), the case says so.
+//! The expected request sequences were derived from the Fabro source at
+//! `b6482910` (`handler/llm/api.rs`: `fallback_plan`,
+//! `failover_agent_session`, `complete_one_shot_request`), the pin at the
+//! time; the reference binary was not run against the twins. Since
+//! `05ebd0f` Fabro runs its failover in Pebble (`handler/llm/pebble.rs`,
+//! `fallback.rs`) and keeps the conversation across a model change as Petri
+//! does; the differential `fallback-failover` cell compares the two live.
 
 mod support;
 
@@ -455,9 +456,9 @@ async fn chain_exhaustion_fails_the_stage_with_the_last_error() {
 /// A provider interruption after a non-idempotent tool effect: the primary
 /// asks for an append, the append runs, the primary's next request fails,
 /// and the fallback continues from the tool result. The append happens once
-/// and the next model sees its output. Fabro rebuilds the session from the
-/// original prompt here, which would run the tool again; Petri keeps the
-/// conversation.
+/// and the next model sees its output. Petri keeps the conversation, as the
+/// reference Fabro does since `05ebd0f` (before that it rebuilt the session
+/// from the original prompt, which ran the tool again).
 #[tokio::test]
 async fn a_tool_effect_is_not_repeated_across_a_failover() {
     let mut case = Case::new("fallback-tool-effect");

@@ -859,9 +859,10 @@ itself), the prompt is asked again on the new route (`replay_prompt`). When
 work happened first (the conversation holds tool results or an assistant
 turn this prompt committed), the next model continues that unfinished turn
 with no new input (`continue_turn`): it answers the committed tool results as
-they stand, and the tool that ran is not run again. Fabro rebuilds the
-session from the original prompt on every failover, which would repeat the
-tool; this is an accepted difference. A prompt node re-sends its
+they stand, and the tool that ran is not run again. The reference Fabro
+(`05ebd0f`) runs its failover in Pebble the same way, so both engines run
+the tool once; the reference before it rebuilt the session from the
+original prompt and repeated the tool. A prompt node re-sends its
 messages, repair history included, on the next route (`replay_prompt`).
 
 Three retry mechanisms exist and each has one owner: the client's own
@@ -1065,7 +1066,8 @@ Events, all `StepEvent::Custom`:
   `missing_directory` (a workflow-named directory that does not exist; a
   missing conventional directory is ordinary and silent). The same text
   reaches the terminal as a stderr line `skills: <path> <message>` of the
-  node. Fabro skips such files silently. The first three come from Pebble's
+  node. Fabro records Pebble's report verbatim (`agent.skills.discovered`)
+  and adds no warning of its own. The first three come from Pebble's
   own `SkillsDiscovered.skipped` report, read once per stage from the root
   session; the fourth is Petri's own probe, because Pebble says nothing
   about a directory that is not there.
