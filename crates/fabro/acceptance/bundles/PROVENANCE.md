@@ -34,8 +34,8 @@ the rest are `0644`. The lock records no symbolic links.
 | `code-review` | `lithoscomputer/code-review` | `0c81ffb4f68039ca56842ab3328fde03b9714350` | 2026-08-28T20:00:53-04:00 | clean | 80 | `c43a461a05b2962cedd95b165430e3a21942ce8517a8e9d26024ed9ff4f22e8a` | required |
 | `security-review` | `lithoscomputer/security-review` | `c14279e9cdac4f7553b5e010718ada1a76e5c1f8` | 2026-08-28T13:33:18-04:00 | clean | 33 | `4b17685a5612fb37e5cdd53c9526793342a562caf5afce36f7d895c4eebba555` | required |
 | `fix-ci` | `veniceai/factory` | `1b50f791ac4811aad62788c2a4282a75d1e92422` | 2026-09-05T03:31:21-04:00 | bundle files were read from the working tree and match the committed revision; the repository had unrelated uncommitted changes | 9 | `9c64c9ccff8d1c60b708102b7f5bcb23a9c4e6daaea80887bbc7ae972536174b` | excluded |
-| `implement-issue` | `fabro-sh/fabro` | `b6482910e517d00dfc3c4a2f2d3e417c9348f7f6` | 2026-09-05T14:05:48-04:00 | see lock | 6 | `fec86b59733ac4612cb3cd1e405444a7fa34f3002e8453b0136e2db19fb9d04e` | required |
-| `interview` | `fabro-sh/fabro` | `b6482910e517d00dfc3c4a2f2d3e417c9348f7f6` | 2026-09-05T14:05:48-04:00 | see lock | 3 | `6c52182c0e4e906ba042a7cbcd35c73a0b37ff94d58e33db6572e1e27c749972` | required |
+| `implement-issue` | `fabro-sh/fabro` | `05ebd0fd1beec214b558f4b478e36bd08b507dc7` | 2026-09-13T08:42:18-06:00 | see lock | 6 | `fec86b59733ac4612cb3cd1e405444a7fa34f3002e8453b0136e2db19fb9d04e` | required |
+| `interview` | `fabro-sh/fabro` | `05ebd0fd1beec214b558f4b478e36bd08b507dc7` | 2026-09-13T08:42:18-06:00 | see lock | 3 | `6c52182c0e4e906ba042a7cbcd35c73a0b37ff94d58e33db6572e1e27c749972` | required |
 
 The bundle hash is the lock's `bundle_hash_rule` over the file list. The
 status column is the lock's disposition (`../CONTRACT.md`, "Required bundles").

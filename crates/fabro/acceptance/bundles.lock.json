@@ -3,7 +3,7 @@
   "generated_for": "Petri Fabro black box battery, phase 1 (first replacement set)",
   "fabro_reference": {
     "repository": "fabro-sh/fabro",
-    "commit": "b6482910e517d00dfc3c4a2f2d3e417c9348f7f6",
+    "commit": "05ebd0fd1beec214b558f4b478e36bd08b507dc7",
     "pin_file": "crates/fabro/corpus-pin.txt"
   },
   "digest_algorithm": "sha256",
@@ -61,10 +61,9 @@
       "visibility": "public",
       "vendored": true,
       "access": "vendored: the listed files are tracked under crates/fabro/acceptance/bundles/<id>/ (implement-issue, interview); scripts/corpus-fetch-fabro-bundles.sh verifies them against these digests and never fetches this source",
-      "revision": "b6482910e517d00dfc3c4a2f2d3e417c9348f7f6",
+      "revision": "05ebd0fd1beec214b558f4b478e36bd08b507dc7",
       "revision_kind": "commit",
-      "committed_at": "2026-09-05T14:05:48-04:00",
-      "ref_at_lock_time": "refs/pull/844/head",
+      "committed_at": "2026-09-13T08:42:18-06:00",
       "same_as": "crates/fabro/corpus-pin.txt"
     }
   },
