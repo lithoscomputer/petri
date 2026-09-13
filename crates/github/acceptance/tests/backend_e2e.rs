@@ -7,9 +7,7 @@ use std::env;
 use std::sync::Arc;
 
 use acceptance::runs::RUNNER_IMAGE_2404;
-use executor_sandbox::{
-    MemoryLedger, PluginSettings, PluginSupervisor, RunIdentity, SandboxExecutor,
-};
+use executor_sandbox::{MemoryLedger, PluginSettings, PluginSource, RunIdentity, SandboxExecutor};
 use runtime::executor::Retention;
 use runtime::ir::RunStatus;
 use runtime::{DaytonaResources, DaytonaSandboxKind, SandboxBackend, SandboxOptions};
@@ -106,7 +104,7 @@ async fn ordinary_actions_run_without_advertising_an_unreachable_results_service
     }
     let dir = RunDir::new("actions-without-callback");
     let executor = SandboxExecutor::new(
-        Arc::new(PluginSupervisor::new(
+        Arc::new(PluginSource::new(
             PluginSettings::from_env("docker", Some(true)).unwrap(),
         )),
         Arc::new(MemoryLedger::default()),

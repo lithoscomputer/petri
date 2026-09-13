@@ -28,27 +28,34 @@
 //!
 //! # Supervision
 //!
-//! A supervisor owns the plugin process and a generation number. When the
-//! transport closes, every in-flight call fails routably through the
-//! protocol client, and no call is ever replayed: a mutating call whose
-//! outcome is unknown is reconciled by the lease manager from durable
-//! records and provider labels, not by trying again. The next provider call
-//! launches one new process, single-flight, with the same kind, path,
-//! checksum, and environment, and hands back a new generation; the lease
-//! manager fences every sandbox once before a holder resumes on it.
+//! sandbox-driver's [`PluginSupervisor`] owns the plugin process. It probes
+//! the backend's health before a generation serves, numbers generations in
+//! launch order, and refuses a replacement that reports a different resource
+//! namespace than the first. When the transport closes, every in-flight call
+//! fails routably through the protocol client, and no call is ever replayed:
+//! a mutating call whose outcome is unknown is reconciled by the lease
+//! manager from durable records and provider labels, not by trying again.
+//! The next provider call launches one new process, single-flight, with the
+//! same kind, path, checksum, and environment, and hands back a new
+//! generation; the lease manager fences every sandbox once before a holder
+//! resumes on it.
+//!
+//! [`PluginSource`] is that supervisor as a [`ProviderSource`]: it launches
+//! the supervisor on the first call, so a run that never needs the provider
+//! never starts its process, and records the fingerprint the first
+//! generation's health report confirms.
 
 use std::collections::BTreeMap;
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::{env, fmt};
 
 use executor::EnvError;
-use sandbox_driver::{HealthStatus, ProviderHealth, ProviderKind, SandboxProvider};
-use sandbox_driver_protocol::PluginProvider;
-use sandbox_driver_protocol::discovery::{PluginConfig, launch_plugin};
-use tokio::sync::Mutex;
+use sandbox_driver::{ProviderHealth, ProviderKind, SandboxProvider};
+use sandbox_driver_protocol::discovery::PluginConfig;
+use sandbox_driver_protocol::{PluginGeneration, PluginSupervisor};
+use tokio::sync::OnceCell;
 
 use crate::DOCKER_HOST_ALIAS;
 
@@ -369,35 +376,22 @@ fn fingerprint_for(kind: &str, env: &BTreeMap<String, String>) -> String {
     }
 }
 
-/// One live plugin process and the generation it belongs to.
-pub struct PluginGeneration {
-    pub provider:   Arc<PluginProvider>,
-    pub generation: u64,
-    pub path:       PathBuf,
-}
-
-impl PluginGeneration {
-    pub fn is_closed(&self) -> bool {
-        self.provider.is_closed()
-    }
-}
-
-/// Owns the plugin process for one provider kind.
-pub struct PluginSupervisor {
+/// A supervised plugin as a manager's provider source: sandbox-driver's
+/// [`PluginSupervisor`] under this kind's [`PluginSettings`], launched on
+/// the first call.
+pub struct PluginSource {
     settings:    PluginSettings,
-    current:     Mutex<Option<Arc<PluginGeneration>>>,
-    next:        AtomicU64,
-    /// Filled only after the provider verifies its resource namespace. Later
-    /// generations must still address the same namespace.
+    supervisor:  OnceCell<PluginSupervisor>,
+    /// Filled once the first generation verifies its resource namespace.
+    /// The supervisor refuses a later generation that names another.
     fingerprint: OnceLock<String>,
 }
 
-impl PluginSupervisor {
+impl PluginSource {
     pub fn new(settings: PluginSettings) -> Self {
         Self {
             settings,
-            current: Mutex::new(None),
-            next: AtomicU64::new(1),
+            supervisor: OnceCell::new(),
             fingerprint: OnceLock::new(),
         }
     }
@@ -410,107 +404,51 @@ impl PluginSupervisor {
         &self.settings.kind
     }
 
-    /// The live generation, launching one when there is none or the last
-    /// one's transport closed. Single-flight: concurrent callers share one
-    /// launch.
+    /// The live generation, launching the plugin on first use and again
+    /// after its transport closed. Single-flight: concurrent callers share
+    /// one launch, and the next call retries a failed one.
     pub async fn current(&self) -> Result<Arc<PluginGeneration>, PluginError> {
-        let mut current = self.current.lock().await;
-        if let Some(generation) = current.as_ref() {
-            if !generation.is_closed() {
-                return Ok(Arc::clone(generation));
-            }
-            tracing::warn!(
-                provider_kind = %self.settings.kind,
-                generation = generation.generation,
-                "sandbox plugin transport closed; relaunching"
-            );
-        }
-        let launched = self.launch().await?;
-        *current = Some(Arc::clone(&launched));
-        Ok(launched)
+        let supervisor = self.supervisor.get_or_try_init(|| self.launch()).await?;
+        supervisor
+            .current()
+            .await
+            .map_err(|source| self.launch_failed(source))
     }
 
-    async fn launch(&self) -> Result<Arc<PluginGeneration>, PluginError> {
-        let kind = self.settings.kind.to_string();
+    /// Launches the supervisor and its first generation, and verifies the
+    /// resource namespace the fingerprint records before any lease uses it.
+    async fn launch(&self) -> Result<PluginSupervisor, PluginError> {
         let config = self.settings.config()?;
-        let launch = launch_plugin(PLUGIN_PREFIX, &config)
+        let supervisor = PluginSupervisor::launch(PLUGIN_PREFIX, config)
             .await
-            .map_err(|source| PluginError::Launch {
-                kind:   kind.clone(),
-                source: Box::new(source),
-            })?;
-        let generation = self.next.fetch_add(1, Ordering::Relaxed);
-        if launch.verified {
-            tracing::info!(
-                provider_kind = %kind,
-                generation,
-                path = %launch.path.display(),
-                "sandbox plugin launched"
-            );
-        } else {
-            tracing::warn!(
-                provider_kind = %kind,
-                generation,
-                path = %launch.path.display(),
-                "sandbox plugin launched UNVERIFIED: dev mode allows an unpinned executable"
-            );
-        }
-        let health = launch
-            .provider
-            .health()
+            .map_err(|source| self.launch_failed(source))?;
+        let first = supervisor
+            .current()
             .await
-            .map_err(|source| PluginError::Launch {
-                kind:   kind.clone(),
-                source: Box::new(source),
-            })?;
-        if health.status != HealthStatus::Ok {
-            let status = match health.status {
-                HealthStatus::Unreachable => "unreachable",
-                HealthStatus::Unauthorized => "unauthorized",
-                _ => "in an unknown state",
-            };
-            let message = health
-                .message
-                .unwrap_or_else(|| "the plugin gave no detail".to_owned());
-            let _ = launch.provider.shutdown().await;
-            return Err(PluginError::Unhealthy {
-                kind,
-                status,
-                message,
-            });
-        }
-        let fingerprint = match self.settings.effective_fingerprint(&health) {
-            Ok(fingerprint) => fingerprint,
+            .map_err(|source| self.launch_failed(source))?;
+        match self.settings.effective_fingerprint(first.health()) {
+            Ok(fingerprint) => {
+                let _ = self.fingerprint.set(fingerprint);
+                Ok(supervisor)
+            }
             Err(error) => {
-                let _ = launch.provider.shutdown().await;
-                return Err(error);
+                let _ = supervisor.shutdown().await;
+                Err(error)
             }
-        };
-        if let Some(previous) = self.fingerprint.get() {
-            if previous != &fingerprint {
-                let _ = launch.provider.shutdown().await;
-                return Err(PluginError::Unhealthy {
-                    kind,
-                    status: "with a changed resource identity",
-                    message: "the plugin's effective backend changed between generations"
-                        .to_owned(),
-                });
-            }
-        } else {
-            let _ = self.fingerprint.set(fingerprint);
         }
-        Ok(Arc::new(PluginGeneration {
-            provider: Arc::new(launch.provider),
-            generation,
-            path: launch.path,
-        }))
+    }
+
+    fn launch_failed(&self, source: sandbox_driver::Error) -> PluginError {
+        PluginError::Launch {
+            kind:   self.settings.kind.to_string(),
+            source: Box::new(source),
+        }
     }
 
     /// Asks the live plugin, if any, to exit.
     pub async fn shutdown(&self) {
-        let current = self.current.lock().await.take();
-        if let Some(generation) = current
-            && let Err(error) = generation.provider.shutdown().await
+        if let Some(supervisor) = self.supervisor.get()
+            && let Err(error) = supervisor.shutdown().await
         {
             tracing::debug!(error = %error, "sandbox plugin shutdown failed");
         }
@@ -543,12 +481,12 @@ pub trait ProviderSource: Send + Sync {
 }
 
 #[async_trait::async_trait]
-impl ProviderSource for PluginSupervisor {
+impl ProviderSource for PluginSource {
     async fn current(&self) -> Result<(Arc<dyn SandboxProvider>, u64), EnvError> {
         let generation = self.current().await.map_err(PluginError::into_env_error)?;
         let provider: Arc<dyn SandboxProvider> =
-            Arc::clone(&generation.provider) as Arc<dyn SandboxProvider>;
-        Ok((provider, generation.generation))
+            Arc::clone(generation.provider()) as Arc<dyn SandboxProvider>;
+        Ok((provider, generation.number()))
     }
 
     async fn shutdown(&self) {
@@ -611,6 +549,8 @@ impl ProviderSource for FixedProvider {
 mod tests {
     use std::collections::BTreeSet;
 
+    use sandbox_driver::HealthStatus;
+
     use super::*;
 
     #[test]
@@ -619,10 +559,10 @@ mod tests {
             (name == "DAYTONA_TARGET").then(|| "us-central-1".into())
         })
         .unwrap();
-        let source = PluginSupervisor::new(settings);
+        let source = PluginSource::new(settings);
         assert_eq!(source.region(), Some("us-central-1"));
         let settings = PluginSettings::from_lookup("daytona", Some(true), |_| None).unwrap();
-        assert_eq!(PluginSupervisor::new(settings).region(), None);
+        assert_eq!(PluginSource::new(settings).region(), None);
     }
 
     #[test]

@@ -48,9 +48,7 @@ pub use crate::lease::{
     LeaseLedger, LeaseRecord, LeaseState, LedgerError, MemoryLedger, PendingIntent,
     SandboxLeaseManager,
 };
-pub use crate::plugin::{
-    FixedProvider, PluginError, PluginSettings, PluginSupervisor, ProviderSource,
-};
+pub use crate::plugin::{FixedProvider, PluginError, PluginSettings, PluginSource, ProviderSource};
 pub use crate::routing::{CONTAINER_KIND, RoutingExecutor};
 use crate::run::workspace_dir;
 pub use crate::run::{LEASE_LABEL, RUN_ID_FILE, RUN_LABEL, RunIdentity, WORKSPACE_LABEL};

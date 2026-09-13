@@ -9,7 +9,7 @@ use executor::{
     AcquireContext, ContainerRunner, Executor as _, OneShotContainer, ProcessSpec, Retention,
     SandboxLeaseId, ScopeOutcome, ScopeSpec, WorkspaceId,
 };
-use executor_sandbox::{MemoryLedger, PluginSettings, PluginSupervisor, RoutingExecutor};
+use executor_sandbox::{MemoryLedger, PluginSettings, PluginSource, RoutingExecutor};
 use ir::ScopeId;
 use testkit::{RunDir, container_id, is_docker_ready, list_containers, recorded_run_id};
 use tokio::fs;
@@ -168,7 +168,7 @@ async fn releasing_a_host_lease_needs_no_container_provider() {
     let unavailable =
         PluginSettings::at_path("docker", dir.path().join("no-docker-plugin")).expect("settings");
     let router = RoutingExecutor::with_provider_source(
-        Arc::new(PluginSupervisor::new(unavailable)),
+        Arc::new(PluginSource::new(unavailable)),
         dir.path(),
         Retention::Never,
     );
@@ -206,7 +206,7 @@ async fn assert_failed_action_cleanup_preserves_workspace(lease: Option<SandboxL
     let unavailable =
         PluginSettings::at_path("docker", dir.path().join("no-docker-plugin")).expect("settings");
     let router = RoutingExecutor::with_provider_source(
-        Arc::new(PluginSupervisor::new(unavailable)),
+        Arc::new(PluginSource::new(unavailable)),
         dir.path(),
         Retention::Never,
     );

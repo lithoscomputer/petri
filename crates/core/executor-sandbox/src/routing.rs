@@ -18,7 +18,7 @@ use tokio::sync::OnceCell;
 
 use crate::actions::{ActionHost, ActionHostRunner, remove_recorded};
 use crate::lease::{LeaseLedger, MemoryLedger};
-use crate::plugin::{FixedProvider, PluginSettings, PluginSupervisor, ProviderSource};
+use crate::plugin::{FixedProvider, PluginSettings, PluginSource, ProviderSource};
 use crate::run::{RunIdentity, workspace_dir};
 use crate::{SandboxBackend, SandboxExecutor, SandboxOptions, SandboxTeardown};
 
@@ -192,7 +192,7 @@ impl RoutingExecutor {
                     let host_address = settings.host_address().map_err(|error| error.to_string());
                     let supports_host_workspace = settings.supports_host_workspace();
                     Ok(ProviderConfig {
-                        source: Arc::new(PluginSupervisor::new(settings)),
+                        source: Arc::new(PluginSource::new(settings)),
                         host_address,
                         supports_host_workspace,
                     })
@@ -221,7 +221,7 @@ impl RoutingExecutor {
                     .cloned()
                     .unwrap_or_else(|| Arc::new(MemoryLedger::default()));
                 Ok(Arc::new(SandboxExecutor::new(
-                    Arc::new(PluginSupervisor::new(settings)),
+                    Arc::new(PluginSource::new(settings)),
                     ledger,
                     self.identity.clone(),
                     self.retention,

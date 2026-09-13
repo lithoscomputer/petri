@@ -13,7 +13,7 @@ use std::{env, fs, process};
 
 use driver::ExecutionReport;
 use executor::Retention;
-use executor_sandbox::{PluginSettings, PluginSupervisor};
+use executor_sandbox::{PluginSettings, PluginSource};
 use ir::{Graph, GraphBuilder, NodeId, ScopeId, StepRef, Value};
 use serde::Deserialize;
 use serde_json::json;
@@ -301,7 +301,7 @@ pub async fn is_docker_available() -> bool {
     let Ok(settings) = PluginSettings::from_env("docker", None) else {
         return false;
     };
-    let supervisor = PluginSupervisor::new(settings);
+    let supervisor = PluginSource::new(settings);
     let ready = supervisor.current().await.is_ok();
     supervisor.shutdown().await;
     ready

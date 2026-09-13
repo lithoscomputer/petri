@@ -10,7 +10,7 @@ use executor::{
     AcquireContext, Executor, OneShotContainer, ProcessHandle, ProcessSpec, Retention,
     SandboxLeaseId, ScopeOutcome, ScopeSpec,
 };
-use executor_sandbox::{MemoryLedger, PluginSettings, PluginSupervisor, RoutingExecutor};
+use executor_sandbox::{MemoryLedger, PluginSettings, PluginSource, RoutingExecutor};
 use ir::{RuntimeSpec, ScopeId};
 use testkit::{RunDir, container_id, is_docker_ready, list_containers, sandbox_name};
 use tokio::process::Command;
@@ -48,7 +48,7 @@ async fn a_plugin_crash_fails_calls_then_recovers_one_generation_and_the_same_sa
     .unwrap();
     fs::write(&launcher, "#!/bin/sh\ncd -- \"$(dirname -- \"$0\")\" || exit 1\necho \"$$\" >> launches\nexec ./plugin\n").unwrap();
     fs::set_permissions(&launcher, fs::Permissions::from_mode(0o700)).unwrap();
-    let supervisor = Arc::new(PluginSupervisor::new(
+    let supervisor = Arc::new(PluginSource::new(
         PluginSettings::at_path("docker", &launcher).unwrap(),
     ));
     let router = RoutingExecutor::with_provider_source(
@@ -130,7 +130,7 @@ async fn a_plugin_crash_fails_calls_then_recovers_one_generation_and_the_same_sa
     let (first, second) = tokio::join!(supervisor.current(), supervisor.current());
     let (first, second) = (first.unwrap(), second.unwrap());
     assert!(Arc::ptr_eq(&first, &second));
-    assert_eq!(first.generation, generation.generation + 1);
+    assert_eq!(first.number(), generation.number() + 1);
     assert_eq!(
         fs::read_to_string(directory.path().join("launches"))
             .unwrap()
@@ -214,7 +214,7 @@ async fn host_actions_recover_after_the_docker_plugin_restarts() {
         return;
     }
     let directory = RunDir::new("host-action-plugin-recovery");
-    let supervisor = Arc::new(PluginSupervisor::new(
+    let supervisor = Arc::new(PluginSource::new(
         PluginSettings::from_env("docker", Some(true)).expect("settings"),
     ));
     let router = RoutingExecutor::with_provider_source(
@@ -246,7 +246,7 @@ async fn host_actions_recover_after_the_docker_plugin_restarts() {
             supervisor.shutdown().await;
         }
     }
-    assert_eq!(supervisor.current().await.unwrap().generation, 2);
+    assert_eq!(supervisor.current().await.unwrap().number(), 2);
     let prefix = router.container_prefix().await.unwrap();
     assert_eq!(list_containers(&prefix).await.len(), 1);
     assert!(
