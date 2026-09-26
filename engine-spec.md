@@ -166,6 +166,14 @@ Rules (violations are review-blockers):
 `Cancelled` joins the statuses that flow through routing (§5);
 `is_success_like` is untouched — it remains `Success | PartialSuccess`.
 
+**Budget refusal.** A key the budget refuses (`firing_count >= max_firings`)
+records `RunError::BudgetExceeded`, which fails the run; it takes the key's
+tokens and marks the key fired, and it records and routes nothing, so work
+downstream of it waits. Routing nothing is what makes the budget a
+termination guarantee: a routed outcome could take a back edge, be refused
+again in the next generation, and route again, forever. (A mutation that
+routes a failure instead overflows the stack in the flow property test.)
+
 **Retries.** Each firing starts at `Attempt(1)`; counters reset per firing (a
 later generation retries fresh). On a matching non-final failure the core emits
 `ScheduleRetry` (deterministic base delay; driver adds jitter and sleeps; feeds

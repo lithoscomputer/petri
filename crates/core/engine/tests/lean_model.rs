@@ -112,9 +112,10 @@ proptest! {
     #![proptest_config(ProptestConfig::with_cases(512))]
 
     /// Which nodes start after each host step, the order they finish in, the
-    /// tokens left waiting and the run status all match the model.
+    /// tokens left waiting and the run status all match the model. Acyclic
+    /// cases only, until the model has generations and budgets.
     #[test]
-    fn flow_runs_match_the_lean_model(case in flow::flow_case()) {
+    fn flow_runs_match_the_lean_model(case in flow::acyclic_flow_case()) {
         let Some(answer) = ask(&json!({ "flow": &case })) else {
             return Ok(());
         };

@@ -40,11 +40,13 @@ structure Case where
   deriving Repr
 
 /-- What a run looks like from outside the core; `Observed` in the Rust
-test. -/
+test. Keys are `(node, generation)`; this model has only generation 0 and
+no budgets, so `budgetExceeded` is always empty. -/
 structure Observed where
-  steps : List (List Nat)
-  finished : List Nat
-  parked : List (Nat × Nat)
+  steps : List (List (Nat × Nat))
+  finished : List (Nat × Nat)
+  parked : List (Nat × Nat × Nat)
+  budgetExceeded : List Nat
   status : String
   deriving Repr
 
@@ -133,6 +135,11 @@ def run (c : Case) : Observed :=
     if !s.live.isEmpty then "unsettled"
     else if s.finished.any (failed c) then "failed"
     else "success"
-  { steps := s.steps, finished := s.finished, parked, status }
+  let key := fun (node : Nat) => (node, 0)
+  { steps := s.steps.map (·.map key)
+    finished := s.finished.map key
+    parked := parked.map fun (node, edge) => (node, 0, edge)
+    budgetExceeded := []
+    status }
 
 end PetriModel.Flow
