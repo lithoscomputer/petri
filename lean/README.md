@@ -95,5 +95,6 @@ mise run test:lean    # build, then check the core against the model
 ```
 
 Without a built model, `lean_model.rs` skips. `PETRI_REQUIRE_LEAN_MODEL=1`
-turns the skip into a failure, and `mise run test:lean` sets it.
-`PETRI_LEAN_MODEL` names a binary somewhere else.
+turns the skip into a failure, and `mise run test:lean` sets it; the required
+`lean model` CI job runs that task. `PETRI_LEAN_MODEL` names a binary
+somewhere else.

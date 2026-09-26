@@ -259,7 +259,11 @@ job, `fabro compatibility`, builds the pinned `fabro` binary from the fetched
 corpus (`scripts/fabro-provision.sh`; only the binary is cached, keyed by the pin
 and the toolchain; about three minutes on a miss) and runs the comparison
 matrix through `mise run test:fabro:differential` with
-`PETRI_REQUIRE_FABRO_BINARY` set. The Nightly workflow repeats the black box
+`PETRI_REQUIRE_FABRO_BINARY` set. A third required job, `lean model`,
+installs elan (pinned by version and digest), builds the Lean model in
+`lean/`, which checks every proof, and runs `mise run test:lean`: the engine's
+`lean_model` tests compare the real core with the model's executable, with
+`PETRI_REQUIRE_LEAN_MODEL` set. The Nightly workflow repeats the black box
 set three times under different test schedules
 (`mise run test:fabro:blackbox:repeat`), runs the long tests, and reruns the
 matrix; it adds repetitions and is never the only parity evidence.
