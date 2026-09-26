@@ -1,0 +1,91 @@
+# Lean model of the engine core
+
+A Lean 4 model of parts of Petri's engine core, the theorems proved about it,
+and an executable that `crates/core/engine/tests/lean_model.rs` checks the
+real core against.
+
+This follows the approach AWS used for Cedar. The Lean definitions are the
+specification. The theorems are proved about those definitions. A
+property-based test runs the same definitions against the Rust code, so the
+proofs describe what the Rust code does on every case the test generates.
+Nothing here translates Rust into Lean.
+
+## What is modeled
+
+| Lean | Rust | Source of truth |
+| --- | --- | --- |
+| `PetriModel/Join.lean` | `on_token`, `try_fire`, `is_join_satisfied` in `crates/core/engine/src/apply.rs` | `engine-spec.md` §3, §4 |
+| `PetriModel/Pick.lean` | `deterministic_pick` in `crates/core/engine/src/apply.rs` | `engine-spec.md` §2, §6 |
+| `PetriModel/Flow.lean` | a whole run of the acyclic flows the Rust generator makes | `crates/core/engine/tests/flow/mod.rs` |
+
+The flow model leaves out loops, retries, cancellation, expansions,
+preconditions, budgets and splices. The Rust generator does not produce
+them either.
+
+A rank in `deterministic_pick` is an `f64` compared with `f64::total_cmp`.
+The model carries the rank's bit pattern and compares the same key
+`total_cmp` uses, so NaN, the infinities and signed zeros agree with Rust.
+
+## What is proved
+
+All theorems are complete. None uses `sorry`, and none depends on axioms
+beyond Lean's standard three (`propext`, `Classical.choice`, `Quot.sound`).
+
+For one `(node, generation)` key (`PetriModel/Thm/Join.lean`):
+
+- `fires_at_most_once`: whatever tokens arrive, the node fires at most once.
+- `fired_iff`: after a sequence of arrivals, the key has fired exactly when
+  the distinct edges seen satisfy the join.
+- `fired_depends_only_on_edges`: whether a key fires depends only on which
+  edges delivered a token, not on arrival order or duplicates. The driver's
+  completion order is not deterministic, and this is why a join does not
+  depend on it.
+- `all_fires_iff`, `any_fires_iff`, `quorum_fires_iff`: the three policies,
+  stated over the arrivals.
+- `quorum_never_fires`: a `Quorum n` fed only through fewer than `max n 1`
+  incoming edges never fires. Load-time validation accepts such a node today.
+
+For `deterministic_pick` (`PetriModel/Thm/Pick.lean`):
+
+- `select_count`: a weighted draw is proportional. Of the rolls
+  `0 ≤ roll < total`, exactly `weight i` pick candidate `i`.
+- `select_weight_pos`: a zero-weight candidate is never picked.
+- `pick_weighted_ok`: a draw that matches its proposal is never refused. The
+  Rust function's last `Err` ("the weighted draw did not select a
+  candidate") cannot happen.
+- `pick_mem`: whatever the policy, a pick names one of the candidates.
+- `highest_max`: `HighestWeightThenLexical` picks a heaviest candidate.
+- `lowest_min`, `lowest_eq_none`: `LowestRankThenArmOrder` picks a candidate
+  with the smallest rank key, and picks nothing only when no candidate has a
+  rank.
+
+## How the Rust code is checked
+
+`petri-model` reads one JSON query per line and writes one answer per line
+(`PetriModel/Wire.lean`). `crates/core/engine/tests/lean_model.rs` starts it
+once per test and, for each generated case, compares its answer with the
+real core's:
+
+- `flow_runs_match_the_lean_model`: which nodes start after each host step,
+  the order they finish in, the tokens left waiting at the end, and the run
+  status.
+- `deterministic_pick_matches_the_lean_model`: the picked edge, or the
+  reason for a refusal. A new refusal message in Rust fails the test until
+  the model has it too.
+
+`crates/core/engine/tests/flow_properties.rs` checks the join rules on the
+same generator without Lean, so it runs in every `mise run test`.
+
+## Commands
+
+Install [elan](https://github.com/leanprover/elan). It reads the Lean
+version from `lean-toolchain`.
+
+```sh
+mise run lean:build   # build the model and check every proof
+mise run test:lean    # build, then check the core against the model
+```
+
+Without a built model, `lean_model.rs` skips. `PETRI_REQUIRE_LEAN_MODEL=1`
+turns the skip into a failure, and `mise run test:lean` sets it.
+`PETRI_LEAN_MODEL` names a binary somewhere else.

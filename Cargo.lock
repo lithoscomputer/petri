@@ -1655,6 +1655,7 @@ name = "petri-engine"
 version = "0.1.0"
 dependencies = [
  "petri-ir",
+ "proptest",
  "serde",
  "serde_json",
  "smol_str",

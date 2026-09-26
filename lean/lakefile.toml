@@ -1,0 +1,10 @@
+name = "petri_model"
+version = "0.1.0"
+defaultTargets = ["PetriModel", "petri-model"]
+
+[[lean_lib]]
+name = "PetriModel"
+
+[[lean_exe]]
+name = "petri-model"
+root = "Main"
