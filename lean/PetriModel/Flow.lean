@@ -4,7 +4,7 @@ import PetriModel.Join
 # Flows
 
 A whole run of the flows `crates/core/engine/tests/flow/mod.rs` generates:
-every step is a `noop` that succeeds or fails as scripted, every routing
+every step is a `noop` with a scripted outcome, every routing
 group picks its first arm whose guard passes (`FirstMatch` with
 `Fallthrough::NoEmit`), and each `(node, generation)` key's join is
 `Join.arrive`. A back arm starts the next generation; a node fires at most
@@ -33,12 +33,32 @@ structure Arm where
   edge : Nat
   deriving Repr
 
+/-- What the host reports for a firing. -/
+inductive Outcome where
+  | success
+  | failure
+  /-- A failure of class `flaky`. -/
+  | flaky
+  | timedOut
+  deriving Repr, DecidableEq
+
+/-- `Status::is_failure`: a failure or a timeout. -/
+def Outcome.isFailure : Outcome → Bool
+  | .success => false
+  | .failure | .flaky | .timedOut => true
+
+/-- `Status::tag`. -/
+def Outcome.tag : Outcome → String
+  | .success => "success"
+  | .failure | .flaky => "failure"
+  | .timedOut => "timed_out"
+
 structure Node where
   join : Join.Policy
   maxFirings : Nat
-  /-- Whether the host fails the node's first, second, … firing; the last
+  /-- The host's outcome for the node's first, second, … firing; the last
   entry repeats. -/
-  outcomes : List Bool
+  outcomes : List Outcome
   groups : List (List Arm)
   deriving Repr
 
@@ -60,19 +80,21 @@ structure Observed where
   status : String
   deriving Repr
 
-/-- `always()`, `success()` and `failure()` over the node's own outcome. -/
-def Guard.passes : Guard → Bool → Bool
+/-- `always()`, `success()` and `failure()` over the node's own outcome, as
+the expression builtins define them: `success()` is success-like, and
+`failure()` is the `failure` status only, so a timeout passes neither. -/
+def Guard.passes : Guard → Outcome → Bool
   | .always, _ => true
-  | .success, failed => !failed
-  | .failure, failed => failed
+  | .success, o => o == .success
+  | .failure, o => o == .failure || o == .flaky
 
-/-- Whether the host fails the node's firing number `ordinal`, from 0. -/
-def Node.fails (node : Node) (ordinal : Nat) : Bool :=
-  (node.outcomes[min ordinal (node.outcomes.length - 1)]?).getD false
+/-- The host's outcome for the node's firing number `ordinal`, from 0. -/
+def Node.outcome (node : Node) (ordinal : Nat) : Outcome :=
+  (node.outcomes[min ordinal (node.outcomes.length - 1)]?).getD .success
 
 /-- A group emits on its first arm whose guard passes, or not at all. -/
-def emit (failed : Bool) (group : List Arm) : Option Arm :=
-  group.find? (·.guard.passes failed)
+def emit (outcome : Outcome) (group : List Arm) : Option Arm :=
+  group.find? (·.guard.passes outcome)
 
 def arms (c : Case) : List Arm :=
   c.nodes.flatMap (·.groups.flatten)
@@ -109,9 +131,9 @@ structure State where
   /-- Firings so far, per node. -/
   firings : List Nat
   /-- Running firings with their scripted outcome, ascending by key. -/
-  live : List (Key × Bool)
+  live : List (Key × Outcome)
   steps : List (List Key)
-  finished : List (Key × Bool)
+  finished : List (Key × Outcome)
   budgetExceeded : List Nat
 
 def State.key (s : State) (k : Key) : Join.Key :=
@@ -130,7 +152,7 @@ def State.bump (s : State) (node : Nat) : State :=
 /-- Deliver tokens in order; returns the state and the firings started, each
 with its scripted outcome. A key the join fires is refused when its node's
 budget is spent (§4, "Budget refusal"). -/
-def deliver (c : Case) : State → List Token → State × List (Key × Bool)
+def deliver (c : Case) : State → List Token → State × List (Key × Outcome)
   | s, [] => (s, [])
   | s, t :: rest =>
     match c.nodes[t.target]? with
@@ -144,9 +166,9 @@ def deliver (c : Case) : State → List Token → State × List (Key × Bool)
         deliver c { s with budgetExceeded := s.budgetExceeded ++ [t.target] } rest
       else
         let r := deliver c (s.bump t.target) rest
-        (r.1, (k, node.fails (s.firingsOf t.target)) :: r.2)
+        (r.1, (k, node.outcome (s.firingsOf t.target)) :: r.2)
 
-def keyLe (a b : Key × Bool) : Bool :=
+def keyLe (a b : Key × Outcome) : Bool :=
   a.1.1 < b.1.1 || (a.1.1 == b.1.1 && a.1.2 ≤ b.1.2)
 
 def start (c : Case) : State :=
@@ -158,14 +180,14 @@ def start (c : Case) : State :=
   { r.1 with live := started, steps := [started.map (·.1)] }
 
 /-- The tokens a finished firing routes, in group order. -/
-def tokensOf (c : Case) (k : Key) (failed : Bool) : List Token :=
+def tokensOf (c : Case) (k : Key) (outcome : Outcome) : List Token :=
   let groups := (c.nodes[k.1]?.map (·.groups)).getD []
-  (groups.filterMap (emit failed)).map fun arm =>
+  (groups.filterMap (emit outcome)).map fun arm =>
     ⟨arm.to, if arm.back then k.2 + 1 else k.2, arm.edge⟩
 
 /-- The host finishes one live firing: record it, route it, deliver its
 tokens. -/
-def finish (c : Case) (s : State) (firing : Key × Bool) : State :=
+def finish (c : Case) (s : State) (firing : Key × Outcome) : State :=
   let s := { s with
     live := s.live.erase firing
     finished := s.finished ++ [firing] }
@@ -192,7 +214,7 @@ def run (c : Case) : Observed :=
       if key.fired then [] else key.tokens.map fun edge => (node, generation, edge)).mergeSort parkedLe
   let status :=
     if !s.live.isEmpty then "unsettled"
-    else if s.finished.any (·.2) || !s.budgetExceeded.isEmpty then "failed"
+    else if s.finished.any (·.2.isFailure) || !s.budgetExceeded.isEmpty then "failed"
     else "success"
   { steps := s.steps
     finished := s.finished.map (·.1)

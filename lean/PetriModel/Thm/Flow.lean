@@ -176,7 +176,7 @@ theorem deliver_started (c : Case) :
 def StartedOnce (s : State) : Prop :=
   s.steps.flatten.Nodup ∧ ∀ k ∈ s.steps.flatten, (s.key k).fired = true
 
-theorem sorted_keys_perm (started : List (Key × Bool)) :
+theorem sorted_keys_perm (started : List (Key × Outcome)) :
     ((started.mergeSort keyLe).map (·.1)).Perm (started.map (·.1)) :=
   (List.mergeSort_perm started keyLe).map _
 
@@ -190,7 +190,7 @@ theorem startedOnce_start (c : Case) : StartedOnce (start c) := by
   · simp only [start, List.flatten_cons, List.flatten_nil, List.append_nil] at hk
     exact (hks k ((sorted_keys_perm _).mem_iff.mp hk)).2
 
-theorem startedOnce_finish (c : Case) {s : State} (h : StartedOnce s) (firing : Key × Bool) :
+theorem startedOnce_finish (c : Case) {s : State} (h : StartedOnce s) (firing : Key × Outcome) :
     StartedOnce (finish c s firing) := by
   obtain ⟨hnd, hfired⟩ := h
   let s₁ : State := { s with live := s.live.erase firing, finished := s.finished ++ [firing] }
@@ -265,7 +265,7 @@ theorem within_budget_start (c : Case) : WithinBudget c (start c) := by
   split <;> simp
 
 theorem within_budget_finish (c : Case) {s : State} (h : WithinBudget c s)
-    (firing : Key × Bool) : WithinBudget c (finish c s firing) :=
+    (firing : Key × Outcome) : WithinBudget c (finish c s firing) :=
   deliver_within_budget c _ _ h
 
 theorem within_budget_loop (c : Case) :
@@ -297,8 +297,8 @@ theorem budget_exceeded_fails (c : Case) (h : (run c).budgetExceeded ≠ []) :
 
 /-- A routed token comes from an arm of the firing's node, and its generation
 is the firing's, plus one on a back arm. -/
-theorem token_generation (c : Case) (k : Key) (failed : Bool) :
-    ∀ t ∈ tokensOf c k failed, ∃ (node : Node) (group : List Arm) (arm : Arm),
+theorem token_generation (c : Case) (k : Key) (outcome : Outcome) :
+    ∀ t ∈ tokensOf c k outcome, ∃ (node : Node) (group : List Arm) (arm : Arm),
       c.nodes[k.1]? = some node ∧ group ∈ node.groups ∧ arm ∈ group ∧
         t = ⟨arm.to, if arm.back then k.2 + 1 else k.2, arm.edge⟩ := by
   intro t ht
@@ -387,7 +387,7 @@ theorem counted_start (c : Case) : Counted c (start c) := by
   · simp [start, hsum]
   · simp [start, hfin]
 
-theorem counted_finish (c : Case) {s : State} (h : Counted c s) {firing : Key × Bool}
+theorem counted_finish (c : Case) {s : State} (h : Counted c s) {firing : Key × Outcome}
     (hmem : firing ∈ s.live) :
     Counted c (finish c s firing) ∧
       (finish c s firing).finished.length = s.finished.length + 1 := by

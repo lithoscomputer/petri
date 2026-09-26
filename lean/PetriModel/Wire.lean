@@ -56,11 +56,21 @@ def arm (j : Json) : Except String Flow.Arm := do
     back := ← (← field j "back").getBool?
     edge := ← (← field j "edge").getNat? }
 
+def outcome (j : Json) : Except String Flow.Outcome := do
+  match ← j.getStr? with
+  | "success" => pure .success
+  | "failure" => pure .failure
+  | "flaky" => pure .flaky
+  | "timed_out" => pure .timedOut
+  | other => throw s!"unknown outcome `{other}`"
+
+/-- Each firing's first attempt: this model has no retries yet. -/
 def node (j : Json) : Except String Flow.Node := do
   return {
     join := ← join (← field j "join")
     maxFirings := ← (← field j "max_firings").getNat?
-    outcomes := ← list (← field j "outcomes") (·.getBool?)
+    outcomes := ← list (← field j "outcomes") fun firing => do
+      return (← list firing outcome).head?.getD .success
     groups := ← list (← field j "groups") (list · arm) }
 
 def flowCase (j : Json) : Except String Flow.Case := do
