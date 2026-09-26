@@ -45,7 +45,9 @@ structure Draw where
   total : Nat
   deriving Repr
 
-/-- Why a pick is refused, one case per `Err` in the Rust function. -/
+/-- Why a pick is refused, one case per `Err` in the Rust function.
+`noSelection` cannot happen (`pick_weighted_ok`); it stays to mirror the Rust
+function, which keeps the refusal instead of a panic. -/
 inductive Refusal where
   | drawOnEmpty
   | drawOnUnweighted
