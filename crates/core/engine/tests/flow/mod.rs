@@ -225,18 +225,6 @@ pub(crate) struct FlowCase {
     pub schedule: Vec<u32>,
 }
 
-/// Cases with one attempt per firing and no `AcceptPartial`. The Lean model
-/// check uses them until the model has retries.
-pub(crate) fn flow_case_without_retries() -> impl Strategy<Value = FlowCase> {
-    flow_case().prop_map(|mut case| {
-        for node in &mut case.nodes {
-            node.retry.max_attempts = 1;
-            node.retry.accept_partial = false;
-        }
-        case
-    })
-}
-
 impl FlowCase {
     /// The same case with every firing cut to the last attempt its script
     /// reaches, and one attempt allowed. Retries are invisible outside the

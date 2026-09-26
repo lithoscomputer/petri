@@ -176,7 +176,7 @@ theorem deliver_started (c : Case) :
 def StartedOnce (s : State) : Prop :=
   s.steps.flatten.Nodup ∧ ∀ k ∈ s.steps.flatten, (s.key k).fired = true
 
-theorem sorted_keys_perm (started : List (Key × Outcome)) :
+theorem sorted_keys_perm (started : List (Key × Nat)) :
     ((started.mergeSort keyLe).map (·.1)).Perm (started.map (·.1)) :=
   (List.mergeSort_perm started keyLe).map _
 
@@ -190,12 +190,12 @@ theorem startedOnce_start (c : Case) : StartedOnce (start c) := by
   · simp only [start, List.flatten_cons, List.flatten_nil, List.append_nil] at hk
     exact (hks k ((sorted_keys_perm _).mem_iff.mp hk)).2
 
-theorem startedOnce_finish (c : Case) {s : State} (h : StartedOnce s) (firing : Key × Outcome) :
+theorem startedOnce_finish (c : Case) {s : State} (h : StartedOnce s) (firing : Key × Nat) :
     StartedOnce (finish c s firing) := by
   obtain ⟨hnd, hfired⟩ := h
   let s₁ : State := { s with live := s.live.erase firing, finished := s.finished ++ [firing] }
-  obtain ⟨hnew, hks⟩ := deliver_started c (tokensOf c firing.1 firing.2) s₁
-  have hperm := sorted_keys_perm (deliver c s₁ (tokensOf c firing.1 firing.2)).2
+  obtain ⟨hnew, hks⟩ := deliver_started c (tokensOf c firing.1 (c.record firing.1.1 firing.2)) s₁
+  have hperm := sorted_keys_perm (deliver c s₁ (tokensOf c firing.1 (c.record firing.1.1 firing.2))).2
   refine ⟨?_, fun k hk => ?_⟩
   · simp only [finish, deliver_steps, List.flatten_append, List.flatten_cons, List.flatten_nil,
       List.append_nil]
@@ -223,7 +223,7 @@ theorem startedOnce_loop (c : Case) :
 
 /-- In any run, each `(node, generation)` key starts at most once. -/
 theorem started_once (c : Case) : (run c).steps.flatten.Nodup := by
-  simp only [run]
+  simp only [run, runState]
   exact (startedOnce_loop c _ 0 (start c) (startedOnce_start c)).1
 
 /-! ## Runs: budgets -/
@@ -265,7 +265,7 @@ theorem within_budget_start (c : Case) : WithinBudget c (start c) := by
   split <;> simp
 
 theorem within_budget_finish (c : Case) {s : State} (h : WithinBudget c s)
-    (firing : Key × Outcome) : WithinBudget c (finish c s firing) :=
+    (firing : Key × Nat) : WithinBudget c (finish c s firing) :=
   deliver_within_budget c _ _ h
 
 theorem within_budget_loop (c : Case) :
@@ -282,23 +282,27 @@ theorem firings_le_budget (c : Case) (fuel : Nat) :
     WithinBudget c (loop c fuel 0 (start c)) :=
   within_budget_loop c fuel 0 _ (within_budget_start c)
 
+/-- The status `run` reports is `failed` whenever a budget refused a firing. -/
+theorem status_ne_success {live : List (Key × Nat)} {failed : Bool} {budget : List Nat}
+    (h : budget ≠ []) :
+    (if (!live.isEmpty) = true then "unsettled"
+      else if (failed || !budget.isEmpty) = true then "failed" else "success") ≠ "success" := by
+  cases budget with
+  | nil => exact absurd rfl h
+  | cons _ _ => cases live <;> cases failed <;> simp
+
 /-- A run in which a budget refused a firing does not report success. -/
 theorem budget_exceeded_fails (c : Case) (h : (run c).budgetExceeded ≠ []) :
     (run c).status ≠ "success" := by
-  simp only [run] at h ⊢
-  split
-  · decide
-  · split
-    · decide
-    · rename_i h₁ h₂
-      simp_all
+  simp only [run, runState] at h ⊢
+  exact status_ne_success h
 
 /-! ## Tokens -/
 
 /-- A routed token comes from an arm of the firing's node, and its generation
 is the firing's, plus one on a back arm. -/
-theorem token_generation (c : Case) (k : Key) (outcome : Outcome) :
-    ∀ t ∈ tokensOf c k outcome, ∃ (node : Node) (group : List Arm) (arm : Arm),
+theorem token_generation (c : Case) (k : Key) (status : Status) :
+    ∀ t ∈ tokensOf c k status, ∃ (node : Node) (group : List Arm) (arm : Arm),
       c.nodes[k.1]? = some node ∧ group ∈ node.groups ∧ arm ∈ group ∧
         t = ⟨arm.to, if arm.back then k.2 + 1 else k.2, arm.edge⟩ := by
   intro t ht
@@ -387,12 +391,12 @@ theorem counted_start (c : Case) : Counted c (start c) := by
   · simp [start, hsum]
   · simp [start, hfin]
 
-theorem counted_finish (c : Case) {s : State} (h : Counted c s) {firing : Key × Outcome}
+theorem counted_finish (c : Case) {s : State} (h : Counted c s) {firing : Key × Nat}
     (hmem : firing ∈ s.live) :
     Counted c (finish c s firing) ∧
       (finish c s firing).finished.length = s.finished.length + 1 := by
   obtain ⟨hlen, hsteps, hlive⟩ := h
-  obtain ⟨hl, hf, hlen', hsum⟩ := deliver_counts c (tokensOf c firing.1 firing.2)
+  obtain ⟨hl, hf, hlen', hsum⟩ := deliver_counts c (tokensOf c firing.1 (c.record firing.1.1 firing.2))
     { s with live := s.live.erase firing, finished := s.finished ++ [firing] } hlen
   have herase := List.length_erase_of_mem hmem
   have hpos : 0 < s.live.length := List.length_pos_of_mem hmem
@@ -460,8 +464,13 @@ theorem run_settles (c : Case) :
     have hsum := hc.2.2
     omega
 
+theorem failed_or_success (failed : Bool) :
+    (if failed = true then "failed" else "success") ≠ "unsettled" := by
+  cases failed <;> decide
+
 theorem run_not_unsettled (c : Case) : (run c).status ≠ "unsettled" := by
-  simp only [run, run_settles, List.isEmpty_nil, Bool.not_true, Bool.false_eq_true, ↓reduceIte]
-  split <;> decide
+  simp only [run, runState, run_settles, List.isEmpty_nil, Bool.not_true, Bool.false_eq_true,
+    ↓reduceIte]
+  exact failed_or_success _
 
 end PetriModel.Flow
