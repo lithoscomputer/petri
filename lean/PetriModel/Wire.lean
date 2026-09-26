@@ -53,14 +53,14 @@ def arm (j : Json) : Except String Flow.Arm := do
   return {
     to := ← (← field j "to").getNat?
     guard := ← guard (← field j "guard")
+    back := ← (← field j "back").getBool?
     edge := ← (← field j "edge").getNat? }
 
-/-- Only the first outcome is read: this model runs each node once. -/
 def node (j : Json) : Except String Flow.Node := do
-  let outcomes ← list (← field j "outcomes") (·.getBool?)
   return {
     join := ← join (← field j "join")
-    fails := outcomes.head?.getD false
+    maxFirings := ← (← field j "max_firings").getNat?
+    outcomes := ← list (← field j "outcomes") (·.getBool?)
     groups := ← list (← field j "groups") (list · arm) }
 
 def flowCase (j : Json) : Except String Flow.Case := do

@@ -142,13 +142,6 @@ pub(crate) struct Run {
 
 // ── Generation ────────────────────────────────────────────────────────────
 
-/// Whether a generated case may loop. The Lean model check uses acyclic cases
-/// until the model has generations.
-#[derive(Clone, Copy, Debug)]
-pub(crate) struct Shape {
-    pub loops: bool,
-}
-
 /// A raw arm: a guard choice, a target offset and a back-arm roll, normalized
 /// by position.
 type RawArm = (u8, u32, u8);
@@ -181,17 +174,7 @@ fn raw_node() -> impl Strategy<Value = RawNode> {
     )
 }
 
-/// Cases that may loop.
 pub(crate) fn flow_case() -> impl Strategy<Value = FlowCase> {
-    flow_case_shaped(Shape { loops: true })
-}
-
-/// Cases without back arms, budgets past one, or outcomes that change.
-pub(crate) fn acyclic_flow_case() -> impl Strategy<Value = FlowCase> {
-    flow_case_shaped(Shape { loops: false })
-}
-
-fn flow_case_shaped(shape: Shape) -> impl Strategy<Value = FlowCase> {
     (2..=MAX_NODES)
         .prop_flat_map(|n| {
             (
@@ -199,11 +182,11 @@ fn flow_case_shaped(shape: Shape) -> impl Strategy<Value = FlowCase> {
                 prop::collection::vec(0u32..8, 0..=2 * n),
             )
         })
-        .prop_map(move |(raw, schedule)| FlowCase::from_raw(&raw, schedule, shape))
+        .prop_map(|(raw, schedule)| FlowCase::from_raw(&raw, schedule))
 }
 
 impl FlowCase {
-    fn from_raw(raw: &[RawNode], schedule: Vec<u32>, shape: Shape) -> Self {
+    fn from_raw(raw: &[RawNode], schedule: Vec<u32>) -> Self {
         let count = u32::try_from(raw.len()).expect("a case holds at most MAX_NODES nodes");
         // Targets first: an arm with nowhere to go is dropped, and guards
         // depend on an arm's final position in its group.
@@ -220,7 +203,7 @@ impl FlowCase {
                                 // About one arm in five loops back; the last node,
                                 // which has no forward target, loops back less often
                                 // and otherwise ends the flow.
-                                if shape.loops && (back_roll < 2 || (later == 0 && back_roll < 4)) {
+                                if back_roll < 2 || (later == 0 && back_roll < 4) {
                                     Some((guard, offset % (index + 1), true))
                                 } else if later > 0 {
                                     Some((guard, index + 1 + offset % later, false))
@@ -286,15 +269,10 @@ impl FlowCase {
                     } else {
                         *join
                     };
-                    let (max_firings, outcomes) = if shape.loops {
-                        (*max_firings, outcomes.clone())
-                    } else {
-                        (1, vec![outcomes[0]])
-                    };
                     NodeSpec {
                         join,
-                        max_firings,
-                        outcomes,
+                        max_firings: *max_firings,
+                        outcomes: outcomes.clone(),
                         groups,
                     }
                 },
