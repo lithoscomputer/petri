@@ -42,6 +42,11 @@ For one `(node, generation)` key (`PetriModel/Thm/Join.lean`):
   depend on it.
 - `all_fires_iff`, `any_fires_iff`, `quorum_fires_iff`: the three policies,
   stated over the arrivals.
+- `all_never_fires`: an `All` join that counts two edges of which at most
+  one ever delivers never fires. Two arms of one routing group are such a
+  pair, and `engine-spec.md` §8 invariant 10 rejects that join at load.
+  `crates/core/engine/tests/flow_properties.rs` checks the rule against the
+  real core: a node it rejects never runs.
 - `quorum_never_fires`: a `Quorum n` fed only through fewer than `max n 1`
   incoming edges never fires. Load-time validation accepts such a node today.
 

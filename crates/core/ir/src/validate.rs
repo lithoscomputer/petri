@@ -141,6 +141,19 @@ pub enum ValidationError<S = Live> {
          only edges into the entry and out of the exit may cross"
     )]
     BoundaryCrossing { node: NodeId<S>, edge: EdgeId<S> },
+
+    // ── Invariant 10 ───────────────────────────────────────────────────────
+    #[error(
+        "node {node} joins with `JoinPolicy::All`, but its incoming edges {first} and \
+         {second} are arms of one routing group on node {from}. A group emits at most \
+         one token, so the two edges never both deliver and node {node} can never run"
+    )]
+    AllJoinExclusiveArms {
+        node:   NodeId<S>,
+        from:   NodeId<S>,
+        first:  EdgeId<S>,
+        second: EdgeId<S>,
+    },
 }
 
 /// Node ids joined for a message: a cycle is a list, and `Vec` has no
@@ -203,6 +216,7 @@ impl<S> ValidationError<S> {
             | Self::ExitNotPostdominator { .. }
             | Self::BoundaryCrossing { .. } => "validate.expansion_region",
             Self::EntryHasIncoming(_) => "validate.entry_has_incoming",
+            Self::AllJoinExclusiveArms { .. } => "validate.all_join_exclusive_arms",
         }
     }
 
@@ -233,7 +247,8 @@ impl<S> ValidationError<S> {
             | Self::BoundaryCrossing { node, .. }
             | Self::ZeroBudget(node)
             | Self::UnboundedLoopBudget(node)
-            | Self::LoopHeadMustJoinAny(node) => ValidationLocation::Node(*node),
+            | Self::LoopHeadMustJoinAny(node)
+            | Self::AllJoinExclusiveArms { node, .. } => ValidationLocation::Node(*node),
             Self::UnknownTarget { edge, .. }
             | Self::DuplicateEdgeId(edge)
             | Self::ReservedEdgeId(edge) => ValidationLocation::Edge(*edge),
@@ -279,7 +294,8 @@ impl<S> ValidationError<S> {
             | Self::EntryHasIncoming(node)
             | Self::ZeroBudget(node)
             | Self::UnboundedLoopBudget(node)
-            | Self::LoopHeadMustJoinAny(node) => Some(*node),
+            | Self::LoopHeadMustJoinAny(node)
+            | Self::AllJoinExclusiveArms { node, .. } => Some(*node),
             Self::UnknownTarget { from, .. } => Some(*from),
             Self::CycleWithoutBackEdge(nodes) => nodes.first().copied(),
             Self::ScopeIdMismatch { .. }
@@ -307,6 +323,9 @@ impl<S> ValidationError<S> {
             Self::AlwaysNotLast { .. } => {
                 Some("move the `Guard::Always` arm to the end of its select group")
             }
+            Self::AllJoinExclusiveArms { .. } => Some(
+                "join with `Any` to run on whichever arm the group picks, or send each arm to a node of its own",
+            ),
             _ => None,
         }
     }
@@ -492,6 +511,7 @@ fn collect_body_tail<S>(body: &GraphBody<S>, errors: &mut Vec<ValidationError<S>
     check_back_edges(body, errors);
     check_budgets(body, errors);
     check_loop_head_joins(body, errors);
+    check_all_join_arms(body, errors);
     check_expansions(body, errors);
 }
 
@@ -1017,6 +1037,55 @@ fn check_loop_head_joins<S>(graph: &GraphBody<S>, errors: &mut Vec<ValidationErr
             && node.join != JoinPolicy::Any
         {
             errors.push(ValidationError::LoopHeadMustJoinAny(head));
+        }
+    }
+}
+
+// ── Invariant 10 ──────────────────────────────────────────────────────────
+
+/// Nodes whose join invariant 10 leaves alone. A loop head already has to
+/// join with `Any` (invariant 8), and a restart target is entered by the
+/// successor execution directly, without waiting on its join.
+fn join_exempt<S>(graph: &GraphBody<S>) -> BTreeSet<NodeId<S>> {
+    graph
+        .edges()
+        .filter(|edge| edge.back || edge.transition == EdgeTransition::Restart)
+        .map(|edge| edge.to)
+        .collect()
+}
+
+/// Invariant 10, for `All`: the join may not count two arms of one routing
+/// group.
+///
+/// A group emits at most one token each time its node fires, and a node fires
+/// at most once per generation, so two arms of one group never both deliver
+/// to the same `(node, generation)`. An `All` join over both waits forever,
+/// and under `Completion::AnyFailure` the run still reports success.
+/// Expansion does not change this: every clone copies the group whole.
+fn check_all_join_arms<S>(graph: &GraphBody<S>, errors: &mut Vec<ValidationError<S>>) {
+    let exempt = join_exempt(graph);
+    for source in &graph.nodes {
+        for group in &source.routing.groups {
+            let mut arms: BTreeMap<NodeId<S>, Vec<EdgeId<S>>> = BTreeMap::new();
+            for arm in &group.arms {
+                arms.entry(arm.to).or_default().push(arm.id);
+            }
+            for (node, edges) in arms {
+                let joins_all = graph
+                    .node(node)
+                    .is_some_and(|target| target.join == JoinPolicy::All);
+                if let [first, second, ..] = edges[..]
+                    && joins_all
+                    && !exempt.contains(&node)
+                {
+                    errors.push(ValidationError::AllJoinExclusiveArms {
+                        node,
+                        from: source.id,
+                        first,
+                        second,
+                    });
+                }
+            }
         }
     }
 }

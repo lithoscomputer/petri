@@ -1,6 +1,7 @@
 //! §3/§4 over random acyclic flows: the join rules hold for every graph and
 //! every order a host finishes steps in, not only for the hand-written cases
-//! in `joins.rs`.
+//! in `joins.rs`. §8 invariant 10 is checked against the same runs: a join it
+//! rejects never runs.
 
 mod flow;
 mod support;
@@ -9,7 +10,7 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use engine::EngineState;
 use flow::{FlowCase, JoinSpec};
-use ir::{EdgeId, NodeId, validate};
+use ir::{EdgeId, Graph, NodeId, ValidationError, validate};
 use proptest::prelude::*;
 use proptest::test_runner::TestCaseError;
 
@@ -40,12 +41,25 @@ fn satisfies(join: JoinSpec, incoming: &BTreeSet<EdgeId>, tokens: &BTreeSet<Edge
         }
 }
 
+/// The nodes §8 invariant 10 rejects. The generator breaks no other
+/// invariant.
+fn rejected_joins(graph: &Graph) -> Result<BTreeSet<NodeId>, TestCaseError> {
+    let Err(errors) = validate(graph) else {
+        return Ok(BTreeSet::new());
+    };
+    errors
+        .iter()
+        .map(|error| match error {
+            ValidationError::AllJoinExclusiveArms { node, .. } => Ok(*node),
+            other => Err(TestCaseError::fail(format!(
+                "the generator built an invalid graph: {other}"
+            ))),
+        })
+        .collect()
+}
+
 fn check_join_rules(case: &FlowCase) -> Result<(), TestCaseError> {
-    let graph = case.graph();
-    prop_assert!(
-        validate(&graph).is_ok(),
-        "the generator builds valid graphs"
-    );
+    let rejected = rejected_joins(&case.graph())?;
 
     let run = flow::run(case);
     let state = &run.harness.state;
@@ -64,6 +78,16 @@ fn check_join_rules(case: &FlowCase) -> Result<(), TestCaseError> {
         prop_assert!(
             satisfies(join, &incoming(state, start.node), &tokens),
             "{} started on {tokens:?} under {join:?}",
+            start.node
+        );
+    }
+
+    // Invariant 10 rejects only joins that can never run. The core runs a
+    // graph whether or not it validated, and never starts one.
+    for start in &run.starts {
+        prop_assert!(
+            !rejected.contains(&start.node),
+            "invariant 10 rejected {}, which ran",
             start.node
         );
     }
@@ -108,9 +132,10 @@ fn check_join_rules(case: &FlowCase) -> Result<(), TestCaseError> {
 proptest! {
     #![proptest_config(ProptestConfig::with_cases(512))]
 
-    /// Joins are sound and complete, each node fires at most once, the run
-    /// status folds from the records, and replay is byte-identical — for
-    /// every generated graph and host schedule.
+    /// Joins are sound and complete, each node fires at most once, a join
+    /// invariant 10 rejects never runs, the run status folds from the
+    /// records, and replay is byte-identical — for every generated graph and
+    /// host schedule.
     #[test]
     fn random_acyclic_flows_keep_the_join_rules(case in flow::flow_case()) {
         check_join_rules(&case)?;

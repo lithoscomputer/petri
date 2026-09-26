@@ -105,6 +105,11 @@ gather:
   join: { quorum: 2 }  # tokens on two distinct incoming edges
 ```
 
+Only one arm of a `select:` ever emits, so `join: all` cannot wait on two arms
+of one select: the node would never run, and loading rejects it
+(`validate.all_join_exclusive_arms`). Use `join: any` on the node a select's
+arms meet at.
+
 ## Preconditions
 
 `if:` is evaluated in the node's own context before it runs. False means the node

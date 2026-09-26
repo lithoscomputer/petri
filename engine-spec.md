@@ -629,6 +629,14 @@ strict/unknown-field-lint mode is a v2 seam.
 9. `Completion::TerminalNode(id)`: the node must exist. Nothing more — the node
    is *expected* to be terminal, but the semantics only need a final record, so
    terminal shape and reachability rules belong to frontends.
+10. **Every join can be satisfied.** A routing group emits at most one token
+    each time its node fires, and a node fires at most once per generation, so
+    two arms of one group never both deliver to one `(node, generation)`. An
+    `All` join may not count two arms of one group: it would wait forever, and
+    under `AnyFailure` the run would still report success. Expansion does not
+    change this, since every clone copies its groups whole. Loop heads
+    (invariant 8 already requires `Any`) and restart targets (a successor
+    execution enters them directly, without the join) are exempt.
 
 **Lint (warning, not error):** possible scope re-entry after release — a node
 outside a scope both reachable from it and reaching back into it. Suppressed

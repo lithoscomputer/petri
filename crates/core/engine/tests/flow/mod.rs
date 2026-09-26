@@ -5,8 +5,11 @@
 //! them in. Node `i` routes only to nodes after it, so every run ends. Each
 //! routing group picks its first arm whose guard passes: `always`,
 //! `success()` or `failure()` over the node's own outcome. Joins are `All`,
-//! `Any` or `Quorum { n }`, with `n` allowed past the in-degree so the
-//! unsatisfiable joins validation accepts are covered too.
+//! `Any` or `Quorum { n }`.
+//!
+//! Some generated joins can never be satisfied, such as an `All` join over two
+//! arms of one routing group. §8 invariant 10 rejects those graphs; the tests
+//! run them anyway, to check that such a node never starts.
 //!
 //! The case is also the wire format of the Lean model check: its JSON is
 //! what `lean/PetriModel/Wire.lean` reads, and [`Observed`] is what the model

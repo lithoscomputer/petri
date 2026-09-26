@@ -6,9 +6,10 @@ use std::time::Duration;
 
 use ir::placeholder::EXPR_PLACEHOLDER_KEY;
 use ir::{
-    Arm, Budget, Completion, Edge, EdgeId, ExpandTarget, Expansion, ExprId, ExprTable, Graph,
-    GraphBuilder, Guard, JoinPolicy, Node, NodeId, Routing, Scope, ScopeId, SelectGroup,
-    StepKindId, StepRef, ValidationError, ValidationLocation, ValidationWarning, Value, validate,
+    Arm, Budget, Completion, Edge, EdgeId, EdgeTransition, ExpandTarget, Expansion, ExprId,
+    ExprTable, Graph, GraphBuilder, Guard, JoinPolicy, Node, NodeId, Routing, Scope, ScopeId,
+    SelectGroup, StepKindId, StepRef, ValidationError, ValidationLocation, ValidationWarning,
+    Value, validate,
 };
 use serde_json::json;
 
@@ -102,6 +103,15 @@ fn structural_errors_have_distinct_codes() {
         (
             ValidationError::CompletionUnknownNode(node),
             "validate.completion_unknown_node",
+        ),
+        (
+            ValidationError::AllJoinExclusiveArms {
+                node,
+                from: NodeId::new(0),
+                first: EdgeId::new(0),
+                second: EdgeId::new(1),
+            },
+            "validate.all_join_exclusive_arms",
         ),
     ];
     for (error, expected) in &cases {
@@ -505,6 +515,63 @@ fn a_multi_branch_join_needs_its_own_node_in_front_of_a_loop_head() {
     b.select(head, vec![Arm::always(head).with_back()]);
     b.set_budget(head, Budget::looped(5));
     validate(&b.build()).expect("valid");
+}
+
+/// Invariant 10: an `All` join may not count two arms of one routing group.
+/// The group emits one token, so the join would wait forever.
+#[test]
+fn an_all_join_cannot_wait_on_two_arms_of_one_group() {
+    let build = |join: JoinPolicy| {
+        let mut b = GraphBuilder::new();
+        let scope = ScopeId::new(0);
+        let classify = b.add_step("classify", scope, NOOP);
+        let done = b.add_step("done", scope, NOOP);
+        let small = b.exprs().call("success", Vec::new());
+        b.select(classify, vec![Arm::when(done, small), Arm::always(done)]);
+        b.set_join(done, join);
+        (b.build(), classify, done)
+    };
+
+    let (graph, classify, done) = build(JoinPolicy::All);
+    let errors = errors(&graph);
+    assert_eq!(errors, vec![ValidationError::AllJoinExclusiveArms {
+        node:   done,
+        from:   classify,
+        first:  EdgeId::new(0),
+        second: EdgeId::new(1),
+    }]);
+    assert_eq!(errors[0].primary_node(), Some(done));
+    assert!(errors[0].hint().is_some());
+
+    let (graph, ..) = build(JoinPolicy::Any);
+    validate(&graph).expect("`Any` runs on whichever arm the group picks");
+}
+
+/// Separate groups each emit their own token, so an `All` join may count an
+/// arm from each.
+#[test]
+fn an_all_join_may_wait_on_arms_of_separate_groups() {
+    let mut b = GraphBuilder::new();
+    let scope = ScopeId::new(0);
+    let start = b.add_step("start", scope, NOOP);
+    let done = b.add_step("done", scope, NOOP);
+    let group = || vec![Arm::always(done)];
+    b.fan_out_groups(start, vec![group(), group()]);
+    validate(&b.build()).expect("both groups emit");
+}
+
+/// A successor execution enters a restart target directly, without its join,
+/// so invariant 10 leaves the target alone.
+#[test]
+fn a_restart_target_is_exempt_from_invariant_10() {
+    let mut b = GraphBuilder::new();
+    let scope = ScopeId::new(0);
+    let classify = b.add_step("classify", scope, NOOP);
+    let done = b.add_step("done", scope, NOOP);
+    let again = b.exprs().call("failure", Vec::new());
+    b.select(classify, vec![Arm::when(done, again), Arm::always(done)]);
+    b.node_mut(classify).routing.groups[0].arms[0].transition = EdgeTransition::Restart;
+    validate(&b.build()).expect("the restart target is exempt");
 }
 
 /// A scope a path can leave and return to gets a warning, not an error: release

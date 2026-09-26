@@ -14,6 +14,9 @@ For one `(node, generation)` key:
   a join.
 * `all_fires_iff`, `any_fires_iff`, `quorum_fires_iff`: the policies, stated
   over the arrivals.
+* `all_never_fires`: an `All` join that counts two edges of which at most one
+  ever delivers never fires. Two arms of one routing group are such a pair,
+  and §8 invariant 10 rejects the join.
 * `quorum_never_fires`: a `Quorum n` whose tokens come only from fewer than
   `max n 1` incoming edges never fires. Load-time validation accepts such a
   node today.
@@ -210,6 +213,21 @@ theorem all_fires_iff (incoming : List Nat) {es : List Nat} (hne : es ≠ []) :
   | cons x xs =>
     simp only [satisfied, List.all_eq_true, List.contains_iff_mem, ← hc, mem_collect,
       List.not_mem_nil, false_or]
+
+/-- An `All` join that counts two edges of which at most one ever delivers
+never fires. A routing group emits at most one arm (`Flow.emit` returns an
+`Option`), so two arms of one group are such a pair: what §8 invariant 10
+rejects. -/
+theorem all_never_fires {incoming es : List Nat} {e₁ e₂ : Nat} (h₁ : e₁ ∈ incoming)
+    (h₂ : e₂ ∈ incoming) (hexcl : ¬ (e₁ ∈ es ∧ e₂ ∈ es)) :
+    (arriveAll .all incoming {} es).fired = false := by
+  cases es with
+  | nil => rfl
+  | cons e es =>
+    cases h : (arriveAll .all incoming {} (e :: es)).fired
+    · rfl
+    · have hall := (all_fires_iff incoming (List.cons_ne_nil e es)).mp h
+      exact absurd ⟨hall e₁ h₁, hall e₂ h₂⟩ hexcl
 
 /-- `Any` fires on the first token. -/
 theorem any_fires_iff (incoming es : List Nat) :
