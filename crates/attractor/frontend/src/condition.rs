@@ -11,10 +11,11 @@
 //! ```
 //!
 //! Keys: `outcome` (the stage outcome), `preferred_label` (the reported
-//! label), and anything else is a flat run-context key — `context.K` and
-//! bare `K` both read `kv.K`. Every clause lowers onto Fabro's documented
-//! comparison semantics, spelled out as expressions rather than as new
-//! builtins; see [`lower`].
+//! label), `nodes.<id>.<field>` (a completed node's record: `status`,
+//! `output`, `generation`, `attempts`, `success_like`), and anything else
+//! is a flat run-context key — `context.K` and bare `K` both read `kv.K`.
+//! Every clause lowers onto Fabro's documented comparison semantics,
+//! spelled out as expressions rather than as new builtins; see [`lower`].
 
 use frontend::{Diagnostics, Span};
 use ir::{BinOp, ExprId, ExprTable, UnOp};
@@ -287,10 +288,21 @@ impl Builder<'_> {
         self.table.call("to_string", vec![defaulted])
     }
 
-    /// What a key names: the run-context value, or the reported label.
+    /// What a key names: the run-context value, the reported label, or a
+    /// completed node's record.
     fn key_value(&mut self, key: &str) -> ExprId {
         if key == "preferred_label" {
             return self.table.path("output", &["preferred_label"]);
+        }
+        // `nodes.<id>.<field>`: the completed record of node `<id>` —
+        // `generation` is the loop-guard family's counter (fabro-51ad:
+        // this lowered onto a literal kv lookup that never exists, so a
+        // `nodes.<id>.generation >= N` guard could never fire). The last
+        // dot separates the field, so node names keep their own dots.
+        if let Some(rest) = key.strip_prefix("nodes.")
+            && let Some((node, field)) = rest.rsplit_once('.')
+        {
+            return self.table.path("nodes", &[node, field]);
         }
         let key = key.strip_prefix("context.").unwrap_or(key);
         let kv = self.table.var("kv");

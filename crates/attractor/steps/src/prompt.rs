@@ -543,11 +543,34 @@ impl Step for PromptStep {
             .insert(SmolStr::new("last_stage"), json!(config.node));
         match parsed {
             Parsed::Directive(directive) => directive.apply_to(&mut stage),
+            // Fabro's schema contracts promise routing-kind context_updates
+            // semantics: a top-level `context_updates` object inside the
+            // validated response reaches the run context exactly like a
+            // routing directive's does, so later stages can read the keys
+            // through `stdin_source`/kv. Without this spread, a schema'd
+            // stage's updates stay buried under `output.<node>` and every
+            // downstream reader resolves them as missing.
             Parsed::Structured(value) => {
                 stage.output.insert("structured".into(), value.clone());
                 stage
                     .context_updates
-                    .insert(SmolStr::new(format!("output.{}", config.node)), value);
+                    .insert(SmolStr::new(format!("output.{}", config.node)), value.clone());
+                if let Some(updates) = value.get("context_updates").and_then(Value::as_object) {
+                    for (key, item) in updates {
+                        stage.context_updates.insert(SmolStr::new(key.clone()), item.clone());
+                    }
+                }
+                // The routing contract survives the schema contract: routing fields
+                // the directive kind applies, a schema response carries too (Fabro's
+                // schema files document "keeps the routing contract" — required routing
+                // fields, label enums). Without this extraction every conditional edge
+                // on preferred_label falls through to the catch-all under a schema.
+                if let Some(label) = value.get("preferred_next_label").and_then(Value::as_str) {
+                    stage.output.insert("preferred_label".into(), json!(label));
+                }
+                if let Some(ids) = value.get("suggested_next_ids") {
+                    stage.output.insert("suggested_next_ids".into(), ids.clone());
+                }
             }
             Parsed::Plain => {}
         }

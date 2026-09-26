@@ -277,6 +277,35 @@ async fn a_json_schema_contract_writes_the_structured_output() {
     assert!(sent.contains("<output_schema>"), "{sent}");
 }
 
+#[tokio::test]
+async fn a_json_schema_contract_spreads_top_level_context_updates() {
+    // Fabro's schema contracts promise routing-kind context_updates
+    // semantics: a top-level context_updates object inside the validated
+    // response reaches the run context like a directive's does, so a
+    // later stage can read the keys through stdin_source/kv.
+    let (report, _, _) = run(
+        "prompt-schema-context",
+        r#"
+        p [shape=tab, prompt="Count.", output_schema="{\"type\":\"object\",\"required\":[\"n\"],\"properties\":{\"n\":{\"type\":\"integer\"},\"context_updates\":{\"type\":\"object\"}}}"]
+        start -> p -> exit
+    "#,
+        vec![ScriptedCompletion::response(text_response(
+            r#"{"n": 3, "context_updates": {"seed": "seeds-1", "brief": "do it"}}"#,
+        ))],
+    )
+    .await;
+    assert_eq!(
+        report.status,
+        RunStatus::Success,
+        "{:?}",
+        report.state.errors()
+    );
+    let kv = report.state.run_context();
+    assert_eq!(kv.get("output.p"), Some(&json!({ "n": 3, "context_updates": {"seed": "seeds-1", "brief": "do it"} })));
+    assert_eq!(kv.get("seed"), Some(&json!("seeds-1")));
+    assert_eq!(kv.get("brief"), Some(&json!("do it")));
+}
+
 #[test]
 fn acp_on_a_prompt_node_is_refused_as_fabro_refuses_it() {
     let lowered = frontend_attractor::load(

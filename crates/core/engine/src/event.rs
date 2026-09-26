@@ -124,6 +124,13 @@ pub struct RoutingCandidate {
     pub target:     SmolStr,
     pub rank:       Option<f64>,
     pub transition: ir::EdgeTransition,
+    /// The edge is a back edge — a cycle continuation inside this
+    /// execution. The failure circuit breaker reads it: a tripped
+    /// signature blocks a cycle's own continuation, never the graph's
+    /// explicit exit from it. Defaults false for logs recorded before
+    /// the field existed.
+    #[serde(default)]
+    pub back:       bool,
 }
 
 /// The core's proposal for one routing group.
