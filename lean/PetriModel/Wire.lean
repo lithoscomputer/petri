@@ -1,7 +1,7 @@
 import Lean.Data.Json.Parser
 import Lean.Data.Json.Printer
 import Lean.Data.Json.FromToJson.Basic
-import PetriModel.Flow
+import PetriModel.Retry
 import PetriModel.Pick
 
 /-!
@@ -56,14 +56,36 @@ def arm (j : Json) : Except String Flow.Arm := do
     back := ← (← field j "back").getBool?
     edge := ← (← field j "edge").getNat? }
 
-def node (j : Json) : Except String Flow.Node := do
+def outcome (j : Json) : Except String Flow.Outcome := do
+  match ← j.getStr? with
+  | "success" => pure .success
+  | "failure" => pure .failure
+  | "flaky" => pure .flaky
+  | "timed_out" => pure .timedOut
+  | other => throw s!"unknown outcome `{other}`"
+
+def retry (j : Json) : Except String Flow.Retry := do
+  return {
+    maxAttempts := ← (← field j "max_attempts").getNat?
+    retryOn := ← (do
+      match ← (← field j "retry_on").getStr? with
+      | "default" => pure .default
+      | "flaky" => pure .flaky
+      | other => throw s!"unknown retry_on `{other}`")
+    acceptPartial := ← (← field j "accept_partial").getBool?
+    initialNanos := ← (← field j "initial_nanos").getNat?
+    factorBits := UInt64.ofNat (← (← field j "factor_bits").getNat?)
+    maxNanos := ← (← field j "max_nanos").getNat? }
+
+def node (j : Json) : Except String Flow.SpecNode := do
   return {
     join := ← join (← field j "join")
     maxFirings := ← (← field j "max_firings").getNat?
-    outcomes := ← list (← field j "outcomes") (·.getBool?)
+    retry := ← retry (← field j "retry")
+    outcomes := ← list (← field j "outcomes") (list · outcome)
     groups := ← list (← field j "groups") (list · arm) }
 
-def flowCase (j : Json) : Except String Flow.Case := do
+def flowCase (j : Json) : Except String Flow.Spec := do
   return {
     nodes := ← list (← field j "nodes") node
     schedule := ← list (← field j "schedule") (·.getNat?) }
@@ -78,7 +100,10 @@ def observed (o : Flow.Observed) : Json :=
     ("finished", .arr (o.finished.map key).toArray),
     ("parked", .arr (o.parked.map fun (n, g, e) => nats [n, g, e]).toArray),
     ("budget_exceeded", nats o.budgetExceeded),
-    ("status", .str o.status)]
+    ("status", .str o.status),
+    ("attempts", .arr (o.attempts.map fun (n, g, k, tag) =>
+      .arr #[toJson n, toJson g, toJson k, .str tag]).toArray),
+    ("retries", .arr (o.retries.map fun (n, g, k, d) => nats [n, g, k, d]).toArray)]
 
 /-! ## Picks -/
 
@@ -131,7 +156,7 @@ def answer (line : String) : Except String Json := do
   match query.getObjValD "flow", query.getObjValD "pick" with
   | .null, .null => throw "expected a `flow` or `pick` query"
   | .null, q => return picked (Pick.pick (← proposal (← field q "proposal")) (← optional q "draw" draw))
-  | q, _ => return observed (Flow.run (← flowCase q))
+  | q, _ => return observed (Flow.Spec.run (← flowCase q))
 
 def respond (line : String) : String :=
   match answer line with

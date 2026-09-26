@@ -16,13 +16,27 @@ Nothing here translates Rust into Lean.
 | --- | --- | --- |
 | `PetriModel/Join.lean` | `on_token`, `try_fire`, `is_join_satisfied` in `crates/core/engine/src/apply.rs` | `engine-spec.md` §3, §4 |
 | `PetriModel/Pick.lean` | `deterministic_pick` in `crates/core/engine/src/apply.rs` | `engine-spec.md` §2, §6 |
-| `PetriModel/Flow.lean` | a whole run of the flows the Rust generator makes, loops and budgets included | `crates/core/engine/tests/flow/mod.rs`, `engine-spec.md` §4 |
+| `PetriModel/Flow.lean` | a whole run of the flows the Rust generator makes, loops and budgets included, as routing sees it | `crates/core/engine/tests/flow/mod.rs`, `engine-spec.md` §4 |
+| `PetriModel/Retry.lean` | `RetryPolicy` (`should_retry`, `finalize`, `base_delay`) and the retry path of `on_step_finished` | `crates/core/ir/src/graph.rs`, `engine-spec.md` §3.1, §4 |
 
 In the flow model, a back arm starts the next generation, joins match per
 `(node, generation)`, and a node fires at most its budget; a key the budget
 refuses is marked fired and routes nothing (`engine-spec.md` §4, "Budget
-refusal"). The model leaves out retries, cancellation, expansions,
-preconditions and splices. The Rust generator does not produce them either.
+refusal"). Routing sees only the status each firing records; the retry
+layer turns a generated case, with its retry policies and scripted attempts,
+into that view, and adds the attempt counts and each retry's base delay. The
+model leaves out cancellation, expansions, preconditions and splices. The
+Rust generator does not produce them either.
+
+The base delay is computed in `Float`, which is IEEE 754 double precision
+like Rust's `f64`, with the same order of operations, so the comparison
+checks it bit for bit. Nothing about it is proved.
+
+One place the model is stricter than the engine: when `AcceptPartial`
+converts an exhausted timeout, the model keeps the timeout inside the partial
+success, as `engine-spec.md` §3.1 rule 3 asks, but the engine records
+`underlying: None`, because `TimedOut` carries no `FailureInfo`. The
+comparison sees only status tags, so it does not flag this.
 
 A rank in `deterministic_pick` is an `f64` compared with `f64::total_cmp`.
 The model carries the rank's bit pattern and compares the same key
@@ -68,6 +82,19 @@ For whole runs, loops included (`PetriModel/Thm/Flow.lean`):
   budgets allow (their sum, plus one), so `run` never reports `unsettled`
   (`run_not_unsettled`).
 
+For retries (`PetriModel/Thm/Retry.lean`):
+
+- `attempts_le_limit`: a firing never takes more attempts than its limit.
+- `retried_only_retryable`: every attempt before the last is one the policy
+  retries; so `success_is_final`: a success always ends the firing.
+- `attempts_exhausted`: a firing stops early only on an outcome its policy
+  does not retry.
+- `accept_partial_keeps_the_failure`: a partial success is recorded only under
+  `AcceptPartial`, and keeps the retryable failure it came from.
+- `retries_invisible`: a run and the same run with every firing cut to its
+  last attempt, one attempt allowed, look the same to routing and the run
+  context. Only the attempt counts and the retries differ.
+
 For `deterministic_pick` (`PetriModel/Thm/Pick.lean`):
 
 - `select_count`: a weighted draw is proportional. Of the rolls
@@ -91,14 +118,15 @@ real core's:
 
 - `flow_runs_match_the_lean_model`: which `(node, generation)` firings start
   after each host step, the order they finish in, the tokens left waiting at
-  the end, the budget refusals, and the run status.
+  the end, the budget refusals, the run status, each firing's attempts and
+  recorded status, and each retry's base delay.
 - `deterministic_pick_matches_the_lean_model`: the picked edge, or the
   reason for a refusal. A new refusal message in Rust fails the test until
   the model has it too.
 
-`crates/core/engine/tests/flow_properties.rs` checks the join, generation
-and budget rules on the same generator without Lean, so it runs in every
-`mise run test`.
+`crates/core/engine/tests/flow_properties.rs` checks the join, generation,
+budget and retry rules on the same generator without Lean, so it runs in
+every `mise run test`.
 
 ## Commands
 

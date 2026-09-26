@@ -112,8 +112,9 @@ proptest! {
     #![proptest_config(ProptestConfig::with_cases(512))]
 
     /// Which (node, generation) firings start after each host step, the order
-    /// they finish in, the tokens left waiting, the budget refusals and the
-    /// run status all match the model.
+    /// they finish in, the tokens left waiting, the budget refusals, the run
+    /// status, each firing's attempts and recorded status, and each retry's
+    /// base delay, bit for bit, all match the model.
     #[test]
     fn flow_runs_match_the_lean_model(case in flow::flow_case()) {
         let Some(answer) = ask(&json!({ "flow": &case })) else {
