@@ -182,6 +182,43 @@ nodes:
     );
 }
 
+/// A sequential `for_each` in one branch and a plain step in another, meeting
+/// at `join: all`: the join matches only a loop that never iterated, so
+/// loading warns.
+#[test]
+fn a_join_after_a_sequential_for_each_and_another_branch_gets_a_warning() {
+    let lowered = load(
+        "test.yml",
+        r"
+nodes:
+  start:
+    run: echo go
+    parallel: [plan, side]
+  plan:
+    run: echo plan
+    next: work
+  work:
+    for_each:
+      items: ${{ split('a,b', ',') }}
+      parallel: false
+    run: echo work
+    next: report
+  side:
+    run: echo side
+    next: report
+  report:
+    run: echo report
+",
+    );
+    assert!(lowered.graph.is_some(), "a warning does not block the load");
+    let warning = lowered
+        .diagnostics
+        .iter()
+        .find(|d| d.code == "lint.join_across_generations")
+        .expect("the join is warned about");
+    assert_eq!(warning.severity, Severity::Warning);
+}
+
 /// `quorum: 1` on a loop head is normalized, not rejected.
 #[test]
 fn quorum_one_on_a_loop_head_is_normalized_to_any() {

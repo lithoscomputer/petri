@@ -201,6 +201,11 @@ back edge and generations, exactly as the spec describes (§5):
 Inside the body, `${{ item }}` and `${{ index }}` read `input.items[input.idx]` and
 `input.idx`, so a body reads the same either way.
 
+The exit carries the loop's last generation. A `join: all` node that the exit and a
+branch outside the loop both feed therefore waits forever once the loop has run
+more than once, and loading warns (`lint.join_across_generations`). No spelling
+expresses that wait yet (engine spec §14).
+
 ```yaml
 plan:
   run: printf 'regions<<EOF\nus-east\nus-west\neu\nEOF\n' > "$CI_OUTPUT"
