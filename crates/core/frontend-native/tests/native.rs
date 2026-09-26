@@ -136,6 +136,52 @@ nodes:
     lower_ok(&text("any"));
 }
 
+/// Invariant 10: a quorum needs as many incoming routes as it counts. After a
+/// `for_each`, the clones supply them at run time.
+#[test]
+fn a_quorum_needs_its_routes_unless_a_for_each_supplies_them() {
+    let diags = diagnostics(
+        r"
+nodes:
+  start:
+    run: echo go
+    parallel: [a, b]
+  a:
+    run: echo a
+    next: gate
+  b:
+    run: echo b
+    next: gate
+  gate:
+    join: { quorum: 3 }
+    run: echo gate
+",
+    );
+    let error = diags
+        .iter()
+        .find(|d| d.code == "validate.quorum_exceeds_fan_in")
+        .expect("invariant 10 is reported");
+    assert_eq!(error.severity, Severity::Error);
+    assert_eq!(error.span.line, 13, "points at `gate`");
+
+    lower_ok(
+        r"
+nodes:
+  plan:
+    run: echo go
+    next: deploy
+  deploy:
+    for_each:
+      items: ${{ split('a,b,c', ',') }}
+    run: echo deploying
+    next: report
+  report:
+    join: { quorum: 2 }
+    run: echo report
+",
+    );
+}
+
 /// `quorum: 1` on a loop head is normalized, not rejected.
 #[test]
 fn quorum_one_on_a_loop_head_is_normalized_to_any() {

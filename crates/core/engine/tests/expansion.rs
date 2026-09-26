@@ -466,3 +466,33 @@ fn a_tiered_template_node_routes_its_clones() {
         "every clone's tier found its own arm"
     );
 }
+
+/// Each clone is entered by one seed token and keeps the template's join, so
+/// a `Quorum { n: 2 }` on the `for_each` node admits the template but no
+/// clone, and the run still reports success. This is why §8 invariant 10
+/// rejects that join; if clones ever skip their join, relax the rule.
+#[test]
+fn a_quorum_on_the_for_each_node_never_runs_a_clone() {
+    let mut b = GraphBuilder::new();
+    let scope = ir::ScopeId::new(0);
+    let start = b.add_step("start", scope, NOOP);
+    let left = b.add_step("left", scope, NOOP);
+    let right = b.add_step("right", scope, NOOP);
+    let deploy = b.add_step("deploy", scope, NOOP);
+    let collect = b.add_step("collect", scope, NOOP);
+    b.fan_out(start, &[left, right]);
+    b.link(left, deploy);
+    b.link(right, deploy);
+    b.link(deploy, collect);
+    b.set_join(deploy, JoinPolicy::Quorum { n: 2 });
+    let items = b.exprs().lit(json!(["a", "b"]));
+    parallel_for_each(&mut b, deploy, items, ExpandTarget::Node, None, false);
+    let graph = b.build();
+    assert!(validate(&graph).is_err(), "invariant 10 rejects the graph");
+
+    let mut h = Harness::new(graph);
+    assert_eq!(h.run(), RunStatus::Success);
+    assert_eq!(h.start_count("left") + h.start_count("right"), 2);
+    assert_eq!(h.start_count("deploy"), 0, "no clone runs");
+    assert_eq!(h.start_count("collect"), 0);
+}

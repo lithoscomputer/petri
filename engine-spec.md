@@ -634,9 +634,15 @@ strict/unknown-field-lint mode is a v2 seam.
     two arms of one group never both deliver to one `(node, generation)`. An
     `All` join may not count two arms of one group: it would wait forever, and
     under `AnyFailure` the run would still report success. Expansion does not
-    change this, since every clone copies its groups whole. Loop heads
+    change this, since every clone copies its groups whole. A `Quorum { n }`
+    needs `n` routing groups that can feed it, an entry's seed counting as one;
+    the node a `for_each` body exits to is exempt, since each clone adds a
+    group at run time. A `for_each` node may not join with `Quorum { n >= 2 }`:
+    each clone is entered by one seed and applies the same join. Loop heads
     (invariant 8 already requires `Any`) and restart targets (a successor
-    execution enters them directly, without the join) are exempt.
+    execution enters them directly, without the join) are exempt. A splice
+    fragment is checked for `All` only: attachment adds groups, so its nodes'
+    fan-in is known when the fragment applies.
 
 **Lint (warning, not error):** possible scope re-entry after release — a node
 outside a scope both reachable from it and reaching back into it. Suppressed

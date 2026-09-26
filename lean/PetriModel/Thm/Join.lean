@@ -17,9 +17,10 @@ For one `(node, generation)` key:
 * `all_never_fires`: an `All` join that counts two edges of which at most one
   ever delivers never fires. Two arms of one routing group are such a pair,
   and §8 invariant 10 rejects the join.
-* `quorum_never_fires`: a `Quorum n` whose tokens come only from fewer than
-  `max n 1` incoming edges never fires. Load-time validation accepts such a
-  node today.
+* `quorum_never_fires_by_groups`: a `Quorum n` fed by fewer than `max n 1`
+  routing groups never fires, when each group delivers at most one edge.
+  §8 invariant 10 rejects the join. `quorum_never_fires` is the special case
+  of one group per edge.
 -/
 
 namespace PetriModel.Join
@@ -258,6 +259,48 @@ theorem quorum_never_fires (n : Nat) {incoming es : List Nat} (hin : ∀ e ∈ e
     simp only [mem_collect, List.not_mem_nil, false_or] at hx
     exact hin x hx
   have hle := List.Nodup.length_le_of_subset (collect_nodup es List.nodup_nil) hsub
+  have : ¬ max n 1 ≤ (collect [] es).length := by omega
+  cases h : (arriveAll (.quorum n) incoming {} es).fired
+  · rfl
+  · exact absurd ((quorum_fires_iff n incoming es).mp h) this
+
+/-- A map that is one-to-one on a list without duplicates keeps it without
+duplicates. -/
+theorem nodup_map_of_injOn {f : Nat → Nat} :
+    ∀ {l : List Nat}, l.Nodup → (∀ x ∈ l, ∀ y ∈ l, f x = f y → x = y) → (l.map f).Nodup
+  | [], _, _ => List.nodup_nil
+  | a :: l, h, hinj => by
+    rw [List.nodup_cons] at h
+    rw [List.map_cons, List.nodup_cons]
+    refine ⟨?_, nodup_map_of_injOn h.2 fun x hx y hy =>
+      hinj x (List.mem_cons_of_mem _ hx) y (List.mem_cons_of_mem _ hy)⟩
+    intro hmem
+    obtain ⟨b, hb, hfb⟩ := List.mem_map.mp hmem
+    have := hinj b (List.mem_cons_of_mem _ hb) a List.mem_cons_self hfb
+    exact h.1 (this ▸ hb)
+
+/-- A `Quorum n` fed by fewer than `max n 1` routing groups never fires, when
+each group delivers at most one edge. `group` names the routing group an edge
+belongs to; a group emits at most one arm (`Flow.emit` returns an `Option`),
+so no two distinct edges of one group arrive. What §8 invariant 10 rejects. -/
+theorem quorum_never_fires_by_groups (n : Nat) {incoming es groups : List Nat}
+    (group : Nat → Nat) (hin : ∀ e ∈ es, group e ∈ groups)
+    (hone : ∀ e₁ ∈ es, ∀ e₂ ∈ es, group e₁ = group e₂ → e₁ = e₂)
+    (hlt : groups.length < max n 1) :
+    (arriveAll (.quorum n) incoming {} es).fired = false := by
+  have hmem : ∀ x, x ∈ collect [] es ↔ x ∈ es := by
+    intro x
+    simp only [mem_collect, List.not_mem_nil, false_or]
+  have hnodup := collect_nodup es List.nodup_nil
+  have hmap : ((collect [] es).map group).Nodup :=
+    nodup_map_of_injOn hnodup fun x hx y hy =>
+      hone x ((hmem x).mp hx) y ((hmem y).mp hy)
+  have hsub : (collect [] es).map group ⊆ groups := by
+    intro g hg
+    obtain ⟨e, he, rfl⟩ := List.mem_map.mp hg
+    exact hin e ((hmem e).mp he)
+  have hle := List.Nodup.length_le_of_subset hmap hsub
+  rw [List.length_map] at hle
   have : ¬ max n 1 ≤ (collect [] es).length := by omega
   cases h : (arriveAll (.quorum n) incoming {} es).fired
   · rfl

@@ -110,6 +110,13 @@ of one select: the node would never run, and loading rejects it
 (`validate.all_join_exclusive_arms`). Use `join: any` on the node a select's
 arms meet at.
 
+For the same reason, `{ quorum: n }` needs `n` incoming routes that can each
+emit: the arms of one `select:` count once, and an entry node's seed counts
+once (`validate.quorum_exceeds_fan_in`). The node a parallel `for_each` exits
+to is the exception: each clone adds a route at run time. A `for_each` node
+itself cannot take a quorum of two or more, because each clone starts from one
+seed; put the quorum on a node in front of it.
+
 ## Preconditions
 
 `if:` is evaluated in the node's own context before it runs. False means the node

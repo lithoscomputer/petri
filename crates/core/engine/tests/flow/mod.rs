@@ -7,9 +7,10 @@
 //! `success()` or `failure()` over the node's own outcome. Joins are `All`,
 //! `Any` or `Quorum { n }`.
 //!
-//! Some generated joins can never be satisfied, such as an `All` join over two
-//! arms of one routing group. §8 invariant 10 rejects those graphs; the tests
-//! run them anyway, to check that such a node never starts.
+//! Some generated joins can never be satisfied: an `All` join over two arms of
+//! one routing group, or a `Quorum { n }` fed by fewer than `n` groups. §8
+//! invariant 10 rejects those graphs; the tests run them anyway, to check that
+//! such a node never starts.
 //!
 //! The case is also the wire format of the Lean model check: its JSON is
 //! what `lean/PetriModel/Wire.lean` reads, and [`Observed`] is what the model

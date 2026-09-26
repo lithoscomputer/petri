@@ -50,7 +50,8 @@ fn rejected_joins(graph: &Graph) -> Result<BTreeSet<NodeId>, TestCaseError> {
     errors
         .iter()
         .map(|error| match error {
-            ValidationError::AllJoinExclusiveArms { node, .. } => Ok(*node),
+            ValidationError::AllJoinExclusiveArms { node, .. }
+            | ValidationError::QuorumExceedsFanIn { node, .. } => Ok(*node),
             other => Err(TestCaseError::fail(format!(
                 "the generator built an invalid graph: {other}"
             ))),

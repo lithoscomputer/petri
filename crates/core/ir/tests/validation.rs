@@ -113,6 +113,14 @@ fn structural_errors_have_distinct_codes() {
             },
             "validate.all_join_exclusive_arms",
         ),
+        (
+            ValidationError::QuorumExceedsFanIn {
+                node,
+                n: 3,
+                fan_in: 2,
+            },
+            "validate.quorum_exceeds_fan_in",
+        ),
     ];
     for (error, expected) in &cases {
         assert_eq!(error.code(), *expected, "{error}");
@@ -572,6 +580,109 @@ fn a_restart_target_is_exempt_from_invariant_10() {
     b.select(classify, vec![Arm::when(done, again), Arm::always(done)]);
     b.node_mut(classify).routing.groups[0].arms[0].transition = EdgeTransition::Restart;
     validate(&b.build()).expect("the restart target is exempt");
+}
+
+/// Invariant 10: a `Quorum { n }` needs `n` routing groups that can feed it.
+#[test]
+fn a_quorum_needs_as_many_feeding_groups_as_it_counts() {
+    let build = |n: u32| {
+        let mut b = GraphBuilder::new();
+        let scope = ScopeId::new(0);
+        let start = b.add_step("start", scope, NOOP);
+        let left = b.add_step("left", scope, NOOP);
+        let right = b.add_step("right", scope, NOOP);
+        let gate = b.add_step("gate", scope, NOOP);
+        b.fan_out(start, &[left, right]);
+        b.link(left, gate);
+        b.link(right, gate);
+        b.set_join(gate, JoinPolicy::Quorum { n });
+        (b.build(), gate)
+    };
+
+    let (graph, gate) = build(3);
+    let errors = errors(&graph);
+    assert_eq!(errors, vec![ValidationError::QuorumExceedsFanIn {
+        node:   gate,
+        n:      3,
+        fan_in: 2,
+    }]);
+    assert!(errors[0].hint().is_some());
+    validate(&build(2).0).expect("two groups feed a quorum of two");
+}
+
+/// Two arms of one group count once toward a quorum, and an entry's seed
+/// counts as one group.
+#[test]
+fn arms_of_one_group_and_an_entry_seed_count_once_toward_a_quorum() {
+    let mut b = GraphBuilder::new();
+    let scope = ScopeId::new(0);
+    let classify = b.add_step("classify", scope, NOOP);
+    let gate = b.add_step("gate", scope, NOOP);
+    let small = b.exprs().call("success", Vec::new());
+    b.select(classify, vec![Arm::when(gate, small), Arm::always(gate)]);
+    b.set_join(gate, JoinPolicy::Quorum { n: 2 });
+    b.set_join(classify, JoinPolicy::Quorum { n: 2 });
+    let graph = b.build();
+    let found: BTreeSet<(NodeId, usize)> = errors(&graph)
+        .iter()
+        .filter_map(|error| match error {
+            ValidationError::QuorumExceedsFanIn { node, fan_in, .. } => Some((*node, *fan_in)),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(found, BTreeSet::from([(classify, 1), (gate, 1)]));
+}
+
+/// The node a `for_each` body exits to gains one edge per clone at run time,
+/// so its quorum is not checked at load.
+#[test]
+fn a_quorum_after_a_for_each_is_left_to_run_time() {
+    let mut b = GraphBuilder::new();
+    let scope = ScopeId::new(0);
+    let plan = b.add_step("plan", scope, NOOP);
+    let deploy = b.add_step("deploy", scope, NOOP);
+    let report = b.add_step("report", scope, NOOP);
+    b.link(plan, deploy);
+    b.link(deploy, report);
+    let items = b.exprs().lit(json!(["a", "b", "c"]));
+    b.set_expansion(deploy, Expansion::ForEach {
+        items,
+        target: ExpandTarget::Node,
+        max_parallel: None,
+        fail_fast: false,
+    });
+    b.set_join(report, JoinPolicy::Quorum { n: 2 });
+    validate(&b.build()).expect("the clones feed the quorum");
+}
+
+/// Each `for_each` clone is entered by one seed token and applies the node's
+/// own join, so a quorum of two or more on the `for_each` node never runs the
+/// body.
+#[test]
+fn a_for_each_node_cannot_join_with_a_quorum() {
+    let mut b = GraphBuilder::new();
+    let scope = ScopeId::new(0);
+    let start = b.add_step("start", scope, NOOP);
+    let left = b.add_step("left", scope, NOOP);
+    let right = b.add_step("right", scope, NOOP);
+    let deploy = b.add_step("deploy", scope, NOOP);
+    b.fan_out(start, &[left, right]);
+    b.link(left, deploy);
+    b.link(right, deploy);
+    let items = b.exprs().lit(json!(["a", "b"]));
+    b.set_expansion(deploy, Expansion::ForEach {
+        items,
+        target: ExpandTarget::Node,
+        max_parallel: None,
+        fail_fast: false,
+    });
+    b.set_join(deploy, JoinPolicy::Quorum { n: 2 });
+    assert_eq!(errors(&b.build()), vec![
+        ValidationError::QuorumOnExpansion {
+            node: deploy,
+            n:    2,
+        }
+    ]);
 }
 
 /// A scope a path can leave and return to gets a warning, not an error: release

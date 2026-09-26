@@ -47,8 +47,11 @@ For one `(node, generation)` key (`PetriModel/Thm/Join.lean`):
   pair, and `engine-spec.md` §8 invariant 10 rejects that join at load.
   `crates/core/engine/tests/flow_properties.rs` checks the rule against the
   real core: a node it rejects never runs.
-- `quorum_never_fires`: a `Quorum n` fed only through fewer than `max n 1`
-  incoming edges never fires. Load-time validation accepts such a node today.
+- `quorum_never_fires_by_groups`: a `Quorum n` fed by fewer than `max n 1`
+  routing groups never fires, since each group delivers at most one edge.
+  Invariant 10 rejects that join too, and `flow_properties.rs` checks that
+  such a node never runs. `quorum_never_fires` is the case of one group per
+  edge.
 
 For `deterministic_pick` (`PetriModel/Thm/Pick.lean`):
 

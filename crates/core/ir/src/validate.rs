@@ -154,6 +154,22 @@ pub enum ValidationError<S = Live> {
         first:  EdgeId<S>,
         second: EdgeId<S>,
     },
+    #[error(
+        "node {node} joins with `JoinPolicy::Quorum {{ n: {n} }}`, but only {fan_in} routing \
+         group(s) can send it a token. A group emits at most one token, so the quorum is \
+         never reached and node {node} can never run"
+    )]
+    QuorumExceedsFanIn {
+        node:   NodeId<S>,
+        n:      u32,
+        fan_in: usize,
+    },
+    #[error(
+        "node {node} expands with `for_each` and joins with `JoinPolicy::Quorum {{ n: {n} }}`. \
+         Each clone is entered by one seed token and applies the same join, so no clone \
+         reaches the quorum and the body never runs"
+    )]
+    QuorumOnExpansion { node: NodeId<S>, n: u32 },
 }
 
 /// Node ids joined for a message: a cycle is a list, and `Vec` has no
@@ -217,6 +233,9 @@ impl<S> ValidationError<S> {
             | Self::BoundaryCrossing { .. } => "validate.expansion_region",
             Self::EntryHasIncoming(_) => "validate.entry_has_incoming",
             Self::AllJoinExclusiveArms { .. } => "validate.all_join_exclusive_arms",
+            Self::QuorumExceedsFanIn { .. } | Self::QuorumOnExpansion { .. } => {
+                "validate.quorum_exceeds_fan_in"
+            }
         }
     }
 
@@ -248,7 +267,9 @@ impl<S> ValidationError<S> {
             | Self::ZeroBudget(node)
             | Self::UnboundedLoopBudget(node)
             | Self::LoopHeadMustJoinAny(node)
-            | Self::AllJoinExclusiveArms { node, .. } => ValidationLocation::Node(*node),
+            | Self::AllJoinExclusiveArms { node, .. }
+            | Self::QuorumExceedsFanIn { node, .. }
+            | Self::QuorumOnExpansion { node, .. } => ValidationLocation::Node(*node),
             Self::UnknownTarget { edge, .. }
             | Self::DuplicateEdgeId(edge)
             | Self::ReservedEdgeId(edge) => ValidationLocation::Edge(*edge),
@@ -295,7 +316,9 @@ impl<S> ValidationError<S> {
             | Self::ZeroBudget(node)
             | Self::UnboundedLoopBudget(node)
             | Self::LoopHeadMustJoinAny(node)
-            | Self::AllJoinExclusiveArms { node, .. } => Some(*node),
+            | Self::AllJoinExclusiveArms { node, .. }
+            | Self::QuorumExceedsFanIn { node, .. }
+            | Self::QuorumOnExpansion { node, .. } => Some(*node),
             Self::UnknownTarget { from, .. } => Some(*from),
             Self::CycleWithoutBackEdge(nodes) => nodes.first().copied(),
             Self::ScopeIdMismatch { .. }
@@ -325,6 +348,12 @@ impl<S> ValidationError<S> {
             }
             Self::AllJoinExclusiveArms { .. } => Some(
                 "join with `Any` to run on whichever arm the group picks, or send each arm to a node of its own",
+            ),
+            Self::QuorumExceedsFanIn { .. } => Some(
+                "arms of one routing group count once toward a quorum; lower `n`, or route more groups into the node",
+            ),
+            Self::QuorumOnExpansion { .. } => Some(
+                "put the quorum on a node in front of the `for_each` node, and let that node route into it",
             ),
             _ => None,
         }
@@ -486,6 +515,9 @@ pub(crate) fn collect<S>(
     }
     check_completion(graph, &mut errors);
     collect_body_tail(&graph.body, &mut errors);
+    // Not in `collect_body_tail`: a splice fragment's nodes gain routing
+    // groups when the fragment attaches, so their fan-in is known only then.
+    check_quorum_fan_in(&graph.body, &mut errors);
     errors
 }
 
@@ -1086,6 +1118,68 @@ fn check_all_join_arms<S>(graph: &GraphBody<S>, errors: &mut Vec<ValidationError
                     });
                 }
             }
+        }
+    }
+}
+
+/// Invariant 10, for `Quorum { n }`: at least `n` routing groups can feed the
+/// node, where an entry's seed counts as one group.
+///
+/// Arms of one group count once, for the reason [`check_all_join_arms`]
+/// gives. The node a `for_each` body exits to is exempt: each clone adds a
+/// group at run time, so its fan-in is known only then.
+///
+/// A `for_each` node itself may not join with `Quorum { n >= 2 }`. Its own
+/// firing is decided by the quorum, but each clone is entered by one seed
+/// token and applies the same join, so no clone ever runs.
+fn check_quorum_fan_in<S>(graph: &GraphBody<S>, errors: &mut Vec<ValidationError<S>>) {
+    let exempt = join_exempt(graph);
+    let mut feeders: BTreeMap<NodeId<S>, BTreeSet<(NodeId<S>, usize)>> = BTreeMap::new();
+    for source in &graph.nodes {
+        for (index, group) in source.routing.groups.iter().enumerate() {
+            for arm in &group.arms {
+                feeders
+                    .entry(arm.to)
+                    .or_default()
+                    .insert((source.id, index));
+            }
+        }
+    }
+    let mut collectors = BTreeSet::new();
+    for node in &graph.nodes {
+        let Some(Expansion::ForEach { target, .. }) = &node.expand else {
+            continue;
+        };
+        let exit = match target {
+            ExpandTarget::Node => node.id,
+            ExpandTarget::Subgraph { exit, .. } => *exit,
+        };
+        if let Some(exit) = graph.node(exit) {
+            collectors.extend(exit.routing.edges().map(|edge| edge.to));
+        }
+    }
+
+    for node in &graph.nodes {
+        let JoinPolicy::Quorum { n } = node.join else {
+            continue;
+        };
+        if exempt.contains(&node.id) {
+            continue;
+        }
+        if node.expand.is_some() && n >= 2 {
+            errors.push(ValidationError::QuorumOnExpansion { node: node.id, n });
+        }
+        if collectors.contains(&node.id) {
+            continue;
+        }
+        let seed = usize::from(graph.entry.contains(&node.id));
+        let fan_in = feeders.get(&node.id).map_or(0, BTreeSet::len) + seed;
+        if fan_in < n.max(1) as usize {
+            errors.push(ValidationError::QuorumExceedsFanIn {
+                node: node.id,
+                n,
+                fan_in,
+            });
         }
     }
 }
