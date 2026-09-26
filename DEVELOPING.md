@@ -77,6 +77,8 @@ bounded output capture, and the Pebble environment contract on Host and Docker.
 | `mise run lint` | Run Clippy with warnings denied |
 | `mise run test` | Run the routine suite with Nextest, then run doctests |
 | `mise run check:msrv` | Check all targets with Rust 1.89 |
+| `mise run lean:build` | Build the Lean model in `lean/` and check every proof |
+| `mise run test:lean` | Check the engine core against the Lean model, with the model required |
 | `mise run check` | Run the complete routine verification gate |
 | `mise run check:bundles` | Verify the vendored Fabro bundles against `bundles.lock.json`, digest by digest |
 | `mise run check:pins` | Check that internal Git dependencies track `main`, and that `Cargo.lock`, `CONTRACT.md`, and the latest evidence records cite the same revisions |
@@ -88,6 +90,17 @@ bounded output capture, and the Pebble environment contract on Host and Docker.
 | `mise run release <target> <version>` | Build a native release archive |
 
 Run `mise run check` before opening a pull request.
+
+## Lean model
+
+`lean/` holds a Lean 4 model of parts of the engine core, the theorems proved
+about it, and an executable the engine's `lean_model` tests compare the real
+core with; `lean/README.md` explains it. Install
+[elan](https://github.com/leanprover/elan) to work on it: elan reads the Lean
+version from `lean/lean-toolchain`. Without a built model, `mise run test`
+skips the comparison; `mise run test:lean` builds the model and requires it,
+as the `lean model` CI job does. A new Lean or elan version must be at least
+a day old, like every other tool here.
 
 ## Diagnostics
 

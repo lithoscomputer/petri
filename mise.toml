@@ -103,6 +103,17 @@ depends = ["plugins:build"]
 env = { CARGO_PROFILE_TEST_DEBUG = "0", PETRI_SANDBOX_DOCKER_PLUGIN = "{{config_root}}/target/plugins/bin/sandbox-driver-docker", PETRI_SANDBOX_HOST_PLUGIN = "{{config_root}}/target/plugins/bin/sandbox-driver-host" }
 run = "scripts/test-remote-docker.sh"
 
+[tasks."lean:build"]
+description = "Build the Lean model of the engine core and check its proofs (needs elan)"
+dir = "{{config_root}}/lean"
+run = "lake build"
+
+[tasks."test:lean"]
+description = "Check the engine core against the Lean model, with the model required"
+depends = ["lean:build"]
+env = { CARGO_PROFILE_TEST_DEBUG = "0", PETRI_REQUIRE_LEAN_MODEL = "1" }
+run = "cargo nextest run --locked -p petri-engine --test lean_model --no-tests=fail"
+
 [tasks."build:release"]
 description = "Build the workspace in release mode"
 run = "cargo build --locked --workspace --release"

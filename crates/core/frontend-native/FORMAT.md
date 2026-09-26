@@ -105,6 +105,18 @@ gather:
   join: { quorum: 2 }  # tokens on two distinct incoming edges
 ```
 
+Only one arm of a `select:` ever emits, so `join: all` cannot wait on two arms
+of one select: the node would never run, and loading rejects it
+(`validate.all_join_exclusive_arms`). Use `join: any` on the node a select's
+arms meet at.
+
+For the same reason, `{ quorum: n }` needs `n` incoming routes that can each
+emit: the arms of one `select:` count once, and an entry node's seed counts
+once (`validate.quorum_exceeds_fan_in`). The node a parallel `for_each` exits
+to is the exception: each clone adds a route at run time. On a `for_each`
+node itself, the join decides when the expansion starts; the clones then start
+without waiting on it again.
+
 ## Preconditions
 
 `if:` is evaluated in the node's own context before it runs. False means the node

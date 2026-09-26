@@ -6,6 +6,7 @@
 !/.ai/plans/DRAFTING.md
 node_modules/
 /target
+/lean/.lake/
 /dist-release/
 __pycache__/
 tmp

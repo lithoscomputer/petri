@@ -98,6 +98,8 @@ crates/core/engine/tests/partial_success.rs  handoff §4 soft failure, is_succes
 crates/core/engine/tests/seeding.rs          seed edges for entry nodes and clone entries
 crates/core/engine/tests/resolved_firing.rs  the executor boundary: no unresolved ExprId crosses it
 crates/core/engine/tests/event_log.rs        §5 logging, determinism, serde round-trip, §8 seams
+crates/core/engine/tests/flow_properties.rs  §3/§4 over random acyclic flows: joins sound and complete, one firing per key, replay
+crates/core/engine/tests/lean_model.rs       the core against the Lean model in `lean/`: flows and `deterministic_pick` (`mise run test:lean`)
 crates/core/ir/tests/validation.rs           §7, invariant by invariant
 crates/core/ir/tests/expressions.rs          the expression language
 
@@ -257,7 +259,11 @@ job, `fabro compatibility`, builds the pinned `fabro` binary from the fetched
 corpus (`scripts/fabro-provision.sh`; only the binary is cached, keyed by the pin
 and the toolchain; about three minutes on a miss) and runs the comparison
 matrix through `mise run test:fabro:differential` with
-`PETRI_REQUIRE_FABRO_BINARY` set. The Nightly workflow repeats the black box
+`PETRI_REQUIRE_FABRO_BINARY` set. A third required job, `lean model`,
+installs elan (pinned by version and digest), builds the Lean model in
+`lean/`, which checks every proof, and runs `mise run test:lean`: the engine's
+`lean_model` tests compare the real core with the model's executable, with
+`PETRI_REQUIRE_LEAN_MODEL` set. The Nightly workflow repeats the black box
 set three times under different test schedules
 (`mise run test:fabro:blackbox:repeat`), runs the long tests, and reruns the
 matrix; it adds repetitions and is never the only parity evidence.
@@ -1053,7 +1059,9 @@ Three things this package taught, kept because they generalise:
   turns that skip into a failure.** CI sets it on the Linux job. A silently skipped
   acceptance battery is indistinguishable from a passing one, and that job exists
   precisely to say the battery ran. The live Daytona tier follows the same
-  convention with `PETRI_REQUIRE_DAYTONA`, which `mise run test:daytona` sets.
+  convention with `PETRI_REQUIRE_DAYTONA`, which `mise run test:daytona` sets,
+  and so does the Lean model check with `PETRI_REQUIRE_LEAN_MODEL`, which
+  `mise run test:lean` sets.
 - **A container test reads the workspace through the sandbox, never through a
   host path.** The workspace lives in the sandbox's own volume. A test checks a
   file the step wrote with `ExecEnv::read_file`, or with `docker exec` through

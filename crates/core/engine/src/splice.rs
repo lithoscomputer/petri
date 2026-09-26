@@ -708,6 +708,11 @@ pub(crate) fn apply_prepared_splice(
     }
     for seed in &prepared.seeds {
         state.register_seed_edge(seed.edge, seed.entry);
+        // The template's join already admitted the expansion, so a clone's
+        // entry starts on its seed without applying that join again: one seed
+        // token cannot satisfy a `Quorum { n >= 2 }`. Only the seed's
+        // generation is forced; a loop inside the body joins as usual.
+        state.force_entry(seed.entry, seed.generation);
     }
     for (target, group) in prepared.routing_extensions {
         if let Some(node) = state.graph.body.node_mut(target) {

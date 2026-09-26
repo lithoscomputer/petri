@@ -1383,6 +1383,10 @@ pub fn deterministic_pick(
                 }
                 roll -= weight;
             }
+            // Unreachable: `roll < total` and `total` is the sum of the weights,
+            // so the walk always lands on a candidate (`pick_weighted_ok` in
+            // `lean/PetriModel/Thm/Pick.lean`). A refusal rather than a panic,
+            // because the draw is host input and the checks above could change.
             Err(SmolStr::new("the weighted draw did not select a candidate"))
         }
     }

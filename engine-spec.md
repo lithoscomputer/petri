@@ -211,7 +211,11 @@ for external item resolution but is never emitted today.
 **Entry nodes** are seeded via synthetic seed edges allocated at runtime from
 `max declared id + 1` (collision impossible by construction; validation never
 sees them; `EdgeId::SEED` is rejected in routing groups). Join counting is
-uniform: `All` over one seed edge = one seed token.
+uniform: `All` over one seed edge = one seed token. The one exception is a
+`for_each` clone's entry: the template's join already admitted the expansion,
+so the clone's seed forces entry for its generation, as a restart or a jump
+does, and the join is not applied twice. Without that, a `Quorum { n >= 2 }`
+on the `for_each` node would admit the template and then start no clone.
 
 **Sequential for_each** is a frontend desugar, not IR: entry emits
 `{items, idx: 0, acc: []}`; final select group has a back arm guarded
@@ -629,6 +633,20 @@ strict/unknown-field-lint mode is a v2 seam.
 9. `Completion::TerminalNode(id)`: the node must exist. Nothing more — the node
    is *expected* to be terminal, but the semantics only need a final record, so
    terminal shape and reachability rules belong to frontends.
+10. **Every join can be satisfied.** A routing group emits at most one token
+    each time its node fires, and a node fires at most once per generation, so
+    two arms of one group never both deliver to one `(node, generation)`. An
+    `All` join may not count two arms of one group: it would wait forever, and
+    under `AnyFailure` the run would still report success. Expansion does not
+    change this, since every clone copies its groups whole. A `Quorum { n }`
+    needs `n` routing groups that can feed it, an entry's seed counting as one;
+    the node a `for_each` body exits to is exempt, since each clone adds a
+    group at run time. A `for_each` node's own quorum is counted like any
+    other; its clones start without it (§5, entry nodes). Loop heads
+    (invariant 8 already requires `Any`) and restart targets (a successor
+    execution enters them directly, without the join) are exempt. A splice
+    fragment is checked for `All` only: attachment adds groups, so its nodes'
+    fan-in is known when the fragment applies.
 
 **Lint (warning, not error):** possible scope re-entry after release — a node
 outside a scope both reachable from it and reaching back into it. Suppressed

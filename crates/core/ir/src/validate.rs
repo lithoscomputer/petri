@@ -141,6 +141,29 @@ pub enum ValidationError<S = Live> {
          only edges into the entry and out of the exit may cross"
     )]
     BoundaryCrossing { node: NodeId<S>, edge: EdgeId<S> },
+
+    // ── Invariant 10 ───────────────────────────────────────────────────────
+    #[error(
+        "node {node} joins with `JoinPolicy::All`, but its incoming edges {first} and \
+         {second} are arms of one routing group on node {from}. A group emits at most \
+         one token, so the two edges never both deliver and node {node} can never run"
+    )]
+    AllJoinExclusiveArms {
+        node:   NodeId<S>,
+        from:   NodeId<S>,
+        first:  EdgeId<S>,
+        second: EdgeId<S>,
+    },
+    #[error(
+        "node {node} joins with `JoinPolicy::Quorum {{ n: {n} }}`, but only {fan_in} routing \
+         group(s) can send it a token. A group emits at most one token, so the quorum is \
+         never reached and node {node} can never run"
+    )]
+    QuorumExceedsFanIn {
+        node:   NodeId<S>,
+        n:      u32,
+        fan_in: usize,
+    },
 }
 
 /// Node ids joined for a message: a cycle is a list, and `Vec` has no
@@ -203,6 +226,8 @@ impl<S> ValidationError<S> {
             | Self::ExitNotPostdominator { .. }
             | Self::BoundaryCrossing { .. } => "validate.expansion_region",
             Self::EntryHasIncoming(_) => "validate.entry_has_incoming",
+            Self::AllJoinExclusiveArms { .. } => "validate.all_join_exclusive_arms",
+            Self::QuorumExceedsFanIn { .. } => "validate.quorum_exceeds_fan_in",
         }
     }
 
@@ -233,7 +258,9 @@ impl<S> ValidationError<S> {
             | Self::BoundaryCrossing { node, .. }
             | Self::ZeroBudget(node)
             | Self::UnboundedLoopBudget(node)
-            | Self::LoopHeadMustJoinAny(node) => ValidationLocation::Node(*node),
+            | Self::LoopHeadMustJoinAny(node)
+            | Self::AllJoinExclusiveArms { node, .. }
+            | Self::QuorumExceedsFanIn { node, .. } => ValidationLocation::Node(*node),
             Self::UnknownTarget { edge, .. }
             | Self::DuplicateEdgeId(edge)
             | Self::ReservedEdgeId(edge) => ValidationLocation::Edge(*edge),
@@ -279,7 +306,9 @@ impl<S> ValidationError<S> {
             | Self::EntryHasIncoming(node)
             | Self::ZeroBudget(node)
             | Self::UnboundedLoopBudget(node)
-            | Self::LoopHeadMustJoinAny(node) => Some(*node),
+            | Self::LoopHeadMustJoinAny(node)
+            | Self::AllJoinExclusiveArms { node, .. }
+            | Self::QuorumExceedsFanIn { node, .. } => Some(*node),
             Self::UnknownTarget { from, .. } => Some(*from),
             Self::CycleWithoutBackEdge(nodes) => nodes.first().copied(),
             Self::ScopeIdMismatch { .. }
@@ -307,6 +336,12 @@ impl<S> ValidationError<S> {
             Self::AlwaysNotLast { .. } => {
                 Some("move the `Guard::Always` arm to the end of its select group")
             }
+            Self::AllJoinExclusiveArms { .. } => Some(
+                "join with `Any` to run on whichever arm the group picks, or send each arm to a node of its own",
+            ),
+            Self::QuorumExceedsFanIn { .. } => Some(
+                "arms of one routing group count once toward a quorum; lower `n`, or route more groups into the node",
+            ),
             _ => None,
         }
     }
@@ -467,6 +502,9 @@ pub(crate) fn collect<S>(
     }
     check_completion(graph, &mut errors);
     collect_body_tail(&graph.body, &mut errors);
+    // Not in `collect_body_tail`: a splice fragment's nodes gain routing
+    // groups when the fragment attaches, so their fan-in is known only then.
+    check_quorum_fan_in(&graph.body, &mut errors);
     errors
 }
 
@@ -492,6 +530,7 @@ fn collect_body_tail<S>(body: &GraphBody<S>, errors: &mut Vec<ValidationError<S>
     check_back_edges(body, errors);
     check_budgets(body, errors);
     check_loop_head_joins(body, errors);
+    check_all_join_arms(body, errors);
     check_expansions(body, errors);
 }
 
@@ -1017,6 +1056,108 @@ fn check_loop_head_joins<S>(graph: &GraphBody<S>, errors: &mut Vec<ValidationErr
             && node.join != JoinPolicy::Any
         {
             errors.push(ValidationError::LoopHeadMustJoinAny(head));
+        }
+    }
+}
+
+// ── Invariant 10 ──────────────────────────────────────────────────────────
+
+/// Nodes whose join invariant 10 leaves alone. A loop head already has to
+/// join with `Any` (invariant 8), and a restart target is entered by the
+/// successor execution directly, without waiting on its join.
+fn join_exempt<S>(graph: &GraphBody<S>) -> BTreeSet<NodeId<S>> {
+    graph
+        .edges()
+        .filter(|edge| edge.back || edge.transition == EdgeTransition::Restart)
+        .map(|edge| edge.to)
+        .collect()
+}
+
+/// Invariant 10, for `All`: the join may not count two arms of one routing
+/// group.
+///
+/// A group emits at most one token each time its node fires, and a node fires
+/// at most once per generation, so two arms of one group never both deliver
+/// to the same `(node, generation)`. An `All` join over both waits forever,
+/// and under `Completion::AnyFailure` the run still reports success.
+/// Expansion does not change this: every clone copies the group whole.
+fn check_all_join_arms<S>(graph: &GraphBody<S>, errors: &mut Vec<ValidationError<S>>) {
+    let exempt = join_exempt(graph);
+    for source in &graph.nodes {
+        for group in &source.routing.groups {
+            let mut arms: BTreeMap<NodeId<S>, Vec<EdgeId<S>>> = BTreeMap::new();
+            for arm in &group.arms {
+                arms.entry(arm.to).or_default().push(arm.id);
+            }
+            for (node, edges) in arms {
+                let joins_all = graph
+                    .node(node)
+                    .is_some_and(|target| target.join == JoinPolicy::All);
+                if let [first, second, ..] = edges[..]
+                    && joins_all
+                    && !exempt.contains(&node)
+                {
+                    errors.push(ValidationError::AllJoinExclusiveArms {
+                        node,
+                        from: source.id,
+                        first,
+                        second,
+                    });
+                }
+            }
+        }
+    }
+}
+
+/// Invariant 10, for `Quorum { n }`: at least `n` routing groups can feed the
+/// node, where an entry's seed counts as one group.
+///
+/// Arms of one group count once, for the reason [`check_all_join_arms`]
+/// gives. The node a `for_each` body exits to is exempt: each clone adds a
+/// group at run time, so its fan-in is known only then. A `for_each` node's
+/// own quorum is checked like any other; its clones start without it.
+fn check_quorum_fan_in<S>(graph: &GraphBody<S>, errors: &mut Vec<ValidationError<S>>) {
+    let exempt = join_exempt(graph);
+    let mut feeders: BTreeMap<NodeId<S>, BTreeSet<(NodeId<S>, usize)>> = BTreeMap::new();
+    for source in &graph.nodes {
+        for (index, group) in source.routing.groups.iter().enumerate() {
+            for arm in &group.arms {
+                feeders
+                    .entry(arm.to)
+                    .or_default()
+                    .insert((source.id, index));
+            }
+        }
+    }
+    let mut collectors = BTreeSet::new();
+    for node in &graph.nodes {
+        let Some(Expansion::ForEach { target, .. }) = &node.expand else {
+            continue;
+        };
+        let exit = match target {
+            ExpandTarget::Node => node.id,
+            ExpandTarget::Subgraph { exit, .. } => *exit,
+        };
+        if let Some(exit) = graph.node(exit) {
+            collectors.extend(exit.routing.edges().map(|edge| edge.to));
+        }
+    }
+
+    for node in &graph.nodes {
+        let JoinPolicy::Quorum { n } = node.join else {
+            continue;
+        };
+        if exempt.contains(&node.id) || collectors.contains(&node.id) {
+            continue;
+        }
+        let seed = usize::from(graph.entry.contains(&node.id));
+        let fan_in = feeders.get(&node.id).map_or(0, BTreeSet::len) + seed;
+        if fan_in < n.max(1) as usize {
+            errors.push(ValidationError::QuorumExceedsFanIn {
+                node: node.id,
+                n,
+                fan_in,
+            });
         }
     }
 }
