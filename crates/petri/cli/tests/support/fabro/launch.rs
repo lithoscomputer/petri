@@ -447,7 +447,15 @@ impl Case {
         });
         let mut stdout = child.stdout.take().expect("piped stdout");
         let stderr = child.stderr.take().expect("piped stderr");
-        let stderr_needle = launch.interrupt_when_stderr.clone();
+        // Every needle the case watches for, the interrupt's among them: each
+        // one creates its marker file the first time a stderr line carries it.
+        let stderr_watches: Vec<(String, PathBuf)> = launch
+            .interrupt_when_stderr
+            .clone()
+            .zip(stderr_marker.clone())
+            .into_iter()
+            .chain(launch.mark_when_stderr.clone())
+            .collect();
         let drain = async {
             let mut out = Vec::new();
             let read_out = stdout.read_to_end(&mut out);
@@ -457,11 +465,11 @@ impl Case {
                 let mut err = Vec::new();
                 let mut lines = BufReader::new(stderr).split(b'\n');
                 while let Ok(Some(line)) = lines.next_segment().await {
-                    if let (Some(needle), Some(marker)) = (&stderr_needle, &stderr_marker)
-                        && !marker.exists()
-                        && String::from_utf8_lossy(&line).contains(needle.as_str())
-                    {
-                        let _ = fs::write(marker, "");
+                    let text = String::from_utf8_lossy(&line);
+                    for (needle, marker) in &stderr_watches {
+                        if !marker.exists() && text.contains(needle.as_str()) {
+                            let _ = fs::write(marker, "");
+                        }
                     }
                     err.extend_from_slice(&line);
                     err.push(b'\n');
@@ -549,6 +557,10 @@ pub(crate) struct Launch {
     /// Send SIGINT once a stderr line contains this text: the cancel a
     /// person sends when they see a gate waiting.
     pub(crate) interrupt_when_stderr: Option<String>,
+    /// Create each file once a stderr line contains its text: the marker an
+    /// [`Launch::append_when`] entry waits on, so a case orders its controls
+    /// by what the run has reached instead of by the clock.
+    pub(crate) mark_when_stderr: Vec<(String, PathBuf)>,
     /// SIGKILL the `petri` process, by pid, this long after the marker file
     /// exists: the crash `petri resume` recovers from. The launch then ends
     /// with no exit code.

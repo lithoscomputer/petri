@@ -2201,6 +2201,11 @@ async fn the_control_file_pauses_unpauses_and_steers_without_answering() {
     })]);
     let started = case.workspace().join("started.txt");
     let control_arg = control.to_str().expect("utf-8").to_owned();
+    // Each control waits for the run to report the previous one, not for a
+    // guessed delay: the steer has to reach the gate before the script's
+    // answer does, and a loaded machine makes any margin a coin toss.
+    let paused = case.root.join("saw-paused");
+    let unpaused = case.root.join("saw-unpaused");
     let finished = case
         .run_with(
             &workflow,
@@ -2211,26 +2216,30 @@ async fn the_control_file_pauses_unpauses_and_steers_without_answering() {
                 &control_arg,
             ],
             Launch {
+                mark_when_stderr: vec![
+                    ("control: paused".to_owned(), paused.clone()),
+                    ("control: unpaused".to_owned(), unpaused.clone()),
+                ],
                 append_when: vec![
                     // Pause right after `prepare` starts: `gate` is held.
                     (
-                        started.clone(),
+                        started,
                         control.clone(),
                         "pause\n".into(),
                         Duration::from_millis(0),
                     ),
                     (
-                        started.clone(),
+                        paused,
                         control.clone(),
                         "unpause\n".into(),
-                        Duration::from_millis(900),
+                        Duration::from_millis(0),
                     ),
                     // The gate is now waiting on its (delayed) answer.
                     (
-                        started,
+                        unpaused,
                         control,
                         "steer gate please decide\nsteer nobody hi\ndance\n".into(),
-                        Duration::from_millis(500),
+                        Duration::from_millis(0),
                     ),
                 ],
                 ..Launch::default()
