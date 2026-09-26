@@ -166,6 +166,14 @@ Rules (violations are review-blockers):
 `Cancelled` joins the statuses that flow through routing (§5);
 `is_success_like` is untouched — it remains `Success | PartialSuccess`.
 
+**Budget refusal.** A key the budget refuses (`firing_count >= max_firings`)
+records `RunError::BudgetExceeded`, which fails the run; it takes the key's
+tokens and marks the key fired, and it records and routes nothing, so work
+downstream of it waits. Routing nothing is what makes the budget a
+termination guarantee: a routed outcome could take a back edge, be refused
+again in the next generation, and route again, forever. (A mutation that
+routes a failure instead overflows the stack in the flow property test.)
+
 **Retries.** Each firing starts at `Attempt(1)`; counters reset per firing (a
 later generation retries fresh). On a matching non-final failure the core emits
 `ScheduleRetry` (deterministic base delay; driver adds jitter and sleeps; feeds
@@ -657,6 +665,17 @@ unreachable given invariant 8 and is kept as documented defense. Remaining
 positives are a labelled over-approximation; the warning names the re-entry
 node and the fix.
 
+**Lint (warning, not error):** a join across generations
+(`lint.join_across_generations`) — an `All` join, or a `Quorum` that needs
+both sides, over an edge from a node a loop reaches and an edge from a node
+no loop reaches. A token keeps the generation its loop gave it (§4), so the
+join fires only when the loop exits in generation 0; after one iteration it
+waits forever, and under `AnyFailure` the run still succeeds. A warning, not
+an error, because the graph works for a loop that does not iterate and
+nothing else can express the wait yet (§14). Not exact: it also fires for a
+loop that never iterates, and it misses a join between two loops that exit in
+different generations.
+
 **Firing-time errors are node failures, routable, never run aborts:**
 `UnresolvedConfig`, `secret_misplaced`, `bad_output_file`, `env_acquire`.
 
@@ -1072,6 +1091,15 @@ opaque labels (D3). `Control::Pause` (enum is `#[non_exhaustive]`); `Steer` and
 `Approve` shipped as `Control::Deliver` (§6, §10). Strict expression mode. Encoded-secret masking. Content
 caching (`StepKind::fingerprint` defaults `None`). JS action host; action
 shims are package 04. Windows; service containers; resource limits.
+
+**Joining after a loop (open design question).** Nothing resets a generation:
+a token leaving a loop keeps the loop's generation, and a join matches one
+generation, so no graph can wait for a loop and a path that skips it once the
+loop has iterated (`lint.join_across_generations`, §8). Closing the gap needs
+a way to leave a loop at a known generation — for example an exit edge that
+resets the generation, or a join that matches its inputs across generations —
+and either changes the core's token rules. Undecided. As of the lint's
+introduction, no Fabro or GitHub Actions corpus workflow has the shape.
 
 ## 15. Testing notes (institutional memory)
 

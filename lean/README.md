@@ -16,11 +16,13 @@ Nothing here translates Rust into Lean.
 | --- | --- | --- |
 | `PetriModel/Join.lean` | `on_token`, `try_fire`, `is_join_satisfied` in `crates/core/engine/src/apply.rs` | `engine-spec.md` §3, §4 |
 | `PetriModel/Pick.lean` | `deterministic_pick` in `crates/core/engine/src/apply.rs` | `engine-spec.md` §2, §6 |
-| `PetriModel/Flow.lean` | a whole run of the acyclic flows the Rust generator makes | `crates/core/engine/tests/flow/mod.rs` |
+| `PetriModel/Flow.lean` | a whole run of the flows the Rust generator makes, loops and budgets included | `crates/core/engine/tests/flow/mod.rs`, `engine-spec.md` §4 |
 
-The flow model leaves out loops, retries, cancellation, expansions,
-preconditions, budgets and splices. The Rust generator does not produce
-them either.
+In the flow model, a back arm starts the next generation, joins match per
+`(node, generation)`, and a node fires at most its budget; a key the budget
+refuses is marked fired and routes nothing (`engine-spec.md` §4, "Budget
+refusal"). The model leaves out retries, cancellation, expansions,
+preconditions and splices. The Rust generator does not produce them either.
 
 A rank in `deterministic_pick` is an `f64` compared with `f64::total_cmp`.
 The model carries the rank's bit pattern and compares the same key
@@ -53,6 +55,19 @@ For one `(node, generation)` key (`PetriModel/Thm/Join.lean`):
   such a node never runs. `quorum_never_fires` is the case of one group per
   edge.
 
+For whole runs, loops included (`PetriModel/Thm/Flow.lean`):
+
+- `started_once`: in any run, each `(node, generation)` key starts at most
+  once.
+- `token_generation`: a routed token comes from an arm of the firing's node,
+  and its generation is the firing's, plus one on a back arm.
+- `firings_le_budget`: no node fires more often than its budget.
+- `budget_exceeded_fails`: a run in which a budget refused a firing does not
+  report success.
+- `run_settles`: every run ends with nothing live within the host steps its
+  budgets allow (their sum, plus one), so `run` never reports `unsettled`
+  (`run_not_unsettled`).
+
 For `deterministic_pick` (`PetriModel/Thm/Pick.lean`):
 
 - `select_count`: a weighted draw is proportional. Of the rolls
@@ -74,15 +89,16 @@ For `deterministic_pick` (`PetriModel/Thm/Pick.lean`):
 once per test and, for each generated case, compares its answer with the
 real core's:
 
-- `flow_runs_match_the_lean_model`: which nodes start after each host step,
-  the order they finish in, the tokens left waiting at the end, and the run
-  status.
+- `flow_runs_match_the_lean_model`: which `(node, generation)` firings start
+  after each host step, the order they finish in, the tokens left waiting at
+  the end, the budget refusals, and the run status.
 - `deterministic_pick_matches_the_lean_model`: the picked edge, or the
   reason for a refusal. A new refusal message in Rust fails the test until
   the model has it too.
 
-`crates/core/engine/tests/flow_properties.rs` checks the join rules on the
-same generator without Lean, so it runs in every `mise run test`.
+`crates/core/engine/tests/flow_properties.rs` checks the join, generation
+and budget rules on the same generator without Lean, so it runs in every
+`mise run test`.
 
 ## Commands
 

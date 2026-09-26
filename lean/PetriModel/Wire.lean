@@ -53,12 +53,14 @@ def arm (j : Json) : Except String Flow.Arm := do
   return {
     to := ← (← field j "to").getNat?
     guard := ← guard (← field j "guard")
+    back := ← (← field j "back").getBool?
     edge := ← (← field j "edge").getNat? }
 
 def node (j : Json) : Except String Flow.Node := do
   return {
     join := ← join (← field j "join")
-    fails := ← (← field j "fails").getBool?
+    maxFirings := ← (← field j "max_firings").getNat?
+    outcomes := ← list (← field j "outcomes") (·.getBool?)
     groups := ← list (← field j "groups") (list · arm) }
 
 def flowCase (j : Json) : Except String Flow.Case := do
@@ -70,10 +72,12 @@ def nats (ns : List Nat) : Json :=
   .arr (ns.map toJson).toArray
 
 def observed (o : Flow.Observed) : Json :=
+  let key := fun ((n, g) : Nat × Nat) => nats [n, g]
   Json.mkObj [
-    ("steps", .arr (o.steps.map nats).toArray),
-    ("finished", nats o.finished),
-    ("parked", .arr (o.parked.map fun (n, e) => nats [n, e]).toArray),
+    ("steps", .arr (o.steps.map fun step => .arr (step.map key).toArray).toArray),
+    ("finished", .arr (o.finished.map key).toArray),
+    ("parked", .arr (o.parked.map fun (n, g, e) => nats [n, g, e]).toArray),
+    ("budget_exceeded", nats o.budgetExceeded),
     ("status", .str o.status)]
 
 /-! ## Picks -/

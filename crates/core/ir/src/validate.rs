@@ -373,6 +373,17 @@ pub enum ValidationWarning<S = Live> {
          the region instead — clones inherit it"
     )]
     RunOnCancelExpansion { node: NodeId<S> },
+    #[error(
+        "node {node} joins an edge from node {inside}, which a loop reaches, with an edge from \
+         node {outside}, which no loop reaches. A token keeps the generation its loop gave it, \
+         and a join matches tokens of one generation, so once the loop has iterated the two \
+         never meet: node {node} waits forever, and the run can still report success"
+    )]
+    JoinAcrossGenerations {
+        node:    NodeId<S>,
+        inside:  NodeId<S>,
+        outside: NodeId<S>,
+    },
 }
 
 impl<S> ValidationWarning<S> {
@@ -381,6 +392,7 @@ impl<S> ValidationWarning<S> {
         match self {
             Self::ScopeReentry { .. } => "lint.scope_reentry",
             Self::RunOnCancelExpansion { .. } => "lint.run_on_cancel_expansion",
+            Self::JoinAcrossGenerations { .. } => "lint.join_across_generations",
         }
     }
 
@@ -388,7 +400,7 @@ impl<S> ValidationWarning<S> {
     pub fn primary_node(&self) -> NodeId<S> {
         match self {
             Self::ScopeReentry { at, .. } => *at,
-            Self::RunOnCancelExpansion { node } => *node,
+            Self::RunOnCancelExpansion { node } | Self::JoinAcrossGenerations { node, .. } => *node,
         }
     }
 
@@ -400,6 +412,10 @@ impl<S> ValidationWarning<S> {
                  return, and cannot tell whether a given run reaches the releasing state",
             ),
             Self::RunOnCancelExpansion { .. } => None,
+            Self::JoinAcrossGenerations { .. } => Some(
+                "the join fires only when the loop exits in its first iteration; nothing yet \
+                 waits for a loop and a path outside it together (engine-spec.md §14)",
+            ),
         }
     }
 }
@@ -457,6 +473,7 @@ pub(crate) fn check_with<S>(
     let mut warnings = Vec::new();
     check_scope_reentry(&graph.body, &mut warnings);
     check_run_on_cancel(&graph.body, &mut warnings);
+    check_join_across_generations(&graph.body, &mut warnings);
     ValidationReport {
         errors: collect(graph, registry),
         warnings,
@@ -1248,6 +1265,80 @@ fn check_scope_reentry<S>(graph: &GraphBody<S>, warnings: &mut Vec<ValidationWar
 /// never splices, so the flag can never admit anything there. v1 ignores it;
 /// the fix is to flag the template nodes inside the region, which clones
 /// inherit.
+/// Warn where a join meets tokens a loop carries and tokens no loop reaches.
+///
+/// A back arm raises a token's generation, and every token after it keeps
+/// that generation, so only a node reachable from a loop head can fire past
+/// generation 0. A join matches tokens of one generation. An `All` join, or a
+/// `Quorum` that needs tokens from both sides, over an edge from such a node
+/// and an edge from a node no loop reaches can therefore fire only when the
+/// loop exits in generation 0. Loop heads are left to invariant 8.
+///
+/// The warning is not exact: it also fires for a loop that happens never to
+/// iterate, and it misses a join between two loops that exit in different
+/// generations.
+fn check_join_across_generations<S>(
+    graph: &GraphBody<S>,
+    warnings: &mut Vec<ValidationWarning<S>>,
+) {
+    let mut successors: BTreeMap<NodeId<S>, Vec<NodeId<S>>> = BTreeMap::new();
+    let mut heads = BTreeSet::new();
+    for node in &graph.nodes {
+        for edge in node.routing.edges() {
+            successors.entry(node.id).or_default().push(edge.to);
+            if edge.back {
+                heads.insert(edge.to);
+            }
+        }
+    }
+    let mut looped = BTreeSet::new();
+    let mut queue: VecDeque<NodeId<S>> = heads.iter().copied().collect();
+    while let Some(node) = queue.pop_front() {
+        if looped.insert(node)
+            && let Some(next) = successors.get(&node)
+        {
+            queue.extend(next.iter().copied());
+        }
+    }
+
+    for node in &graph.nodes {
+        let need = match node.join {
+            JoinPolicy::All => None,
+            JoinPolicy::Quorum { n } => Some(n.max(1) as usize),
+            JoinPolicy::Any => continue,
+        };
+        if heads.contains(&node.id) {
+            continue;
+        }
+        let mut inside = BTreeSet::new();
+        let mut outside = BTreeSet::new();
+        for source in &graph.nodes {
+            for (index, group) in source.routing.groups.iter().enumerate() {
+                if !group.arms.iter().any(|arm| arm.to == node.id) {
+                    continue;
+                }
+                if looped.contains(&source.id) {
+                    inside.insert((source.id, index));
+                } else {
+                    outside.insert((source.id, index));
+                }
+            }
+        }
+        let (Some(&(inside_node, _)), Some(&(outside_node, _))) = (inside.first(), outside.first())
+        else {
+            continue;
+        };
+        if need.is_some_and(|need| inside.len() >= need || outside.len() >= need) {
+            continue;
+        }
+        warnings.push(ValidationWarning::JoinAcrossGenerations {
+            node:    node.id,
+            inside:  inside_node,
+            outside: outside_node,
+        });
+    }
+}
+
 fn check_run_on_cancel<S>(graph: &GraphBody<S>, warnings: &mut Vec<ValidationWarning<S>>) {
     for node in &graph.nodes {
         if node.run_on_cancel && node.expand.is_some() {
