@@ -164,12 +164,6 @@ pub enum ValidationError<S = Live> {
         n:      u32,
         fan_in: usize,
     },
-    #[error(
-        "node {node} expands with `for_each` and joins with `JoinPolicy::Quorum {{ n: {n} }}`. \
-         Each clone is entered by one seed token and applies the same join, so no clone \
-         reaches the quorum and the body never runs"
-    )]
-    QuorumOnExpansion { node: NodeId<S>, n: u32 },
 }
 
 /// Node ids joined for a message: a cycle is a list, and `Vec` has no
@@ -233,9 +227,7 @@ impl<S> ValidationError<S> {
             | Self::BoundaryCrossing { .. } => "validate.expansion_region",
             Self::EntryHasIncoming(_) => "validate.entry_has_incoming",
             Self::AllJoinExclusiveArms { .. } => "validate.all_join_exclusive_arms",
-            Self::QuorumExceedsFanIn { .. } | Self::QuorumOnExpansion { .. } => {
-                "validate.quorum_exceeds_fan_in"
-            }
+            Self::QuorumExceedsFanIn { .. } => "validate.quorum_exceeds_fan_in",
         }
     }
 
@@ -268,8 +260,7 @@ impl<S> ValidationError<S> {
             | Self::UnboundedLoopBudget(node)
             | Self::LoopHeadMustJoinAny(node)
             | Self::AllJoinExclusiveArms { node, .. }
-            | Self::QuorumExceedsFanIn { node, .. }
-            | Self::QuorumOnExpansion { node, .. } => ValidationLocation::Node(*node),
+            | Self::QuorumExceedsFanIn { node, .. } => ValidationLocation::Node(*node),
             Self::UnknownTarget { edge, .. }
             | Self::DuplicateEdgeId(edge)
             | Self::ReservedEdgeId(edge) => ValidationLocation::Edge(*edge),
@@ -317,8 +308,7 @@ impl<S> ValidationError<S> {
             | Self::UnboundedLoopBudget(node)
             | Self::LoopHeadMustJoinAny(node)
             | Self::AllJoinExclusiveArms { node, .. }
-            | Self::QuorumExceedsFanIn { node, .. }
-            | Self::QuorumOnExpansion { node, .. } => Some(*node),
+            | Self::QuorumExceedsFanIn { node, .. } => Some(*node),
             Self::UnknownTarget { from, .. } => Some(*from),
             Self::CycleWithoutBackEdge(nodes) => nodes.first().copied(),
             Self::ScopeIdMismatch { .. }
@@ -351,9 +341,6 @@ impl<S> ValidationError<S> {
             ),
             Self::QuorumExceedsFanIn { .. } => Some(
                 "arms of one routing group count once toward a quorum; lower `n`, or route more groups into the node",
-            ),
-            Self::QuorumOnExpansion { .. } => Some(
-                "put the quorum on a node in front of the `for_each` node, and let that node route into it",
             ),
             _ => None,
         }
@@ -1127,11 +1114,8 @@ fn check_all_join_arms<S>(graph: &GraphBody<S>, errors: &mut Vec<ValidationError
 ///
 /// Arms of one group count once, for the reason [`check_all_join_arms`]
 /// gives. The node a `for_each` body exits to is exempt: each clone adds a
-/// group at run time, so its fan-in is known only then.
-///
-/// A `for_each` node itself may not join with `Quorum { n >= 2 }`. Its own
-/// firing is decided by the quorum, but each clone is entered by one seed
-/// token and applies the same join, so no clone ever runs.
+/// group at run time, so its fan-in is known only then. A `for_each` node's
+/// own quorum is checked like any other; its clones start without it.
 fn check_quorum_fan_in<S>(graph: &GraphBody<S>, errors: &mut Vec<ValidationError<S>>) {
     let exempt = join_exempt(graph);
     let mut feeders: BTreeMap<NodeId<S>, BTreeSet<(NodeId<S>, usize)>> = BTreeMap::new();
@@ -1163,13 +1147,7 @@ fn check_quorum_fan_in<S>(graph: &GraphBody<S>, errors: &mut Vec<ValidationError
         let JoinPolicy::Quorum { n } = node.join else {
             continue;
         };
-        if exempt.contains(&node.id) {
-            continue;
-        }
-        if node.expand.is_some() && n >= 2 {
-            errors.push(ValidationError::QuorumOnExpansion { node: node.id, n });
-        }
-        if collectors.contains(&node.id) {
+        if exempt.contains(&node.id) || collectors.contains(&node.id) {
             continue;
         }
         let seed = usize::from(graph.entry.contains(&node.id));

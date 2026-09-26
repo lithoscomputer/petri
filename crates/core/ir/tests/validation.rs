@@ -655,34 +655,38 @@ fn a_quorum_after_a_for_each_is_left_to_run_time() {
     validate(&b.build()).expect("the clones feed the quorum");
 }
 
-/// Each `for_each` clone is entered by one seed token and applies the node's
-/// own join, so a quorum of two or more on the `for_each` node never runs the
-/// body.
+/// A `for_each` node's own quorum is counted like any other node's; its
+/// clones start on their seeds without it.
 #[test]
-fn a_for_each_node_cannot_join_with_a_quorum() {
-    let mut b = GraphBuilder::new();
-    let scope = ScopeId::new(0);
-    let start = b.add_step("start", scope, NOOP);
-    let left = b.add_step("left", scope, NOOP);
-    let right = b.add_step("right", scope, NOOP);
-    let deploy = b.add_step("deploy", scope, NOOP);
-    b.fan_out(start, &[left, right]);
-    b.link(left, deploy);
-    b.link(right, deploy);
-    let items = b.exprs().lit(json!(["a", "b"]));
-    b.set_expansion(deploy, Expansion::ForEach {
-        items,
-        target: ExpandTarget::Node,
-        max_parallel: None,
-        fail_fast: false,
-    });
-    b.set_join(deploy, JoinPolicy::Quorum { n: 2 });
-    assert_eq!(errors(&b.build()), vec![
-        ValidationError::QuorumOnExpansion {
-            node: deploy,
-            n:    2,
-        }
-    ]);
+fn a_for_each_node_counts_its_own_quorum() {
+    let build = |n: u32| {
+        let mut b = GraphBuilder::new();
+        let scope = ScopeId::new(0);
+        let start = b.add_step("start", scope, NOOP);
+        let left = b.add_step("left", scope, NOOP);
+        let right = b.add_step("right", scope, NOOP);
+        let deploy = b.add_step("deploy", scope, NOOP);
+        b.fan_out(start, &[left, right]);
+        b.link(left, deploy);
+        b.link(right, deploy);
+        let items = b.exprs().lit(json!(["a", "b"]));
+        b.set_expansion(deploy, Expansion::ForEach {
+            items,
+            target: ExpandTarget::Node,
+            max_parallel: None,
+            fail_fast: false,
+        });
+        b.set_join(deploy, JoinPolicy::Quorum { n });
+        (b.build(), deploy)
+    };
+
+    validate(&build(2).0).expect("two groups feed the quorum");
+    let (graph, deploy) = build(3);
+    assert_eq!(errors(&graph), vec![ValidationError::QuorumExceedsFanIn {
+        node:   deploy,
+        n:      3,
+        fan_in: 2,
+    }]);
 }
 
 /// A scope a path can leave and return to gets a warning, not an error: release

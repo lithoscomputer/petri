@@ -467,32 +467,63 @@ fn a_tiered_template_node_routes_its_clones() {
     );
 }
 
-/// Each clone is entered by one seed token and keeps the template's join, so
-/// a `Quorum { n: 2 }` on the `for_each` node admits the template but no
-/// clone, and the run still reports success. This is why §8 invariant 10
-/// rejects that join; if clones ever skip their join, relax the rule.
+/// A `for_each` node's own join decides when the expansion happens; the
+/// clones then start on their seeds without applying it again. With a quorum
+/// of two over three branches, the clones start after the second branch, and
+/// the third branch's token is dropped.
 #[test]
-fn a_quorum_on_the_for_each_node_never_runs_a_clone() {
+fn a_quorum_on_the_for_each_node_decides_when_the_clones_start() {
     let mut b = GraphBuilder::new();
     let scope = ir::ScopeId::new(0);
     let start = b.add_step("start", scope, NOOP);
-    let left = b.add_step("left", scope, NOOP);
-    let right = b.add_step("right", scope, NOOP);
+    let branches: Vec<_> = ["a", "b", "c"]
+        .iter()
+        .map(|name| b.add_step(name, scope, NOOP))
+        .collect();
     let deploy = b.add_step("deploy", scope, NOOP);
     let collect = b.add_step("collect", scope, NOOP);
-    b.fan_out(start, &[left, right]);
-    b.link(left, deploy);
-    b.link(right, deploy);
+    b.fan_out(start, &branches);
+    for branch in &branches {
+        b.link(*branch, deploy);
+    }
     b.link(deploy, collect);
     b.set_join(deploy, JoinPolicy::Quorum { n: 2 });
-    let items = b.exprs().lit(json!(["a", "b"]));
+    let items = b.exprs().lit(json!(["x", "y"]));
     parallel_for_each(&mut b, deploy, items, ExpandTarget::Node, None, false);
     let graph = b.build();
-    assert!(validate(&graph).is_err(), "invariant 10 rejects the graph");
+    validate(&graph).expect("valid");
 
     let mut h = Harness::new(graph);
-    assert_eq!(h.run(), RunStatus::Success);
-    assert_eq!(h.start_count("left") + h.start_count("right"), 2);
-    assert_eq!(h.start_count("deploy"), 0, "no clone runs");
-    assert_eq!(h.start_count("collect"), 0);
+    h.feed(engine::Event::ExecutionStarted {
+        start: engine::EngineStart::default(),
+    });
+    let started = h.take_starts();
+    h.finish(started[0].0, Outcome::success(Value::Null));
+    let branch_starts = h.take_starts();
+    assert_eq!(branch_starts.len(), 3);
+
+    h.finish(branch_starts[0].0, Outcome::success(Value::Null));
+    assert!(h.take_starts().is_empty(), "one branch is not a quorum");
+    h.finish(branch_starts[1].0, Outcome::success(Value::Null));
+    let clones = h.take_starts();
+    let names: Vec<&str> = clones.iter().map(|(_, name)| name.as_str()).collect();
+    assert_eq!(
+        names,
+        ["deploy#0", "deploy#1"],
+        "the second branch starts both clones"
+    );
+
+    h.finish(branch_starts[2].0, Outcome::success(Value::Null));
+    assert!(
+        h.take_starts().is_empty(),
+        "the third branch's token is dropped"
+    );
+    for (firing, _) in clones {
+        h.finish(firing, Outcome::success(Value::Null));
+    }
+    let collector = h.take_starts();
+    assert_eq!(collector.len(), 1);
+    h.finish(collector[0].0, Outcome::success(Value::Null));
+    assert_eq!(h.status, Some(RunStatus::Success));
+    h.verify_replay();
 }
