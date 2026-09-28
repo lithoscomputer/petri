@@ -152,6 +152,9 @@ fn candidate() -> impl Strategy<Value = RoutingCandidate> {
         target: SmolStr::new(target),
         rank,
         transition: EdgeTransition::Continue,
+        // Fork patch (breaker, d3da02a): the candidate's back-edge flag;
+        // the model check exercises forward routing only.
+        back: false,
     })
 }
 

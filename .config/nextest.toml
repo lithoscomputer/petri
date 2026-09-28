@@ -27,6 +27,14 @@ slow-timeout = { period = "60s", terminate-after = 3 }
 # the account, and the first one may build the shared runner snapshot. A few
 # at a time keeps the account's concurrency in bounds; the slow notice is
 # raised so a VM that takes minutes to come up is not reported as stuck.
+# Fork patch (2026-09-28, fabro-6558 session): a global slow bound so any
+# test waiting on an absent external resource (docker socket, gate, port)
+# terminates instead of wedging the whole suite forever. Generous period,
+# hard stop after two.
+[[profile.default.overrides]]
+filter = "all()"
+slow-timeout = { period = "180s", terminate-after = 2 }
+
 [test-groups.daytona]
 max-threads = 3
 

@@ -233,3 +233,52 @@ fn outcome_success_is_read_as_succeeded_with_a_dated_warning() {
     );
     assert!(rejected("outcome=failure").contains(&"unsupported.outcome_value".to_string()));
 }
+
+/// fabro-51ad: `nodes.<id>.generation` (and the other record fields) lower
+/// onto the run-context node record, so a loop's deadlock guard reads the
+/// counter. Before the fix the key lowered onto a literal `kv` lookup that
+/// never exists, and the guard could not fire.
+#[test]
+fn nodes_record_fields_read_the_run_context_record() {
+    let text = dot(
+        "flaky [prompt=\"x\"]\n  start -> flaky\n  flaky -> exit [condition=\"nodes.flaky.generation >= 2\"]\n  flaky -> flaky [label=\"again\"]",
+    );
+    let graph = lower_ok(&text);
+    let tiers = tiers(&graph, "flaky");
+    let guard = tiers[0].1[0].1;
+
+    let with_generation = |generation: u32| {
+        let mut run = ir::RunContext::new();
+        run.record(
+            smol_str::SmolStr::new("flaky"),
+            ir::NodeRecord {
+                status:     ir::Status::Failure(ir::FailureInfo::default()),
+                output:     serde_json::json!(null),
+                generation: ir::Generation::new(generation),
+                attempts:   1,
+            },
+        );
+        let ir::Guard::Expr(id) = guard else {
+            panic!("a condition guard");
+        };
+        let bound = statics("failure", &serde_json::json!(null));
+        let env = ir::EvalEnv::new(&serde_json::Value::Null, &run, &bound);
+        ir::eval(&graph.exprs, id, &env).unwrap_or_else(|e| panic!("{e}"))
+    };
+
+    assert_eq!(
+        with_generation(2),
+        serde_json::Value::Bool(true),
+        "generation 2 satisfies >= 2"
+    );
+    assert_eq!(
+        with_generation(1),
+        serde_json::Value::Bool(false),
+        "generation 1 does not"
+    );
+    assert_eq!(
+        with_generation(9),
+        serde_json::Value::Bool(true),
+        "generation 9 satisfies >= 2"
+    );
+}

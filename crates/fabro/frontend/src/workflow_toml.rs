@@ -185,6 +185,12 @@ pub fn read(
     reader.environment(&layers);
     let mut settings = reader.settings;
     settings.hooks_text = text.map(|text| (path, text));
+    // Full history whatever the layers ask: checkpoint publishing bundles
+    // the workspace commit and traverses its whole ancestry, and a depth
+    // cut silently truncates the bundle at the shallow boundary
+    // (fabro-df60, fabro-6558, mx-9251c9). `enabled` stays the layers'
+    // to decide; the depth is the full history for every run.
+    settings.run.clone.depth = 0;
     settings
 }
 

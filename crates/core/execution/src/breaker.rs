@@ -393,9 +393,26 @@ impl Middleware for CircuitBreaker {
             return Ok(decision);
         };
         if let Some(reason) = &pending.tripped {
-            return Ok(RouteDecision::Block {
-                reason: SmolStr::new(reason),
-            });
+            // The breaker's charter is to stop a run from LOOPING the
+            // same failure (fabro-51ad, option a): a route that leaves
+            // the cycle — the graph's own deadlock or boundary exit — is
+            // an explicit termination, not a loop, and passes. A back
+            // edge (or a loop-restart transition) continues the cycle
+            // and blocks; so does a decision with no route at all.
+            let continues_cycle = match &decision {
+                RouteDecision::Emit(edge) => call.proposal.candidates.iter().any(|candidate| {
+                    candidate.edge == *edge
+                        && (candidate.back
+                            || candidate.transition == EdgeTransition::Restart)
+                }),
+                _ => true,
+            };
+            if continues_cycle {
+                return Ok(RouteDecision::Block {
+                    reason: SmolStr::new(reason),
+                });
+            }
+            return Ok(decision);
         }
         let RouteDecision::Emit(edge) = decision else {
             return Ok(decision);
@@ -509,4 +526,134 @@ mod tests {
             None
         );
     }
+
+    /// The route seam with a tripped signature: build the middleware
+    /// state through `fold`, then call `route` over a next that returns a
+    /// fixed decision, the way the coordinator does.
+    mod route_seam {
+        use std::sync::Arc;
+
+        use super::super::*;
+        use engine::{DecisionId, RoutingCandidate, RoutingProposal};
+        use ir::{Attempt, EdgeId, FiringId, NodeId, Status};
+        use crate::{DecisionAddress, ExecutionId, InvocationId};
+
+        /// A classifier that calls every failure deterministic.
+        struct Deterministic;
+
+        impl FailureClassifier for Deterministic {
+            fn classify(&self, outcome: &Outcome) -> Option<ClassifiedFailure> {
+                match outcome.status.clone() {
+                    Status::Failure(_) => Some(ClassifiedFailure {
+                        category: FailureCategory::Deterministic,
+                        reason:   "exit status 1".to_string(),
+                    }),
+                    _ => None,
+                }
+            }
+        }
+
+        fn tripped_state(limit: u32) -> Value {
+            let breaker = CircuitBreaker::new(
+                NonZeroU32::new(limit).expect("nonzero"),
+                Arc::new(Deterministic),
+            );
+            let mut state = breaker.initial_state();
+            for firing in 1..=u64::from(limit) {
+                breaker
+                    .fold(
+                        &mut state,
+                        &FoldEvent::FinalOutcome {
+                            firing: FiringId::new(firing),
+                            node:   NodeId::new(2),
+                            outcome: &Outcome::failure("exit status 1"),
+                        },
+                    )
+                    .expect("fold");
+            }
+            state
+        }
+
+        fn proposal(back: bool) -> Arc<RoutingProposal> {
+            Arc::new(RoutingProposal {
+                group:      0,
+                tier:       None,
+                pick:       None,
+                candidates: vec![RoutingCandidate {
+                    edge:       EdgeId::new(7),
+                    weight:     1,
+                    target:     SmolStr::new("target"),
+                    rank:       None,
+                    transition: EdgeTransition::Continue,
+                    back,
+                }],
+            })
+        }
+
+        async fn route_over(
+            breaker: &CircuitBreaker,
+            state: Value,
+            decision: RouteDecision,
+            back: bool,
+        ) -> RouteDecision {
+            let next = RouteNext::from_decision(Ok(decision));
+            breaker
+                .route(
+                    RouteCall {
+                        address:  DecisionAddress {
+                            invocation: InvocationId::new(0),
+                            execution:  ExecutionId::new(0),
+                            decision:   DecisionId::route(FiringId::new(3), Attempt::new(1)),
+                        },
+                        firing:   FiringId::new(3),
+                        proposal: proposal(back),
+                        state,
+                    },
+                    next,
+                )
+                .await
+                .expect("route")
+        }
+
+        /// fabro-51ad (option a): a tripped signature blocks the cycle's
+        /// own continuation (a back edge) but passes the graph's explicit
+        /// exit from it.
+        #[tokio::test]
+        async fn a_tripped_breaker_passes_an_exit_route_and_blocks_a_back_edge() {
+            let breaker = CircuitBreaker::reference(NonZeroU32::new(3).expect("nonzero"));
+            let state = tripped_state(3);
+
+            let exit = route_over(
+                &breaker,
+                state.clone(),
+                RouteDecision::Emit(EdgeId::new(7)),
+                false,
+            )
+            .await;
+            assert_eq!(exit, RouteDecision::Emit(EdgeId::new(7)), "the exit passes");
+
+            let back = route_over(
+                &breaker,
+                state,
+                RouteDecision::Emit(EdgeId::new(7)),
+                true,
+            )
+            .await;
+            assert!(
+                matches!(back, RouteDecision::Block { .. }),
+                "the back edge blocks: {back:?}"
+            );
+        }
+
+        /// A decision with no route at all still blocks with the trip
+        /// reason, exactly as before the back-edge rule.
+        #[tokio::test]
+        async fn a_tripped_breaker_without_a_route_still_blocks() {
+            let breaker = CircuitBreaker::reference(NonZeroU32::new(3).expect("nonzero"));
+            let state = tripped_state(3);
+            let none = route_over(&breaker, state, RouteDecision::None, false).await;
+            assert!(matches!(none, RouteDecision::Block { .. }), "{none:?}");
+        }
+    }
 }
+

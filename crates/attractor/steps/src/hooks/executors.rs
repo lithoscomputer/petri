@@ -22,7 +22,7 @@
 
 use std::collections::BTreeMap;
 use std::mem;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
@@ -301,17 +301,51 @@ async fn sandbox_command(
 
 /// On the host: `sh -c`, the context on stdin, in the workspace directory
 /// when the sandbox shares the host filesystem.
+/// Place a host hook's context payload as a readable file: a private copy
+/// under the system temp dir, named for the run's process and the moment.
+/// `None` leaves the hook with stdin as the only channel (fabro-b714).
+async fn context_file(payload: &[u8]) -> Option<PathBuf> {
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |d| d.as_nanos());
+    let path = std::env::temp_dir().join(format!(
+        ".fabro-hook-context-{}-{nanos}.json",
+        std::process::id()
+    ));
+    tokio::fs::write(&path, payload).await.ok()?;
+    Some(path)
+}
+
 async fn host_command(
     hook: &HookDefinition,
     command: &str,
     payload: &[u8],
-    vars: BTreeMap<String, String>,
+    mut vars: BTreeMap<String, String>,
     env: Option<&dyn ExecEnv>,
 ) -> Executed {
+    // The context reaches a host hook on stdin AND, when a readable copy
+    // can be placed for it, as a file named by `FABRO_HOOK_CONTEXT` — one
+    // contract with the sandbox placement, where the variable is the only
+    // channel a script may rely on (fabro-b714). The wrapper removes the
+    // file when the command ends, wherever it ends up.
+    let context = context_file(payload).await;
+    let script = match &context {
+        Some(path) => {
+            vars.insert(
+                "FABRO_HOOK_CONTEXT".into(),
+                path.to_string_lossy().into_owned(),
+            );
+            format!(
+                "{command}\n__fabro_status=$?\nrm -f -- '{}'\nexit $__fabro_status",
+                path.to_string_lossy().replace('\'', "'\\''")
+            )
+        }
+        None => command.to_owned(),
+    };
     let mut process = Command::new("sh");
     process
         .arg("-c")
-        .arg(command)
+        .arg(script)
         .envs(vars)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -325,6 +359,9 @@ async fn host_command(
     let mut child = match process.spawn() {
         Ok(child) => child,
         Err(error) => {
+            if let Some(path) = &context {
+                let _ = tokio::fs::remove_file(path).await;
+            }
             return Executed::Decided(Decision::Block {
                 reason: Some(format!("command spawn failed: {error}")),
             });
@@ -342,10 +379,22 @@ async fn host_command(
             output.status.code().unwrap_or(1),
             &String::from_utf8_lossy(&output.stdout),
         )),
-        Ok(Err(error)) => Executed::Decided(Decision::Block {
-            reason: Some(format!("command wait failed: {error}")),
-        }),
-        Err(_) => Executed::Decided(parse_decision(-1, "")),
+        Ok(Err(error)) => {
+            if let Some(path) = &context {
+                let _ = tokio::fs::remove_file(path).await;
+            }
+            Executed::Decided(Decision::Block {
+                reason: Some(format!("command wait failed: {error}")),
+            })
+        }
+        // A timeout kills the child (kill_on_drop), so the wrapper's own
+        // removal never runs; the copy is best-effort removed here.
+        Err(_) => {
+            if let Some(path) = &context {
+                let _ = tokio::fs::remove_file(path).await;
+            }
+            Executed::Decided(parse_decision(-1, ""))
+        }
     }
 }
 

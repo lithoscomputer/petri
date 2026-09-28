@@ -1088,6 +1088,7 @@ fn routing_candidate(state: &EngineState, arm: &ir::Edge, rank: Option<f64>) -> 
             .map_or_else(|| SmolStr::new(""), |node| node.name.clone()),
         rank,
         transition: arm.transition,
+        back: arm.back,
     }
 }
 

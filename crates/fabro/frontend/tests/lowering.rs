@@ -772,9 +772,12 @@ fn agent_nodes_carry_the_reference_subagent_configuration() {
     );
 }
 
-/// `[run.clone]` lowers onto the launch parameter with Fabro's defaults
-/// (enabled, 100 commits), the repository the host bound rides beside it,
-/// and the root `start` stage reads the same entry as its `checkout`.
+/// `[run.clone]` lowers onto the launch parameter with `enabled` as the
+/// layers set it and the repository the host bound beside it; the depth is
+/// the full history whatever the layers ask — checkpoint publishing bundles
+/// the workspace commit and traverses its whole ancestry, and a depth cut
+/// silently truncates the bundle (fabro-df60, fabro-6558, mx-9251c9). The
+/// root `start` stage reads the same entry as its `checkout`.
 #[test]
 fn run_clone_lands_on_the_launch_param_with_the_bound_repository() {
     let lowered = load(
@@ -786,12 +789,12 @@ fn run_clone_lands_on_the_launch_param_with_the_bound_repository() {
     let graph = lowered.graph.expect("lowers");
     assert_eq!(
         graph.params["fabro.launch"]["clone"],
-        json!({ "enabled": true, "depth": 100, "repository": null }),
-        "Fabro's defaults, no repository when the host bound none"
+        json!({ "enabled": true, "depth": 0, "repository": null }),
+        "enabled by default, and the depth is forced to the full history"
     );
     assert_eq!(
         node(&graph, "start").step.config["checkout"],
-        json!({ "enabled": true, "depth": 100, "repository": null }),
+        json!({ "enabled": true, "depth": 0, "repository": null }),
         "the start stage carries the same clone settings as its checkout"
     );
 
@@ -820,6 +823,24 @@ fn run_clone_lands_on_the_launch_param_with_the_bound_repository() {
     assert_eq!(
         graph.params["fabro.launch"]["clone"],
         json!({ "enabled": false, "depth": 0, "repository": "/srv/repo" })
+    );
+
+    // A depth the layers ask is not honored: the checkout always carries
+    // the complete history, because checkpoint publishing needs it.
+    let lowered = load(
+        "wf/workflow.fabro",
+        &dot("c [shape=parallelogram, script=\"true\"]\nstart -> c -> exit"),
+        &files(&[(
+            "wf/workflow.toml",
+            "_version = 1\n[run.clone]\ndepth = 10\n",
+        )]),
+        &CompileInputs::new(),
+    );
+    let graph = lowered.graph.expect("lowers");
+    assert_eq!(
+        graph.params["fabro.launch"]["clone"]["depth"],
+        json!(0),
+        "a shallow depth the layers ask is forced to the full history"
     );
 
     let lowered = load(
