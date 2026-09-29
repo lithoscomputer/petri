@@ -34,6 +34,14 @@ treats as a different source. Pick up a newer commit with
 Lithos repository uses fixes that repository promptly. Fabro's `Cargo.lock`
 decides what ships. `mise run check:pins` enforces the form.
 
+After updating the lock, run `python3 scripts/check-pins.py --update-contract`
+to refresh the internal library rows in `crates/fabro/acceptance/CONTRACT.md`.
+It still rejects invalid refs, duplicate library sources, stale evidence,
+and changes to the Fabro reference or runner image citations. Commit the
+lock and contract together after verification. The internal-dependency
+nightly does this only in its temporary checkout and retains both files
+with its evidence; it does not adopt the update on main.
+
 All of these repositories are public. `Cargo.toml` names them over HTTPS, so
 a build needs no SSH key and no credential, locally or in CI.
 `GIT_SSH_COMMAND=false cargo fetch --locked` must pass; it proves no

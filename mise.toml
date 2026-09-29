@@ -133,7 +133,7 @@ run = "scripts/corpus-fetch-fabro-bundles.sh"
 
 [tasks."check:pins"]
 description = "Check internal git dependency refs, and that Cargo.lock, CONTRACT.md, and the latest evidence records agree"
-run = "python3 scripts/check-pins.py"
+run = ["python3 -m unittest discover -s scripts -p 'test_check_pins.py'", "python3 scripts/check-pins.py"]
 
 [tasks."check:whitespace"]
 description = "Check tracked and untracked patches for whitespace errors"

@@ -5,10 +5,11 @@ name: Internal dependencies
 # of each internal library with `cargo update -p`, then runs the routine tests
 # against it, so drift is noticed without anyone asking. A failure opens one
 # tracking issue labeled `internal-deps`, or comments on the open one; the
-# next passing run closes it. Nothing is pushed: Petri's lock only decides
-# what Petri's own CI builds, so a maintainer picks up a passing update with
-# the same `cargo update -p` commands (and the "Pinned revisions" table in
-# crates/fabro/acceptance/CONTRACT.md, which `mise run check:pins` compares).
+# next passing run closes it. The temporary checkout's contract citations
+# move with the lock, so evidence still has to match the tested revisions.
+# Nothing is pushed: a maintainer adopts an update by committing Cargo.lock
+# and the "Pinned revisions" table in crates/fabro/acceptance/CONTRACT.md
+# together after the checks pass.
 
 on:
   schedule:
@@ -66,6 +67,10 @@ jobs:
         with:
           cache-on-failure: true
           shared-key: internal-deps-ubuntu-24.04
+
+      # Refuse a broken committed baseline before refreshing any citations.
+      - name: Check the committed pins
+        run: mise run check:pins
 
       # One package per internal repository: updating one package from a Git
       # repository moves every package from that repository. The summary names
@@ -145,12 +150,19 @@ jobs:
             echo "$delimiter"
           } >> "$GITHUB_OUTPUT"
 
+      - name: Update the temporary contract citations
+        if: steps.update.outputs.changed == 'true'
+        run: |
+          python3 scripts/check-pins.py --update-contract
+          mise run check:pins
+          git diff -- Cargo.lock crates/fabro/acceptance/CONTRACT.md
+
       # The rest mirrors the Linux half of the routine CI job, so the new lock
       # meets the same test suite: the corpus, the vendored bundles, Docker,
       # and the sandbox plugins, all required. It runs the lint, the tests, and
-      # the compiler floor, not the whole `mise run check`: `check:pins` fails
-      # by design until CONTRACT.md cites the new commits, and the release
-      # build and the repository checks do not depend on the lock.
+      # the compiler floor, not the whole `mise run check`: the pin checks
+      # ran above, and the release build and repository checks do not depend
+      # on the lock. The evidence tests use the same strict pin validation.
       - name: Fetch the corpus
         if: steps.update.outputs.changed == 'true'
         run: scripts/corpus-fetch.sh && scripts/corpus-fetch-actions.sh && scripts/corpus-fetch-fabro.sh
@@ -202,6 +214,21 @@ jobs:
       - name: Check the minimum Rust version
         if: steps.update.outputs.changed == 'true'
         run: mise run check:msrv
+
+      # Keep the exact tested lock and contract with the scenario evidence,
+      # including when validation or a later test fails. A passing experiment
+      # is not an adoption of these revisions on main.
+      - name: Keep dependency upgrade provenance and evidence
+        if: always() && steps.update.outputs.changed == 'true'
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
+        with:
+          name: internal-dependency-evidence
+          path: |
+            Cargo.lock
+            crates/fabro/acceptance/CONTRACT.md
+            ${{ runner.temp }}/fabro-evidence
+          if-no-files-found: error
+          retention-days: 30
 
   report:
     name: report

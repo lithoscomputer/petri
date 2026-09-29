@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Check that every citation of a locked library revision agrees.
 
-    scripts/check-pins.py [--evidence DIR]
+    scripts/check-pins.py [--evidence DIR] [--update-contract]
 
 Every internal git dependency (a `lithoscomputer/*` repository) must name
 exactly `branch = "main"` in its manifest: never `rev`, and never an omitted
@@ -24,6 +24,8 @@ commit. Sources compared:
                                       (default: target/fabro-evidence/latest when present)
 
 Exit 1 with every disagreement listed; exit 0 when all agree.
+With --update-contract, refresh only the internal library rows from Cargo.lock,
+and write CONTRACT.md only if all remaining checks (including evidence) pass.
 """
 
 from __future__ import annotations
@@ -101,8 +103,7 @@ def same(problems: list[str], label: str, values: dict[str, str]) -> str | None:
     return None
 
 
-def contract_table(path: Path) -> dict[str, str]:
-    text = path.read_text(encoding="utf-8")
+def contract_table(text: str) -> dict[str, str]:
     start = text.find("## Pinned revisions")
     if start < 0:
         return {}
@@ -117,9 +118,29 @@ def contract_table(path: Path) -> dict[str, str]:
     return table
 
 
+def update_contract(text: str, expected: dict[str, str], problems: list[str]) -> str:
+    """Refresh library citations, without changing reference or runner provenance."""
+    start = text.find("## Pinned revisions\n")
+    if start < 0:
+        problems.append("CONTRACT.md: no `## Pinned revisions` table")
+        return text
+    end = text.find("\n## ", start + 1)
+    end = len(text) if end < 0 else end
+    section = text[start:end]
+    for name in LOCKED:
+        if name not in expected:
+            continue
+        row = re.compile(rf"^(\|\s*`?{name}`?\s*\|\s*`)[0-9a-f]{{7,40}}(`[^\n]*)$", re.M)
+        section, count = row.subn(lambda m: m[1] + expected[name] + m[2], section)
+        if count != 1:
+            problems.append(f"CONTRACT.md: expected one row for {name}, found {count}")
+    return text[:start] + section + text[end:]
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--evidence", type=Path)
+    parser.add_argument("--update-contract", action="store_true", help="refresh internal library citations from Cargo.lock after validation")
     args = parser.parse_args()
     problems: list[str] = []
 
@@ -136,7 +157,10 @@ def main() -> int:
     if lock.get("fabro_reference", {}).get("commit") != fabro:
         problems.append(f"bundles.lock.json fabro_reference.commit {lock.get('fabro_reference', {}).get('commit')} != pin {fabro}")
 
-    contract = contract_table(ROOT / "crates/fabro/acceptance/CONTRACT.md")
+    contract_path = ROOT / "crates/fabro/acceptance/CONTRACT.md"
+    original_contract = contract_path.read_text(encoding="utf-8")
+    updated_contract = update_contract(original_contract, expected, problems) if args.update_contract else original_contract
+    contract = contract_table(updated_contract)
     if not contract:
         problems.append("CONTRACT.md: no `## Pinned revisions` table")
     backend = (ROOT / "crates/core/executor-sandbox/src/backend.rs").read_text(encoding="utf-8")
@@ -181,6 +205,9 @@ def main() -> int:
         for problem in problems:
             print(f"  {problem}", file=sys.stderr)
         return 1
+    if updated_contract != original_contract:
+        contract_path.write_text(updated_contract, encoding="utf-8")
+        print("updated CONTRACT.md internal library citations")
     print("pins agree")
     return 0
 
