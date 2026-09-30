@@ -8,7 +8,11 @@
 //! host at the configured depth, packs the clone as one tarball, and hands
 //! it to the environment's own `tar` through the executor, the delivery
 //! the GitHub Actions checkout uses, so a Docker workspace receives the
-//! same files as a host workspace and mode bits survive.
+//! same files as a host workspace and mode bits survive. The files belong
+//! to the user that extracts them, not to the host user that packed them:
+//! a container sandbox runs as root, and root's `tar` would otherwise restore
+//! the host's uid, which makes every later `git` in the workspace refuse it
+//! as a repository of dubious ownership.
 //!
 //! The clone's `origin` is the repository's own `origin` when it has one
 //! (a fresh clone from the host path would otherwise name that path), and
@@ -279,12 +283,15 @@ fn run(command: &mut Command, what: &str) -> Result<String, String> {
 }
 
 /// Extract the archive with the environment's own `tar`, then remove it.
+/// `--no-same-owner` gives every file to the extracting user (GNU tar,
+/// BSD tar and BusyBox tar all take it); mode bits and symlinks still
+/// come from the archive.
 async fn unpack(ctx: &StepCtx) -> Result<(), CheckoutError> {
     let workspace = ctx.env.workspace_path().to_string();
     let archive = format!("{workspace}/{ARCHIVE}");
     let spec = ProcessSpec::new("sh", &[
         "-c",
-        "tar -xf \"$1\" -C \"$2\" && rm -f \"$1\"",
+        "tar --no-same-owner -xf \"$1\" -C \"$2\" && rm -f \"$1\"",
         "petri-checkout",
         &archive,
         &workspace,
