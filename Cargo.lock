@@ -1968,6 +1968,7 @@ dependencies = [
  "serde_json",
  "smol_str",
  "tokio",
+ "tokio-util",
 ]
 
 [[package]]

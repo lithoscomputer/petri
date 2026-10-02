@@ -226,6 +226,44 @@ impl Coordinator {
         Ok(())
     }
 
+    /// Record the releases a crash cut off: a lease its release settled
+    /// (stopped and kept, or deleted) whose `scope.released` the crash beat
+    /// to the log. Its record says how the release ended; the outcome is
+    /// its owner's, or `status` for an owner with none.
+    pub(super) async fn record_cut_off_releases(&mut self, status: RunStatus) {
+        let unrecorded: Vec<_> = self
+            .resources()
+            .await
+            .records()
+            .filter(|record| {
+                matches!(
+                    record.state,
+                    crate::LeaseState::Stopped | crate::LeaseState::Deleted
+                ) && !self.store.state().released.contains(&record.lease)
+            })
+            .map(|record| {
+                let owner_status = self
+                    .store
+                    .state()
+                    .invocations
+                    .get(&record.allocation.invocation)
+                    .and_then(|invocation| invocation.result.as_ref())
+                    .map_or(status, |result| result.status);
+                (record.lease, record.allocation.invocation, owner_status)
+            })
+            .collect();
+        for (lease, invocation, owner_status) in unrecorded {
+            let release = LeaseRelease {
+                lease,
+                outcome: scope_outcome(owner_status),
+                report: executor::ReleaseReport::default(),
+            };
+            if let Err(error) = self.append_scope_released(invocation, release).await {
+                tracing::warn!(%error, lease = lease.raw(), "the scope's release was not recorded");
+            }
+        }
+    }
+
     /// Release the leases `invocation` allocated, now that it has finished.
     /// An inherited invocation allocated none: its caller's lease outlives
     /// it.

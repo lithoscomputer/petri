@@ -2589,6 +2589,9 @@ impl Driver {
             attempt,
             max_attempts,
             scope,
+            environment: SmolStr::new(
+                EnvironmentId::scoped(self.config.environment_prefix.as_deref(), scope).as_str(),
+            ),
             node: name.clone(),
             config: resolved.config().clone(),
             env,

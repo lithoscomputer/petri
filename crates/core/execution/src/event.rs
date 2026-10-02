@@ -233,9 +233,10 @@ pub enum CoordinatorEvent {
     /// for `outcome`. `retained` is whether the sandbox and its workspace
     /// still exist on the provider afterwards; `problems` is what the release
     /// could not do, in which case the sandbox is still there and the next
-    /// release (`finish`, or `petri sandbox prune`) tries again. Usually
-    /// before `run.finished`; a lease a crash left live is released by the
-    /// resumed run's end, after it.
+    /// release (the run's end, or `petri sandbox prune`) tries again. Always
+    /// before `run.finished`: the run's end releases what a crash left live
+    /// or a failed release left behind, and records a release a crash cut
+    /// off before its record, first.
     #[serde(rename = "scope.released")]
     ScopeReleased {
         invocation: InvocationId,

@@ -42,6 +42,11 @@ pub struct StepCtx {
     pub max_attempts: NonZeroU32,
     /// The resource scope the step runs in.
     pub scope:        ScopeId,
+    /// The scope's environment: the fence identity the executor acquired
+    /// it under, one per execution and scope. Executions that share a
+    /// sandbox (a restart, a child that inherits its caller's) each have
+    /// their own.
+    pub environment:  SmolStr,
     /// The node's instance name, for log file naming and messages.
     pub node:         SmolStr,
     /// The resolved config. Free of expression placeholders; may hold `$secret`

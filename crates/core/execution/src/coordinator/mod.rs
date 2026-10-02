@@ -490,26 +490,24 @@ impl Coordinator {
         Ok(result)
     }
 
-    /// Append the run's end, unless the log already has it.
+    /// Append the run's end, unless the log already has it. Every lease
+    /// still holding a sandbox is released first, so each release is
+    /// recorded and `run.finished` stays the log's last record.
     async fn finish_run(&mut self, status: RunStatus) -> Result<(), CoordinatorError> {
         if self.store.state().run_status.is_none() {
+            self.release_remaining(status).await;
             self.append(CoordinatorEvent::RunFinished { status })
                 .await?;
         }
         Ok(())
     }
 
-    /// End the run: release every lease still holding a sandbox — an
-    /// invocation that finished before a crash, or one that never finished
-    /// — with the run's own status, tear the run services down and stop the
-    /// store writer. The run's store handle comes back, still holding the
-    /// lease, so the caller can read the finished run through it.
-    pub async fn finish(mut self) -> Arc<dyn RunLogs> {
-        let status = self
-            .store
-            .state()
-            .run_status
-            .unwrap_or(RunStatus::Cancelled);
+    /// Release every lease still holding a sandbox — one whose invocation
+    /// finished before a crash, one whose release failed or never ran, or
+    /// one whose invocation never finished — each with its owner's status,
+    /// or `status` for an owner with none, and record each release, and
+    /// each one a crash cut off before its record.
+    async fn release_remaining(&mut self, status: RunStatus) {
         let remaining: Vec<_> = self
             .resources()
             .await
@@ -539,6 +537,19 @@ impl Coordinator {
             {
                 tracing::warn!(%error, lease = lease.raw(), "the scope's release was not recorded");
             }
+        }
+        self.record_cut_off_releases(status).await;
+    }
+
+    /// End the run: tear the run services down and stop the store writer.
+    /// A run that ended released its leases before `run.finished`; one that
+    /// stopped short of its end (an error, the host's stop) releases them
+    /// here, and records each release. The run's store handle comes back,
+    /// still holding the lease, so the caller can read the finished run
+    /// through it.
+    pub async fn finish(mut self) -> Arc<dyn RunLogs> {
+        if self.store.state().run_status.is_none() {
+            self.release_remaining(RunStatus::Cancelled).await;
         }
         self.runtime.finish().await;
         if let Err(error) = self.writer.shutdown().await {

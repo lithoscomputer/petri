@@ -791,6 +791,15 @@ impl SandboxLeaseManager {
                     }
                     report.kept(format!("sandbox {id} (stopped, lease {lease})"))
                 }
+                // Someone outside the run deleted the sandbox: there is
+                // nothing left to keep. The lease ends as a delete that
+                // finds nothing ends, and the release says what was lost.
+                Err(DriverError::NotFound { .. }) => match self.ledger.deleted(lease).await {
+                    Ok(()) => report.problem(format!(
+                        "sandbox {id} was gone before it could be kept; lease {lease} is deleted"
+                    )),
+                    Err(error) => report.problem(error.to_string()),
+                },
                 Err(error) => report.problem(format!("sandbox {id} stop failed: {error}")),
             }
         } else {

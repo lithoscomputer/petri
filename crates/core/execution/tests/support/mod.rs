@@ -1,7 +1,9 @@
 //! A simulated host for the execution layer: the world from
-//! [`testkit::sim`] behind a runtime whose recording clock, step logs and
-//! routing draws come from the simulation, over an in-memory store that
-//! outlives a crash, on a single-threaded runtime whose clock starts paused.
+//! [`testkit::sim`] as the sandbox provider behind the runtime's own lease
+//! router, a recording clock, step logs and routing draws from the
+//! simulation, and an in-memory store that outlives a crash and that a
+//! lifetime can crash on, on a single-threaded runtime whose clock starts
+//! paused.
 
 #![allow(
     dead_code,
@@ -9,26 +11,29 @@
 )]
 
 use std::collections::BTreeMap;
-use std::fs;
 use std::future::Future;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
+use std::{fmt, fs};
 
 use execution::{
     AttemptAdmission, CallSite, CoordinatorInvocationClient, GraphDigest, InvocationClient as _,
-    InvocationRequest, InvocationResult, LogId, MemoryRunStore, RunKey, RunStore as _, SandboxMode,
-    SecretBindings,
+    InvocationRequest, InvocationResult, LeaseState, LogId, MemoryRunStore, PendingIntent,
+    ResourceLogRecord, RunKey, RunStore as _, SandboxMode, SandboxResourceRecord, SecretBindings,
 };
+use executor::Retention;
+use executor_sandbox::{InProcessProviders, LostSandbox, SandboxBackend, SandboxOptions};
 use ir::{FailureInfo, Graph, Outcome, RunStatus, Status, StepKindId};
 use runtime::{RunOptions, Runtime};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use steps::{Step, StepCtx};
-use store::Access;
+use store::{Access, Digest, Record, RunLogs, StoreError};
 use testkit::RunDir;
-use testkit::sim::{Faults, MemoryLogs, World, sandboxed_registry};
+use testkit::sim::{Faults, LeaseRecords, LeaseView, MemoryLogs, World, sandboxed_registry};
 use tokio::runtime::Builder;
+use tokio::sync::Notify;
 use tokio::time::{self, Instant};
 
 /// The recording clock's reading at the simulation's start, in milliseconds
@@ -154,33 +159,52 @@ impl Step for InvokeStep {
 
 // ── The simulated host ────────────────────────────────────────────────────
 
+/// How the run keeps its sandboxes.
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) struct Leases {
+    pub retention: Retention,
+    pub lost:      LostSandbox,
+}
+
 /// What outlives a crash: the store, the world and its step logs.
 pub(crate) struct SimHost {
-    pub dir:   RunDir,
-    pub store: Arc<MemoryRunStore>,
-    pub world: Arc<World>,
-    pub logs:  Arc<MemoryLogs>,
-    pub seed:  u64,
+    pub dir:     RunDir,
+    pub store:   Arc<MemoryRunStore>,
+    /// The store as the runs open it: watched, so a lifetime can crash on a
+    /// resource record.
+    pub watched: Arc<WatchedStore>,
+    pub world:   Arc<World>,
+    pub logs:    Arc<MemoryLogs>,
+    pub seed:    u64,
+    pub leases:  Leases,
     /// The runtime's clock at the simulation's start.
-    pub epoch: Instant,
+    pub epoch:   Instant,
 }
 
 impl SimHost {
     /// A fresh host, on the runtime whose clock is paused: call inside it.
+    /// The world checks every provider call against the store's lease
+    /// records.
     pub(crate) fn new(name: &str, seed: u64, faults: Faults) -> Self {
+        let store = Arc::new(MemoryRunStore::new());
+        let world = World::new(seed, faults);
+        world.check_leases(Arc::new(StoredLeases(Arc::clone(&store))));
         Self {
             dir: RunDir::new(name),
-            store: Arc::new(MemoryRunStore::new()),
-            world: World::new(seed, faults),
+            watched: Arc::new(WatchedStore::new(Arc::clone(&store))),
+            store,
+            world,
             logs: Arc::new(MemoryLogs::default()),
             seed,
+            leases: Leases::default(),
             epoch: Instant::now(),
         }
     }
 
-    /// The runtime one coordinator lifetime runs on: the world's executor as
-    /// that lifetime reaches it, the invoke step beside the world's step, the
-    /// simulated clock, the in-memory step logs and the seed's draws.
+    /// The runtime one coordinator lifetime runs on: the runtime's own lease
+    /// router over the world's provider, as that lifetime reaches it, the
+    /// invoke step beside the world's step, the simulated clock, the
+    /// in-memory step logs and the seed's draws.
     pub(crate) fn runtime(&self) -> Runtime {
         let mut registry = sandboxed_registry();
         registry.register(InvokeStep);
@@ -191,12 +215,18 @@ impl SimHost {
             hard_deadline_slack: HARD_DEADLINE_SLACK,
             cleanup_grace: CLEANUP_GRACE,
             run_key: Some(run_key()),
+            retention: self.leases.retention,
+            sandbox: SandboxOptions {
+                backend: SandboxBackend::Docker,
+                lost_sandbox: self.leases.lost,
+                ..SandboxOptions::default()
+            },
             ..RunOptions::new(self.dir.path())
         };
         Runtime::bare()
             .steps(registry)
-            .executor(self.world.executor())
-            .store(Arc::clone(&self.store) as Arc<dyn store::RunStore>)
+            .in_process_providers(InProcessProviders::new().with(Arc::new(self.world.factory())))
+            .store(Arc::clone(&self.watched) as Arc<dyn store::RunStore>)
             .options(options)
             .recording_clock(driver::RecordingClock::new(move || {
                 SIMULATED_EPOCH_MS + u64::try_from(epoch.elapsed().as_millis()).unwrap_or(u64::MAX)
@@ -258,6 +288,146 @@ impl SimHost {
             resources,
             executions,
         }
+    }
+}
+
+/// The run's lease records, as the world checks its provider calls against
+/// them: the latest record of each lease in the store's resource log.
+pub(crate) struct StoredLeases(pub Arc<MemoryRunStore>);
+
+impl fmt::Debug for StoredLeases {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("StoredLeases")
+    }
+}
+
+#[async_trait::async_trait]
+impl LeaseRecords for StoredLeases {
+    async fn lease(&self, lease: &str) -> Option<LeaseView> {
+        let logs = self.0.open(&run_key(), Access::Read).await.ok()?;
+        let records = logs.read(&LogId::Resources).await.ok()?;
+        records
+            .iter()
+            .rev()
+            .filter_map(|record| record.decode::<ResourceLogRecord>().ok())
+            .find(|record| record.body.lease.raw().to_string() == lease)
+            .map(|record| LeaseView {
+                state:       record.body.state,
+                pending:     record.body.pending,
+                fingerprint: record.body.fingerprint.is_some(),
+                resource_id: record.body.resource_id.map(|id| id.to_string()),
+            })
+    }
+}
+
+/// A resource record's kind, as a crash trigger names it.
+pub(crate) fn resource_kind(record: &SandboxResourceRecord) -> &'static str {
+    match (record.state, record.pending) {
+        (_, Some(PendingIntent::Stop)) => "pending stop",
+        (_, Some(PendingIntent::Delete)) => "pending delete",
+        (LeaseState::Allocating, None) if record.fingerprint.is_some() => "allocating",
+        (LeaseState::Allocating, None) => "reserved",
+        (LeaseState::Live, None) => "live",
+        (LeaseState::Stopped, None) => "stopped",
+        (LeaseState::Deleted, None) => "deleted",
+    }
+}
+
+/// A crash armed for one lifetime: after the `nth` resource record of a
+/// kind, counting from 0.
+struct Armed {
+    kind:  &'static str,
+    nth:   usize,
+    seen:  usize,
+    crash: Arc<Notify>,
+}
+
+/// The in-memory store as the runs open it, watched: a lifetime can crash
+/// right after a resource record of a chosen kind is durable.
+pub(crate) struct WatchedStore {
+    inner: Arc<MemoryRunStore>,
+    armed: Arc<Mutex<Option<Armed>>>,
+}
+
+impl WatchedStore {
+    fn new(inner: Arc<MemoryRunStore>) -> Self {
+        Self {
+            inner,
+            armed: Arc::new(Mutex::new(None)),
+        }
+    }
+
+    /// Crash the next lifetime right after the `nth` record of `kind`, by
+    /// notifying `crash`; or never, for `None`.
+    pub(crate) fn arm(&self, trigger: Option<(&'static str, usize)>, crash: Arc<Notify>) {
+        *self.armed.lock().unwrap_or_else(PoisonError::into_inner) =
+            trigger.map(|(kind, nth)| Armed {
+                kind,
+                nth,
+                seen: 0,
+                crash,
+            });
+    }
+}
+
+#[async_trait::async_trait]
+impl store::RunStore for WatchedStore {
+    async fn open(&self, key: &RunKey, access: Access) -> Result<Arc<dyn RunLogs>, StoreError> {
+        let inner = self.inner.open(key, access).await?;
+        Ok(Arc::new(WatchedLogs {
+            inner,
+            armed: Arc::clone(&self.armed),
+        }))
+    }
+}
+
+struct WatchedLogs {
+    inner: Arc<dyn RunLogs>,
+    armed: Arc<Mutex<Option<Armed>>>,
+}
+
+#[async_trait::async_trait]
+impl RunLogs for WatchedLogs {
+    fn locator(&self) -> String {
+        self.inner.locator()
+    }
+
+    async fn append(&self, log: &LogId, records: &[Record]) -> Result<(), StoreError> {
+        self.inner.append(log, records).await?;
+        if *log == LogId::Resources {
+            let mut armed = self.armed.lock().unwrap_or_else(PoisonError::into_inner);
+            if let Some(armed) = armed.as_mut() {
+                for record in records {
+                    let Ok(line) = record.decode::<ResourceLogRecord>() else {
+                        continue;
+                    };
+                    if resource_kind(&line.body) != armed.kind {
+                        continue;
+                    }
+                    if armed.seen == armed.nth {
+                        armed.crash.notify_one();
+                    }
+                    armed.seen += 1;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    async fn read(&self, log: &LogId) -> Result<Vec<Record>, StoreError> {
+        self.inner.read(log).await
+    }
+
+    async fn read_from(&self, log: &LogId, seq: u64) -> Result<Vec<Record>, StoreError> {
+        self.inner.read_from(log, seq).await
+    }
+
+    async fn put_blob(&self, bytes: &[u8]) -> Result<Digest, StoreError> {
+        self.inner.put_blob(bytes).await
+    }
+
+    async fn get_blob(&self, digest: Digest) -> Result<Option<Vec<u8>>, StoreError> {
+        self.inner.get_blob(digest).await
     }
 }
 

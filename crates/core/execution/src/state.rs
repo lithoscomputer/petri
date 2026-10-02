@@ -8,7 +8,7 @@ use smol_str::SmolStr;
 use crate::host::ForkOrigin;
 use crate::{
     AttemptAdmission, CancelReason, CoordinatorEvent, CoordinatorRecord, ExecutionId, GraphDigest,
-    InvocationId, InvocationResult, ParentCallKey, SandboxBinding, SecretBindings,
+    InvocationId, InvocationResult, ParentCallKey, SandboxBinding, SandboxLeaseId, SecretBindings,
 };
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -116,6 +116,9 @@ pub struct CoordinatorState {
     /// that belong to no firing.
     #[serde(default)]
     pub run_notes:        Vec<RunNote>,
+    /// The leases whose release is recorded (`scope.released`).
+    #[serde(default)]
+    pub released:         BTreeSet<SandboxLeaseId>,
 }
 
 /// A run-level note as recorded: a hook report from a point with no firing
@@ -461,7 +464,9 @@ impl CoordinatorState {
                 kind:      kind.clone(),
                 payload:   payload.clone(),
             }),
-            CoordinatorEvent::ScopeReleased { .. } => {}
+            CoordinatorEvent::ScopeReleased { lease, .. } => {
+                self.released.insert(*lease);
+            }
             CoordinatorEvent::RunFinished { status } => {
                 self.run_status = Some(*status);
             }

@@ -41,6 +41,14 @@ use steps::{Answer, Question, Registry, Step, StepCtx};
 use tokio::sync::{Notify, mpsc};
 use tokio::time;
 
+mod provider;
+
+pub use provider::{
+    Call, CallCrash, CallRecord, LeaseRecords, LeaseView, Moment, WORLD_KIND, WorldFactory,
+    WorldSandbox,
+};
+pub use sandbox_driver::SandboxState;
+
 /// `SplitMix64`.
 #[derive(Clone, Copy, Debug)]
 pub struct Dice(pub u64);
@@ -68,6 +76,8 @@ pub struct Faults {
     pub acquire_ms:      u64,
     /// The longest a release takes, in milliseconds.
     pub release_ms:      u64,
+    /// Percent of sandbox stops and deletes that fail, through the provider.
+    pub release_failure: u64,
 }
 
 /// One acquisition of a scope's environment, from the moment the provider
@@ -167,6 +177,16 @@ struct WorldState {
     /// Processes a fence ended.
     fenced:        usize,
     violations:    Vec<String>,
+    /// The provider's sandboxes, every one ever created, in creation order.
+    sandboxes:     Vec<WorldSandbox>,
+    /// Every provider call that changed a sandbox.
+    calls:         Vec<CallRecord>,
+    /// Calls of each kind this lifetime, for the crash plan.
+    counts:        BTreeMap<Call, usize>,
+    /// Crash the lifetime at the `nth` call of a kind.
+    crash_at:      Option<(CallCrash, Arc<Notify>)>,
+    /// Where provider calls read the run's lease records.
+    records:       Option<Arc<dyn LeaseRecords>>,
 }
 
 /// The world a simulated run's drivers share.
@@ -192,6 +212,11 @@ impl World {
                 fatal: BTreeSet::new(),
                 fenced: 0,
                 violations: Vec::new(),
+                sandboxes: Vec::new(),
+                calls: Vec::new(),
+                counts: BTreeMap::new(),
+                crash_at: None,
+                records: None,
             }),
         })
     }
@@ -213,6 +238,8 @@ impl World {
         state.lifetime += 1;
         state.finished = finished;
         state.stopping = stopping;
+        state.counts.clear();
+        state.crash_at = None;
     }
 
     pub fn violation(&self, message: String) {
@@ -469,35 +496,60 @@ struct WorldEnv {
     generation: u32,
 }
 
-/// A process's scripted parameter, from its environment.
-fn var<T: FromStr>(spec: &ProcessSpec, key: &str) -> Option<T> {
-    spec.env.get(key).and_then(|value| value.parse().ok())
+/// The `index`th line a process prints.
+fn line(firing: u64, attempt: u32, index: u32) -> String {
+    format!("firing {firing} attempt {attempt} line {index}")
 }
 
-#[async_trait::async_trait]
-impl ExecEnv for WorldEnv {
-    async fn spawn(&self, spec: ProcessSpec) -> Result<Box<dyn ProcessHandle>, EnvError> {
-        let firing: u64 = var(&spec, "SIM_FIRING").unwrap_or_default();
-        let attempt: u32 = var(&spec, "SIM_ATTEMPT").unwrap_or_default();
-        let work: u64 = var(&spec, "SIM_WORK_MS").unwrap_or_default();
-        let lines: u32 = var(&spec, "SIM_LINES").unwrap_or_default();
-        let mut state = self.world.lock();
+/// Where a process starts: its sandbox, as the world keys it, and the
+/// execution that ran it.
+struct Place {
+    key:        SmolStr,
+    generation: u32,
+    execution:  SmolStr,
+    /// The sandbox is the one its holder should run in: not fenced by a
+    /// later acquisition. A process in a fenced sandbox is dead on arrival.
+    current:    bool,
+}
+
+/// A started process: its state, whose attempt it is, and the lines it
+/// prints.
+struct Started {
+    state:   Arc<ProcessState>,
+    firing:  u64,
+    attempt: u32,
+    lines:   u32,
+}
+
+impl World {
+    /// Start a process at `place` with the parameters `var` reads (the
+    /// `SIM_*` values the sandboxed step sets), noting each rule its start
+    /// breaks.
+    fn start_process(&self, place: Place, var: impl Fn(&str) -> Option<String>) -> Started {
+        fn parse<T: FromStr>(value: Option<String>) -> Option<T> {
+            value.and_then(|value| value.parse().ok())
+        }
+        let firing: u64 = parse(var("SIM_FIRING")).unwrap_or_default();
+        let attempt: u32 = parse(var("SIM_ATTEMPT")).unwrap_or_default();
+        let work: u64 = parse(var("SIM_WORK_MS")).unwrap_or_default();
+        let lines: u32 = parse(var("SIM_LINES")).unwrap_or_default();
+        let Place {
+            key,
+            generation,
+            execution,
+            current,
+        } = place;
+        let mut state = self.lock();
         let lifetime = state.lifetime;
         let now = time::Instant::now();
-        let execution = self.execution.clone();
-        let current = !state
-            .acquisitions
-            .iter()
-            .any(|a| a.key == self.key && a.generation == self.generation && a.fenced);
         if current
             && state.processes.iter().any(|earlier| {
-                earlier.key == self.key && earlier.lifetime < lifetime && earlier.running(now)
+                earlier.key == key && earlier.lifetime < lifetime && earlier.running(now)
             })
         {
             state.violations.push(format!(
-                "firing {firing} attempt {attempt} ran in {} generation {} beside an unfenced \
-                 process a dead driver left",
-                self.key, self.generation
+                "firing {firing} attempt {attempt} ran in {key} generation {generation} beside \
+                 an unfenced process a dead driver left"
             ));
         }
         if state.sibling {
@@ -538,34 +590,60 @@ impl ExecEnv for WorldEnv {
             exit:       Mutex::new(None),
             changed:    Notify::new(),
             ends_at:    time::Instant::now() + Duration::from_millis(work),
-            code:       var(&spec, "SIM_EXIT").unwrap_or_default(),
-            honor_term: var(&spec, "SIM_HONOR_TERM").unwrap_or(true),
+            code:       parse(var("SIM_EXIT")).unwrap_or_default(),
+            honor_term: parse(var("SIM_HONOR_TERM")).unwrap_or(true),
         });
         // A fenced environment runs nothing: its process is dead on arrival.
         if !current {
             process.kill(9);
         }
         state.processes.push(Ran {
-            key: self.key.clone(),
+            key,
             execution,
-            generation: self.generation,
+            generation,
             lifetime,
             firing,
             attempt,
             state: Arc::clone(&process),
         });
-        drop(state);
-        let (tx, rx) = mpsc::channel(usize::try_from(lines).unwrap_or(0) + 1);
-        for index in 0..lines {
+        Started {
+            state: process,
+            firing,
+            attempt,
+            lines,
+        }
+    }
+}
+
+#[async_trait::async_trait]
+impl ExecEnv for WorldEnv {
+    async fn spawn(&self, spec: ProcessSpec) -> Result<Box<dyn ProcessHandle>, EnvError> {
+        let current = !self
+            .world
+            .lock()
+            .acquisitions
+            .iter()
+            .any(|a| a.key == self.key && a.generation == self.generation && a.fenced);
+        let started = self.world.start_process(
+            Place {
+                key: self.key.clone(),
+                generation: self.generation,
+                execution: self.execution.clone(),
+                current,
+            },
+            |key| spec.env.get(key).map(ToString::to_string),
+        );
+        let (tx, rx) = mpsc::channel(usize::try_from(started.lines).unwrap_or(0) + 1);
+        for index in 0..started.lines {
             let _ = tx.try_send(LogLine {
                 stream:     LogStream::Stdout,
-                line:       format!("firing {firing} attempt {attempt} line {index}"),
+                line:       line(started.firing, started.attempt, index),
                 dropped:    0,
                 terminated: true,
             });
         }
         Ok(Box::new(WorldProcess {
-            state: process,
+            state: started.state,
             lines: Some(rx),
         }))
     }
@@ -687,6 +765,7 @@ impl Step for SandboxedStep {
             .unwrap_or(0);
         let mut spec = ProcessSpec::new("sim", &[]);
         for (key, value) in [
+            ("SIM_EXECUTION", ctx.environment.to_string()),
             ("SIM_FIRING", ctx.firing.raw().to_string()),
             ("SIM_ATTEMPT", ctx.attempt.raw().to_string()),
             ("SIM_WORK_MS", work.to_string()),

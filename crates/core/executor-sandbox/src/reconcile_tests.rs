@@ -540,6 +540,48 @@ async fn a_lost_create_is_adopted_and_fenced_at_reconciliation() {
     assert_eq!(provider.creates.load(Ordering::SeqCst), 1);
 }
 
+/// A release that keeps its sandbox, finding it gone from the provider,
+/// ends the lease as a tombstone and says what was lost: there is nothing
+/// left to keep, and no retry could keep it.
+#[tokio::test]
+async fn a_kept_release_of_a_lost_sandbox_tombstones_its_lease() {
+    let dir = RunDir::new("reconcile-lost-kept");
+    let provider = ScriptedProvider::new();
+    let ledger: Arc<MemoryLedger> = Arc::new(MemoryLedger::default());
+    let manager = build_manager(&dir, &provider, ledger.clone());
+    let id = acquire(&manager).await.expect("creates");
+    manager.release_holder(LEASE).await;
+    drop(manager);
+    provider
+        .delete(&id, None)
+        .await
+        .expect("the provider forgets the sandbox");
+
+    // A resumed run's manager finds the sandbox by its record.
+    let manager = build_manager(&dir, &provider, ledger.clone());
+    let report = manager
+        .release_lease(LEASE, Retention::Always, ScopeOutcome::Failed)
+        .await;
+    assert!(
+        report
+            .problems
+            .iter()
+            .any(|problem| problem.contains("was gone before it could be kept")),
+        "{report:?}"
+    );
+    let record = ledger
+        .lookup(LEASE)
+        .await
+        .expect("the ledger reads")
+        .expect("the lease is recorded");
+    assert_eq!(record.state, LeaseState::Deleted);
+    assert_eq!(record.pending, None);
+    let again = manager
+        .release_lease(LEASE, Retention::Always, ScopeOutcome::Failed)
+        .await;
+    assert!(again.is_clean(), "a tombstone needs no release: {again:?}");
+}
+
 /// A recorded sandbox that is gone from the provider fails the acquire by
 /// default; under `LostSandbox::Replace` a fresh one is created under the
 /// lease and recorded live in its place.

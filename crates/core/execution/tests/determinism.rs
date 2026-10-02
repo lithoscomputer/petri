@@ -25,6 +25,7 @@ const FAULTS: Faults = Faults {
     acquire_failure: 0,
     acquire_ms:      5,
     release_ms:      5,
+    release_failure: 0,
 };
 
 fn sandboxed(work_ms: u64) -> StepRef {

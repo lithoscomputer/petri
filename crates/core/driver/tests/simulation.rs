@@ -702,6 +702,7 @@ fn simulate_world(dir: &RunDir, seed: u64) -> Outcome {
         acquire_failure: 8,
         acquire_ms:      15,
         release_ms:      5,
+        release_failure: 0,
     });
     let store = Arc::new(Store::default());
     let logs = Arc::new(MemoryLogs::default());

@@ -294,6 +294,98 @@ async fn a_crash_between_the_roots_end_and_the_runs_end_still_ends_the_run() {
         vec![result.status],
         "the run ends once, as its root did"
     );
+    // The crash cut off the root's `scope.released` too; its lease was
+    // settled, and the resumed run records that before the run's end.
+    assert_release_before_end(&coordinator).await;
+    coordinator.finish().await;
+}
+
+/// The log's one `scope.released`, then `run.finished` as its last record.
+async fn assert_release_before_end(coordinator: &Coordinator) {
+    let kinds: Vec<&str> = read_coordinator_log(&**coordinator.store().logs())
+        .await
+        .expect("coordinator log decodes")
+        .into_iter()
+        .filter_map(|record| match record.body {
+            CoordinatorEvent::ScopeReleased { .. } => Some("scope.released"),
+            CoordinatorEvent::RunFinished { .. } => Some("run.finished"),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(kinds, ["scope.released", "run.finished"]);
+}
+
+/// A crash after the root's result is stored but before its lease was
+/// released: the resumed run releases it at the run's end, and records the
+/// release before `run.finished`, which stays the last record.
+#[tokio::test]
+async fn a_crash_before_the_roots_release_still_records_it_before_the_runs_end() {
+    let directory = RunDir::new("coordinator-release-on-resume");
+    let runtime = Runtime::standard().options(RunOptions::new(directory.path()));
+    let mut coordinator = Coordinator::create(
+        runtime.prepare_run(directory.path()),
+        Vec::new(),
+        CoordinatorOptions::default(),
+    )
+    .await
+    .expect("the coordinator starts");
+    let mut builder = GraphBuilder::bare();
+    let scope = builder.add_scope(Scope::new(ScopeId::new(0)));
+    builder.add_step("only", scope, "noop");
+    let digest = coordinator
+        .register_graph(&builder.build())
+        .await
+        .expect("graph registers");
+    coordinator
+        .run_root(digest, BTreeMap::new())
+        .await
+        .expect("the first run completes");
+    drop(coordinator);
+
+    // The crash: the coordinator log ends at the root's result, and the
+    // resource log at the lease's sandbox going live.
+    let decoded = read_coordinator_log(&*testkit::read_run_dir(directory.path()).await)
+        .await
+        .expect("coordinator log decodes");
+    let mut prefix = Vec::new();
+    for record in decoded {
+        let root_finished = matches!(
+            record.body,
+            CoordinatorEvent::InvocationFinished { invocation, .. } if invocation == InvocationId::ROOT
+        );
+        serde_json::to_writer(&mut prefix, &record).expect("record encodes");
+        prefix.push(b'\n');
+        if root_finished {
+            break;
+        }
+    }
+    fs::write(directory.path().join("coordinator.jsonl"), prefix).expect("coordinator prefix");
+    let resources = fs::read_to_string(directory.path().join("resources.jsonl"))
+        .expect("the resource log reads");
+    let mut kept = String::new();
+    for line in resources.lines() {
+        kept.push_str(line);
+        kept.push('\n');
+        let record: serde_json::Value = serde_json::from_str(line).expect("a record parses");
+        if record["body"]["state"] == "live" {
+            break;
+        }
+    }
+    fs::write(directory.path().join("resources.jsonl"), kept).expect("resource prefix");
+
+    let runtime = Runtime::standard().options(RunOptions::new(directory.path()));
+    let mut coordinator = Coordinator::resume(
+        runtime.prepare_run(directory.path()),
+        Vec::new(),
+        CoordinatorOptions::default(),
+    )
+    .await
+    .expect("the coordinator resumes");
+    coordinator
+        .run_root(digest, BTreeMap::new())
+        .await
+        .expect("the finished root replays");
+    assert_release_before_end(&coordinator).await;
     coordinator.finish().await;
 }
 

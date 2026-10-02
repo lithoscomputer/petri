@@ -197,6 +197,7 @@ async fn run(
         attempt,
         max_attempts: NonZeroU32::new(3).expect("non-zero"),
         scope: ScopeId::new(0),
+        environment: SmolStr::new("scope-0"),
         node: SmolStr::new("manager"),
         config: config.clone(),
         env: Arc::new(NoEnv),

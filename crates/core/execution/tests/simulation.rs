@@ -4,14 +4,21 @@
 //! sandboxed steps, invoke steps that call child graphs (one call or a fork,
 //! in the caller's sandbox or their own, some through a fork gate), and
 //! restart arms. Some root graphs turn on the circuit breaker, and some set
-//! a low invocation limit. It plans the host's cancels (the root, a second
-//! root cancel that kills, a child invocation) and up to three crashes, at a
-//! virtual time or right after a chosen coordinator record, then runs the
-//! real coordinator through the host wrappers on a single-threaded runtime
-//! whose clock starts paused. A crash drops the host future: the
+//! a low invocation limit. The run keeps its sandboxes as the seed's
+//! retention says, and refuses or replaces a sandbox lost from outside. It
+//! plans the host's cancels (the root, a second root cancel that kills, a
+//! child invocation) and up to three crashes: at a virtual time, right
+//! after a chosen coordinator record or resource record, or at a provider
+//! call, before its effect or after it. Then it runs the real coordinator
+//! through the host wrappers on a single-threaded runtime whose clock
+//! starts paused, with the runtime's own lease router in front of the
+//! world's sandbox provider. A crash drops the host future: the
 //! coordinator, its drivers and their tasks end, their processes run on in
-//! the world, and the dead lifetime's executor does nothing more. The next
-//! lifetime resumes over the same in-memory store. The oracles:
+//! the world's sandboxes, and the dead lifetime's provider does nothing
+//! more. Between lifetimes, someone may delete some of the world's
+//! sandboxes. The next lifetime resumes over the same in-memory store, and
+//! its router reconciles, fences and releases what the last one left. The
+//! oracles:
 //!
 //! - the run ends, well within a bound, with a result, not an error;
 //! - the coordinator log replays, and `run.finished` appears once, with the
@@ -28,9 +35,15 @@
 //!   cancelled twice or killed before it was cancelled;
 //! - the result a caller received is the child's recorded result;
 //! - every block comes from the breaker or the execution limit;
-//! - the world's rules hold: every sandbox is released once, fenced, or left to
-//!   crash recovery, no process outlives the run, and no attempt runs twice in
-//!   a lifetime, again after it finished, or while it was stopping;
+//! - the leases: no create, stop or delete reaches the provider before its
+//!   intent is recorded, and no process starts in a sandbox its lease does not
+//!   record live; every lease ends settled, its sandbox as its record says,
+//!   kept only as the run's retention keeps it, and released once with a
+//!   `scope.released` before `run.finished`; no sandbox outlives the run unless
+//!   its lease keeps it or its last release failed;
+//! - the world's rules hold: no process outlives the run, none runs beside an
+//!   unfenced one a dead lifetime left, and no attempt runs twice in a
+//!   lifetime, again after it finished, or while it was stopping;
 //! - observers see each lifetime's coordinator records in order, without gaps.
 //!
 //! `PETRI_DST_SEEDS` sets how many seeds run (64 by default);
@@ -53,9 +66,11 @@ use engine::{Admission, EngineExit, EngineState, Event, EventLog, EventRecord, R
 use execution::host::{self, HostError, HostRun};
 use execution::{
     CoordinatorEvent, CoordinatorHandle, CoordinatorRecord, CoordinatorState, ExecutionId,
-    ExecutionObserver, GraphDigest, InvocationId, RunStore as _, read_coordinator_log,
-    read_execution_log,
+    ExecutionObserver, GraphDigest, InvocationId, LeaseState, LogId, ResourceLogRecord,
+    RunStore as _, SandboxResourceRecord, read_coordinator_log, read_execution_log,
 };
+use executor::Retention;
+use executor_sandbox::LostSandbox;
 use ir::{
     Arm, Backoff, Budget, CancelScopeId, EdgeTransition, Graph, GraphBuilder, JoinPolicy, NodeId,
     RetryPolicy, RunStatus, ScopeId, StepRef, validate,
@@ -63,8 +78,8 @@ use ir::{
 use serde_json::{Value, json};
 use smol_str::SmolStr;
 use store::Access;
-use support::{Call, INVOKE, SimHost, digest_of, received, run_key, run_paused};
-use testkit::sim::{Dice, Faults, SANDBOXED};
+use support::{Call, INVOKE, Leases, SimHost, digest_of, received, run_key, run_paused};
+use testkit::sim::{self, CallCrash, Dice, Faults, Moment, SANDBOXED, SandboxState, WorldSandbox};
 use tokio::sync::Notify;
 use tokio::task::JoinHandle;
 use tokio::time::{self, Instant};
@@ -76,6 +91,7 @@ const FAULTS: Faults = Faults {
     acquire_failure: 3,
     acquire_ms:      10,
     release_ms:      10,
+    release_failure: 3,
 };
 
 /// Print a seed's story to stderr when `PETRI_DST_TRACE` is set.
@@ -327,13 +343,33 @@ fn stops(dice: &mut Dice) -> Stops {
 
 /// The coordinator record kinds a crash can follow. `root.finished` is the
 /// root's `invocation.finished`, before `run.finished`.
-const RECORD_KINDS: [&str; 6] = [
+const RECORD_KINDS: [&str; 7] = [
     "invocation.declared",
     "execution.declared",
     "execution.finished",
     "invocation.finished",
     "invocation.cancel.requested",
     "root.finished",
+    "scope.released",
+];
+
+/// The resource record kinds a crash can follow: a lease's allocation, the
+/// sandbox live, each intent, and each end.
+const RESOURCE_KINDS: [&str; 6] = [
+    "allocating",
+    "live",
+    "pending stop",
+    "stopped",
+    "pending delete",
+    "deleted",
+];
+
+/// The provider calls a crash can land on.
+const CALLS: [sim::Call; 4] = [
+    sim::Call::Create,
+    sim::Call::Stop,
+    sim::Call::Start,
+    sim::Call::Delete,
 ];
 
 /// What ends one coordinator lifetime early.
@@ -341,25 +377,64 @@ const RECORD_KINDS: [&str; 6] = [
 enum Crash {
     /// At this virtual time.
     At(Duration),
-    /// Right after the `nth` record of this kind the lifetime appends.
+    /// Right after the `nth` coordinator record of this kind the lifetime
+    /// appends.
     After { kind: &'static str, nth: usize },
+    /// At a provider call, before its effect or after it.
+    Call(CallCrash),
+    /// Right after the `nth` resource record of this kind the lifetime
+    /// appends.
+    Resource { kind: &'static str, nth: usize },
+}
+
+fn pick<T: Copy>(dice: &mut Dice, choices: &[T]) -> T {
+    choices[usize::try_from(dice.roll(choices.len() as u64)).expect("an index")]
 }
 
 fn crashes(dice: &mut Dice) -> Vec<Crash> {
     let count = [0, 0, 1, 1, 2, 3][usize::try_from(dice.roll(6)).expect("below 6")];
     (0..count)
         .map(|_| {
-            if dice.chance(50) {
-                Crash::At(Duration::from_millis(dice.roll(200)))
-            } else {
-                let kind = RECORD_KINDS[usize::try_from(dice.roll(6)).expect("below 6")];
-                Crash::After {
-                    kind,
-                    nth: usize::try_from(dice.roll(3)).expect("small"),
-                }
+            let nth = usize::try_from(dice.roll(3)).expect("small");
+            match dice.roll(10) {
+                0..=2 => Crash::At(Duration::from_millis(dice.roll(200))),
+                3..=5 => Crash::After {
+                    kind: pick(dice, &RECORD_KINDS),
+                    nth,
+                },
+                6 | 7 => Crash::Call(CallCrash {
+                    call:   pick(dice, &CALLS),
+                    nth:    nth + 1,
+                    moment: if dice.chance(50) {
+                        Moment::Before
+                    } else {
+                        Moment::After
+                    },
+                }),
+                _ => Crash::Resource {
+                    kind: pick(dice, &RESOURCE_KINDS),
+                    nth,
+                },
             }
         })
         .collect()
+}
+
+/// How the seed's run keeps its sandboxes, and how often someone outside
+/// the run deletes one between two lifetimes.
+fn leases(dice: &mut Dice) -> (Leases, u64) {
+    let retention = pick(dice, &[
+        Retention::Never,
+        Retention::OnFailure,
+        Retention::Always,
+    ]);
+    let lost = if dice.chance(50) {
+        LostSandbox::Replace
+    } else {
+        LostSandbox::Refuse
+    };
+    let lose = if dice.chance(35) { 60 } else { 0 };
+    (Leases { retention, lost }, lose)
 }
 
 /// The kind a crash trigger names a record by.
@@ -625,17 +700,19 @@ fn simulate_world(seed: u64) -> Outcome {
     let workload = workload(&mut dice);
     let stops = stops(&mut dice);
     let crashes = crashes(&mut dice);
+    let (leases, lose) = leases(&mut dice);
     trace(|| {
         format!(
             "seed {seed}: {} graphs, breaker {:?}, limit {:?}, stops {stops:?}, crashes \
-             {crashes:?}",
+             {crashes:?}, leases {leases:?}, lose {lose}%",
             workload.graphs.len(),
             workload.breaker,
             workload.max_calls
         )
     });
     run_paused(async move {
-        let sim = SimHost::new("execution-simulation", seed, FAULTS);
+        let mut sim = SimHost::new("execution-simulation", seed, FAULTS);
+        sim.leases = leases;
         let epoch = sim.epoch;
         let current = Arc::new(Mutex::new(None));
         let host = host(stops, Arc::clone(&current), epoch);
@@ -661,6 +738,16 @@ fn simulate_world(seed: u64) -> Outcome {
                 gates: Mutex::new(Gates::default()),
                 shared: Arc::clone(&shared),
             });
+            if let Some(Crash::Call(at)) = crash {
+                sim.world.crash_at(at, Arc::clone(&notify));
+            }
+            sim.watched.arm(
+                match crash {
+                    Some(Crash::Resource { kind, nth }) => Some((kind, nth)),
+                    _ => None,
+                },
+                Arc::clone(&notify),
+            );
             let runtime = sim.runtime();
             let hand = {
                 let current = Arc::clone(&current);
@@ -693,7 +780,9 @@ fn simulate_world(seed: u64) -> Outcome {
             let crash_now = async {
                 match crash {
                     Some(Crash::At(at)) => time::sleep_until(epoch + at).await,
-                    Some(Crash::After { .. }) => notify.notified().await,
+                    Some(Crash::After { .. } | Crash::Call(_) | Crash::Resource { .. }) => {
+                        notify.notified().await;
+                    }
                     None => future::pending().await,
                 }
             };
@@ -711,8 +800,13 @@ fn simulate_world(seed: u64) -> Outcome {
             // The crash: the lifetime is dead before its drivers drop, so no
             // release of theirs reaches the world.
             *stats.entry("crashes").or_default() += 1;
-            if let Some(Crash::After { kind, .. }) = crash {
-                *stats.entry(kind).or_default() += 1;
+            match crash {
+                Some(Crash::After { kind, .. }) => *stats.entry(kind).or_default() += 1,
+                Some(Crash::Call(_)) => *stats.entry("crashes at provider calls").or_default() += 1,
+                Some(Crash::Resource { .. }) => {
+                    *stats.entry("crashes after resource records").or_default() += 1;
+                }
+                _ => {}
             }
             let (finished, stopping, root_done) =
                 stored_progress(&sim, &workload).await.unwrap_or_default();
@@ -722,6 +816,10 @@ fn simulate_world(seed: u64) -> Outcome {
             sim.world.begin_lifetime(finished, stopping);
             *current.lock().unwrap_or_else(PoisonError::into_inner) = None;
             drop(run);
+            if lose > 0 {
+                *stats.entry("lost sandboxes").or_default() +=
+                    sim.world.lose_sandboxes(lose) as u64;
+            }
             trace(|| format!("crash at {:?} ({crash:?})", epoch.elapsed()));
             lifetime += 1;
         };
@@ -1121,55 +1219,198 @@ async fn check(
 
     // Observers: each lifetime's records in order, without gaps, from where
     // the stored log stood.
-    let seen = seen.lock().unwrap_or_else(PoisonError::into_inner);
-    for (lifetime, start) in stored_at_start {
-        let seqs: Vec<u64> = seen
-            .iter()
-            .filter(|(at, ..)| at == lifetime)
-            .map(|(_, seq, _)| *seq)
-            .collect();
-        let expected: Vec<u64> = (*start..*start + seqs.len() as u64).collect();
-        if seqs != expected && !(*lifetime == 0 && seqs.first() == Some(&0)) {
-            violations.push(format!(
-                "lifetime {lifetime} observed {seqs:?}, from {start} in the store"
-            ));
+    {
+        let seen = seen.lock().unwrap_or_else(PoisonError::into_inner);
+        for (lifetime, start) in stored_at_start {
+            let seqs: Vec<u64> = seen
+                .iter()
+                .filter(|(at, ..)| at == lifetime)
+                .map(|(_, seq, _)| *seq)
+                .collect();
+            let expected: Vec<u64> = (*start..*start + seqs.len() as u64).collect();
+            if seqs != expected && !(*lifetime == 0 && seqs.first() == Some(&0)) {
+                violations.push(format!(
+                    "lifetime {lifetime} observed {seqs:?}, from {start} in the store"
+                ));
+            }
         }
     }
 
-    // The world: every sandbox released once, fenced, or crash recovery's;
-    // no process outlives the run.
-    let last = sim.world.lifetime();
-    let acquisitions = sim.world.acquisitions();
-    for acquired in &acquisitions {
-        if acquired.failed || acquired.abandoned || acquired.releases > 0 {
-            continue;
-        }
-        if acquired.lifetime < last {
-            if !acquired.fenced {
-                *stats.entry("sandboxes left to crash recovery").or_default() += 1;
-            }
-            continue;
-        }
-        violations.push(format!(
-            "{} generation {} (lifetime {}) was never released",
-            acquired.key, acquired.generation, acquired.lifetime
+    // The leases: each ends settled, with its sandbox as its record says,
+    // kept only as the run's retention keeps it, and released with a
+    // `scope.released` before the run's end. A release that failed at the
+    // run's end is the one exception: its intent stays, and its sandbox with
+    // it.
+    let mut latest: BTreeMap<u64, SandboxResourceRecord> = BTreeMap::new();
+    let mut story = Vec::new();
+    for line in logs
+        .read(&LogId::Resources)
+        .await
+        .expect("the resource log reads")
+    {
+        let line: ResourceLogRecord = line.decode().expect("a resource record decodes");
+        story.push(format!(
+            "    {} lease {} {}",
+            line.seq,
+            line.body.lease.raw(),
+            support::resource_kind(&line.body)
         ));
+        latest.insert(line.body.lease.raw(), line.body);
     }
-    *stats.entry("acquisitions").or_default() += acquisitions.len() as u64;
+    let sandboxes = sim.world.sandboxes();
+    let calls = sim.world.calls();
+    trace(|| {
+        let calls: Vec<String> = calls.iter().map(|call| format!("    {call:?}")).collect();
+        format!(
+            "resource log:\n{}\nprovider calls:\n{}",
+            story.join("\n"),
+            calls.join("\n")
+        )
+    });
+    let last_call_failed = |sandbox: &WorldSandbox| {
+        calls
+            .iter()
+            .rev()
+            .find(|call| call.sandbox == sandbox.id)
+            .is_some_and(|call| call.failed)
+    };
+    let released: BTreeSet<u64> = records
+        .iter()
+        .filter_map(|record| match &record.body {
+            CoordinatorEvent::ScopeReleased { lease, .. } => Some(lease.raw()),
+            _ => None,
+        })
+        .collect();
+    // A release that reported a problem is retried and recorded again; one
+    // that went through ends the lease, so a second clean one released it
+    // twice.
+    let mut clean: BTreeMap<u64, usize> = BTreeMap::new();
+    for record in &records {
+        if let CoordinatorEvent::ScopeReleased {
+            lease, problems, ..
+        } = &record.body
+            && problems.is_empty()
+        {
+            *clean.entry(lease.raw()).or_default() += 1;
+        }
+    }
+    for (lease, count) in clean {
+        if count > 1 {
+            violations.push(format!("lease {lease} was released cleanly {count} times"));
+        }
+    }
+    for (lease, record) in &latest {
+        let sandbox = record.resource_id.as_deref().and_then(|id| {
+            sandboxes
+                .iter()
+                .rev()
+                .find(|sandbox| sandbox.id == id && sandbox.lease() == Some(&lease.to_string()))
+        });
+        let reserved = record.state == LeaseState::Allocating && record.fingerprint.is_none();
+        if let Some(intent) = record.pending {
+            if sandbox.is_some_and(last_call_failed) {
+                *stats.entry("releases left failed").or_default() += 1;
+            } else {
+                violations.push(format!("lease {lease} ended with a pending {intent:?}"));
+            }
+        } else {
+            match record.state {
+                LeaseState::Deleted => {
+                    if let Some(sandbox) = sandbox.filter(|s| s.state != SandboxState::Deleted) {
+                        violations.push(format!(
+                            "lease {lease} is deleted, but its sandbox {} is {:?}",
+                            sandbox.id, sandbox.state
+                        ));
+                    }
+                }
+                LeaseState::Stopped => {
+                    // Someone outside the run may delete a kept sandbox: the
+                    // run cannot know.
+                    if sandbox.is_none_or(|sandbox| {
+                        sandbox.state != SandboxState::Stopped && !sandbox.lost
+                    }) {
+                        violations.push(format!(
+                            "lease {lease} is kept, but its sandbox is {:?}",
+                            sandbox.map(|sandbox| sandbox.state)
+                        ));
+                    }
+                    let status = state
+                        .invocations
+                        .get(&record.allocation.invocation)
+                        .and_then(|invocation| invocation.result.as_ref())
+                        .map(|result| result.status);
+                    let keeps = match sim.leases.retention {
+                        Retention::Always => true,
+                        Retention::OnFailure => status != Some(RunStatus::Success),
+                        Retention::Never => false,
+                    };
+                    if keeps {
+                        *stats.entry("kept sandboxes").or_default() += 1;
+                    } else {
+                        violations.push(format!(
+                            "lease {lease} kept its sandbox under {:?} after {status:?}",
+                            sim.leases.retention
+                        ));
+                    }
+                }
+                _ if reserved => {}
+                other => violations.push(format!("lease {lease} ended {other:?}")),
+            }
+        }
+        if !reserved && !released.contains(lease) {
+            violations.push(format!(
+                "lease {lease} ended {:?} with no scope.released",
+                record.state
+            ));
+        }
+    }
+    *stats.entry("scope releases").or_default() += released.len() as u64;
+    // No sandbox of the run outlives it, unless its lease keeps it or its
+    // last release failed.
+    for sandbox in &sandboxes {
+        if sandbox.state == SandboxState::Deleted {
+            continue;
+        }
+        let kept = sandbox
+            .lease()
+            .and_then(|lease| latest.get(&lease.parse().ok()?))
+            .is_some_and(|record| {
+                record.state == LeaseState::Stopped
+                    && record.resource_id.as_deref() == Some(sandbox.id.as_str())
+                    && sandbox.state == SandboxState::Stopped
+            });
+        if !kept && !last_call_failed(sandbox) {
+            violations.push(format!(
+                "sandbox {} ({:?}, created in lifetime {}) outlived the run",
+                sandbox.id, sandbox.state, sandbox.lifetime
+            ));
+        }
+    }
+    *stats.entry("sandboxes created").or_default() += sandboxes.len() as u64;
+    for call in &calls {
+        let key = match call.call {
+            _ if call.failed => "failed provider calls",
+            sim::Call::Start => "adopted or fenced sandboxes",
+            sim::Call::Delete if call.unrecorded => "swept sandboxes",
+            sim::Call::Delete => "deleted sandboxes",
+            sim::Call::Stop => "stopped sandboxes",
+            sim::Call::Create => continue,
+        };
+        *stats.entry(key).or_default() += 1;
+    }
     *stats.entry("fenced processes").or_default() += sim.world.fenced() as u64;
     let now = Instant::now();
     for process in sim.world.processes() {
         if !process.running(now) {
             continue;
         }
-        let recovery = acquisitions.iter().any(|a| {
-            a.key == process.key
-                && a.generation == process.generation
-                && a.lifetime < last
-                && !a.fenced
-                && a.releases == 0
+        let excused = sandboxes.iter().any(|sandbox| {
+            sandbox.id == process.key
+                && sandbox.incarnation == process.generation
+                && sandbox.state == SandboxState::Running
+                && last_call_failed(sandbox)
         });
-        if !recovery {
+        if !excused {
             violations.push(format!(
                 "firing {} attempt {} of {} (lifetime {}) outlived the run",
                 process.firing, process.attempt, process.execution, process.lifetime
@@ -1249,6 +1490,16 @@ fn seeded_runs_keep_the_execution_rules() {
             "limited runs",
             "limit refusals",
             "fenced processes",
+            "sandboxes created",
+            "scope releases",
+            "kept sandboxes",
+            "deleted sandboxes",
+            "stopped sandboxes",
+            "adopted or fenced sandboxes",
+            "lost sandboxes",
+            "failed provider calls",
+            "crashes at provider calls",
+            "crashes after resource records",
         ] {
             assert!(
                 totals.get(key).copied().unwrap_or_default() > 0,
