@@ -170,9 +170,9 @@ final attempt of the latest generation to complete.
 show up here and nowhere else: a non-final attempt has `final: false`, and
 its `context_updates` never reached `kv`.
 
-`routes` entries have `seq`, `firing`, `node`, `kind` (`edge`, `jump`,
-`none`), `group`, `edge`, and `target` (the node the route led to). Together
-with `history` they show routing across repeated visits to one node.
+`routes` entries have `seq`, `firing`, `node`, `kind` (`edge` or `none`),
+`group`, `edge`, and `target` (the node the route led to). Together with
+`history` they show routing across repeated visits to one node.
 
 `deliveries` entries have `seq`, `firing`, `node`, `kind` (`deliver`,
 `cancel`, `kill`, `other`), and `payload` (the delivered value, for `deliver`).

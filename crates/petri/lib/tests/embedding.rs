@@ -26,7 +26,7 @@ use petri::driver::lifecycle::{
     Transition, TransitionError, TransitionReport,
 };
 use petri::driver::{BranchRole, FiringView};
-use petri::engine::{Admission, DecisionId, Event, Intervention, RouteApplied, RouteDecision};
+use petri::engine::{Admission, DecisionId, Event, Intervention, RouteDecision};
 use petri::execution::events::{
     CollectingSink, Derived, EventId, EventProjector, EventSource, Parsed, ProjectionReceipt,
     ProjectorOptions, RunEvent, RunEventSink, SinkError, ViewEvent, WaitState, replay_run_dir,
@@ -798,12 +798,9 @@ impl Timeline {
                         .push((attempt, outcome.status.tag().to_owned()));
                     entry.duration_ms += outcome.metrics.duration_ms.unwrap_or(0);
                 }
-                (Some(Event::RouteApplied { applied }), derived) => {
-                    entry.routes.push(match (applied, derived) {
-                        (RouteApplied::Jump { .. }, Some(Derived::RouteApplied { target, .. })) => {
-                            format!("jump:{}", target.name)
-                        }
-                        (_, Some(Derived::RouteApplied { target, .. })) => target.name.to_string(),
+                (Some(Event::RouteApplied { .. }), derived) => {
+                    entry.routes.push(match derived {
+                        Some(Derived::RouteApplied { target, .. }) => target.name.to_string(),
                         _ => "none".to_owned(),
                     });
                 }

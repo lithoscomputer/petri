@@ -241,7 +241,7 @@ Petri's `partially_succeed` — and the specific one wins:
 
 `goal_gate=true` nodes lower to a `goal_check` noop in front of `exit`: for each
 gate (in id order) an arm guarded by `!default(nodes.<gate>.success_like, false)`
-jumps back to the first existing retry target of the node's `retry_target`, its
+routes back to the first existing retry target of the node's `retry_target`, its
 `fallback_retry_target`, the graph's, the graph's fallback; a gate with no target
 ends the run failed; the last arm reaches `exit` when every gate passed.
 

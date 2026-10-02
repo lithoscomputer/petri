@@ -233,7 +233,7 @@ for external item resolution but is never emitted today.
 sees them; `EdgeId::SEED` is rejected in routing groups). Join counting is
 uniform: `All` over one seed edge = one seed token. The one exception is a
 `for_each` clone's entry: the template's join already admitted the expansion,
-so the clone's seed forces entry for its generation, as a restart or a jump
+so the clone's seed forces entry for its generation, as a restart's entry
 does, and the join is not applied twice. Without that, a `Quorum { n >= 2 }`
 on the `for_each` node would admit the template and then start no clone.
 

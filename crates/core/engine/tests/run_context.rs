@@ -11,8 +11,9 @@ use serde_json::json;
 use support::{Harness, NOOP};
 
 /// Handoff §7 test 3. An Attractor-style goal gate: the exit is blocked, the
-/// run jumps to a repair target, the gate is satisfied on the second pass, and
-/// the exit is taken. Entirely via guards on `nodes.*` — no engine feature.
+/// run routes back to a repair target, the gate is satisfied on the second
+/// pass, and the exit is taken. Entirely via guards on `nodes.*` — no engine
+/// feature.
 #[test]
 fn a_goal_gate_routes_on_the_run_context() {
     let mut b = GraphBuilder::new();

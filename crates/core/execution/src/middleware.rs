@@ -509,10 +509,6 @@ fn intervention(key: MiddlewareKey, decision: &RouteDecision) -> Intervention {
             middleware: key,
             edge:       *edge,
         },
-        RouteDecision::Jump(target) => Intervention::Jump {
-            middleware: key,
-            target:     *target,
-        },
         RouteDecision::Block { reason } => Intervention::Block {
             middleware: key,
             reason:     reason.clone(),

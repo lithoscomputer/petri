@@ -949,7 +949,6 @@ fn group_target(state: &EngineState, group: &GroupDecision) -> GroupTarget {
             .edge(*edge)
             .and_then(|edge| state.graph().node(edge.to))
             .map(node_ref),
-        RouteDecision::Jump(node) => state.graph().node(*node).map(node_ref),
         RouteDecision::None | RouteDecision::Block { .. } => None,
     };
     GroupTarget {
@@ -958,9 +957,9 @@ fn group_target(state: &EngineState, group: &GroupDecision) -> GroupTarget {
     }
 }
 
-/// What an applied route derives: the node it leads to, and for an edge the
-/// edge's transition and `back`. Nothing for a route that applied nothing
-/// or one whose target the graph no longer names.
+/// What an applied route derives: the node its edge leads to, the edge's
+/// transition and `back`. Nothing for a route that applied nothing or one
+/// whose target the graph no longer names.
 fn applied_target(state: &EngineState, applied: &RouteApplied) -> Option<Derived> {
     match applied {
         RouteApplied::Edge { edge, .. } => {
@@ -968,15 +967,10 @@ fn applied_target(state: &EngineState, applied: &RouteApplied) -> Option<Derived
             let target = state.graph().node(arm.to).map(node_ref)?;
             Some(Derived::RouteApplied {
                 target,
-                transition: Some(arm.transition),
-                back: Some(arm.back),
+                transition: arm.transition,
+                back: arm.back,
             })
         }
-        RouteApplied::Jump { target, .. } => Some(Derived::RouteApplied {
-            target:     state.graph().node(*target).map(node_ref)?,
-            transition: None,
-            back:       None,
-        }),
         RouteApplied::None { .. } => None,
     }
 }

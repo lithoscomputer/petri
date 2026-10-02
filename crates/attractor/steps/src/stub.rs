@@ -55,10 +55,10 @@ pub struct Simulate {
     #[serde(default)]
     pub context_updates:    BTreeMap<SmolStr, Value>,
     /// Scripted per call: the n-th time this node's stub runs in a run — an
-    /// attempt after a retry, a second visit after a goal-gate jump or a
-    /// `loop_restart` — takes the n-th entry, and the last entry repeats.
-    /// Fabro's engine calls a handler once per attempt in the same order, so
-    /// the oracle generator scripts its handlers the same way.
+    /// attempt after a retry, a second visit after a goal gate sent the run
+    /// back, or a `loop_restart` — takes the n-th entry, and the last entry
+    /// repeats. Fabro's engine calls a handler once per attempt in the same
+    /// order, so the oracle generator scripts its handlers the same way.
     #[serde(default)]
     pub calls:              Vec<Self>,
 }

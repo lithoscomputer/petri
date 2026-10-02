@@ -140,7 +140,7 @@ deterministic run needs a scripted stand-in for the GitHub API and an
 offline-installable Node target. The owner judged that overkill. The repair
 loop's behavior that does not depend on GitHub is covered elsewhere: a real
 deterministic check driving a repair loop until it passes, with the visit
-totals surviving the jump, is `routing/goal-gate-restart-and-visit-limit`;
+totals surviving the return to the retry target, is `routing/goal-gate-restart-and-visit-limit`;
 a provider failure, an exhausted retry budget, a hanging request and a
 cancellation are the `provider-faults` family; a failing stage's policy is
 `routing/failure-policy`. What stays uncovered is the bundle's own GitHub

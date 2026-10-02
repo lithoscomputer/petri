@@ -290,7 +290,7 @@ fn expansion_regions_may_only_be_entered_at_the_entry() {
     b.link(entry, middle);
     b.link(middle, exit);
     b.link(exit, after);
-    // `outside` jumps straight into the middle of the region.
+    // `outside` enters the region in the middle.
     b.link(outside, middle);
     let items = b.exprs().lit(json!([1]));
     b.set_expansion(entry, Expansion::ForEach {

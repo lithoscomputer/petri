@@ -72,10 +72,6 @@ pub(crate) enum PreparedRoute {
         payload:    Value,
         transition: EdgeTransition,
     },
-    Jump {
-        target:     NodeId,
-        generation: Generation,
-    },
     None {
         group: u32,
     },

@@ -400,15 +400,13 @@ pub enum Derived {
     },
     /// `routing.resolved`: the node each group's decision resolved to.
     RoutingResolved { groups: Vec<GroupTarget> },
-    /// `route.applied`: the node the route leads to, and for an edge its
-    /// transition and whether it is a `back` edge. Absent for a route that
-    /// applied nothing.
+    /// `route.applied`: the node the edge leads to, the edge's transition
+    /// and whether it is a `back` edge. Absent for a route that applied
+    /// nothing.
     RouteApplied {
         target:     NodeRef,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        transition: Option<EdgeTransition>,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        back:       Option<bool>,
+        transition: EdgeTransition,
+        back:       bool,
     },
     /// `node.expanded`: each clone's entry node.
     NodeExpanded { clones: Vec<CloneRef> },
@@ -431,8 +429,8 @@ pub enum Derived {
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct GroupTarget {
     pub group:  u32,
-    /// The node an `emit` or `jump` decision leads to. Absent for `none`
-    /// and `block`.
+    /// The node an `emit` decision leads to. Absent for `none` and
+    /// `block`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub target: Option<NodeRef>,
 }

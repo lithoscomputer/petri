@@ -447,7 +447,7 @@ pub struct Transition {
     pub view:     Arc<FiringView>,
     pub outcome:  Outcome,
     /// One decision per routing group, in declared order. `Emit` names the
-    /// edge; `None` is a no-route completion; `Jump` replaces the groups.
+    /// edge; `None` is a no-route completion.
     pub groups:   Vec<GroupDecision>,
 }
 
