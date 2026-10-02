@@ -89,6 +89,7 @@ impl Ctx<'_> {
                         config["checkout"] = json!({
                             "enabled": self.settings.clone.enabled,
                             "depth": self.settings.clone.depth,
+                            "sparse": self.settings.clone.sparse,
                             "repository": self.repository,
                         });
                     }

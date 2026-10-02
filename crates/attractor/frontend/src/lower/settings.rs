@@ -57,12 +57,14 @@ pub struct RunSettings {
     pub mcps:               Vec<McpServer>,
 }
 
-/// `[run.clone]`, with Fabro's defaults: enabled, 100 commits of history.
-/// `depth = 0` is the full history.
+/// `[run.clone]`, with Fabro's defaults: enabled, 100 commits of history,
+/// a full checkout. `depth = 0` is the full history; a non-empty `sparse`
+/// checks out only those directories (Git's cone mode) and the root's files.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CloneSettings {
     pub enabled: bool,
     pub depth:   i64,
+    pub sparse:  Vec<String>,
 }
 
 impl Default for CloneSettings {
@@ -70,6 +72,7 @@ impl Default for CloneSettings {
         Self {
             enabled: true,
             depth:   100,
+            sparse:  Vec::new(),
         }
     }
 }

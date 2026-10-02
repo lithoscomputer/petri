@@ -786,12 +786,12 @@ fn run_clone_lands_on_the_launch_param_with_the_bound_repository() {
     let graph = lowered.graph.expect("lowers");
     assert_eq!(
         graph.params["fabro.launch"]["clone"],
-        json!({ "enabled": true, "depth": 100, "repository": null }),
+        json!({ "enabled": true, "depth": 100, "sparse": [], "repository": null }),
         "Fabro's defaults, no repository when the host bound none"
     );
     assert_eq!(
         node(&graph, "start").step.config["checkout"],
-        json!({ "enabled": true, "depth": 100, "repository": null }),
+        json!({ "enabled": true, "depth": 100, "sparse": [], "repository": null }),
         "the start stage carries the same clone settings as its checkout"
     );
 
@@ -800,7 +800,7 @@ fn run_clone_lands_on_the_launch_param_with_the_bound_repository() {
         &dot("c [shape=parallelogram, script=\"true\"]\nstart -> c -> exit"),
         &files(&[(
             "wf/workflow.toml",
-            "_version = 1\n[run.clone]\nenabled = false\ndepth = 0\n",
+            "_version = 1\n[run.clone]\nenabled = false\ndepth = 0\nsparse = [\"svc/foo\", \"libs/bar\"]\n",
         )]),
         &CompileInputs::new().with_var(frontend::REPOSITORY_VAR, "/srv/repo"),
     );
@@ -819,7 +819,17 @@ fn run_clone_lands_on_the_launch_param_with_the_bound_repository() {
     let graph = lowered.graph.expect("lowers");
     assert_eq!(
         graph.params["fabro.launch"]["clone"],
-        json!({ "enabled": false, "depth": 0, "repository": "/srv/repo" })
+        json!({
+            "enabled": false,
+            "depth": 0,
+            "sparse": ["svc/foo", "libs/bar"],
+            "repository": "/srv/repo",
+        })
+    );
+    assert_eq!(
+        node(&graph, "start").step.config["checkout"]["sparse"],
+        json!(["svc/foo", "libs/bar"]),
+        "the start stage's checkout carries the cone"
     );
 
     let lowered = load(
@@ -839,6 +849,29 @@ fn run_clone_lands_on_the_launch_param_with_the_bound_repository() {
         "a key Fabro's clone table refuses is refused: {:?}",
         lowered.diagnostics
     );
+
+    for sparse in ["\"svc\"", "[\"svc\", 1]"] {
+        let lowered = load(
+            "wf/workflow.fabro",
+            &dot("c [shape=parallelogram, script=\"true\"]\nstart -> c -> exit"),
+            &files(&[(
+                "wf/workflow.toml",
+                &format!("_version = 1\n[run.clone]\nsparse = {sparse}\n"),
+            )]),
+            &CompileInputs::new(),
+        );
+        let refusal = lowered
+            .diagnostics
+            .iter()
+            .find(|d| d.code.as_str() == "unsupported.workflow_toml.key")
+            .unwrap_or_else(|| panic!("`sparse = {sparse}` is refused: {:?}", lowered.diagnostics));
+        assert!(
+            refusal.message.contains("`run.clone.sparse`")
+                && refusal.message.contains("wrong type"),
+            "{}",
+            refusal.message
+        );
+    }
 }
 
 /// `[run.model]` from the settings and project layers fills what

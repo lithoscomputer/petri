@@ -109,6 +109,7 @@ impl Settings {
             "clone": {
                 "enabled": self.run.clone.enabled,
                 "depth": self.run.clone.depth,
+                "sparse": self.run.clone.sparse,
                 "repository": repository,
             },
             "sandbox_backend": environment.map(Environment::sandbox_backend),
@@ -685,8 +686,9 @@ impl Reader<'_> {
         }
     }
 
-    /// `[run.clone]`: `enabled` and `depth`, as Fabro's `RunCloneLayer`
-    /// reads them. A negative depth is Fabro's full history (0).
+    /// `[run.clone]`: `enabled`, `depth` and `sparse`, as Fabro's
+    /// `RunCloneLayer` reads them. A negative depth is Fabro's full history
+    /// (0). The checkout validates the `sparse` directories themselves.
     fn clone_section(&mut self, item: &toml::Value) {
         let Some(clone) = item.as_table() else {
             return;
@@ -699,12 +701,21 @@ impl Reader<'_> {
                 ("depth", toml::Value::Integer(depth)) => {
                     self.settings.run.clone.depth = (*depth).max(0);
                 }
-                ("enabled" | "depth", _) => {
+                ("sparse", toml::Value::Array(entries))
+                    if entries.iter().all(toml::Value::is_str) =>
+                {
+                    self.settings.run.clone.sparse = entries
+                        .iter()
+                        .filter_map(toml::Value::as_str)
+                        .map(str::to_owned)
+                        .collect();
+                }
+                ("enabled" | "depth" | "sparse", _) => {
                     let path = self.path;
                     self.unsupported(
                         "workflow_toml.key",
                         format!("`run.clone.{key}` in `{path}` has the wrong type"),
-                        "`enabled` is a boolean, `depth` an integer",
+                        "`enabled` is a boolean, `depth` an integer, `sparse` an array of strings",
                     );
                 }
                 (other, _) => {
@@ -712,7 +723,7 @@ impl Reader<'_> {
                     self.unsupported(
                         "workflow_toml.key",
                         format!("`run.clone.{other}` in `{path}` is not a key Fabro accepts"),
-                        "use `enabled` or `depth`",
+                        "use `enabled`, `depth` or `sparse`",
                     );
                 }
             }
