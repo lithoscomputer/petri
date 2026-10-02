@@ -1371,6 +1371,81 @@ async fn run_environment_env_and_secrets_reach_the_commands_and_stay_masked() {
     );
 }
 
+/// Commit everything under `dir` as a fresh repository, as the host user.
+fn commit_all(dir: &Path) {
+    for args in [
+        &["init", "--quiet", "--initial-branch=main"][..],
+        &["add", "--all"],
+        &[
+            "-c",
+            "user.name=Petri Tests",
+            "-c",
+            "user.email=tests@petri.invalid",
+            "commit",
+            "--quiet",
+            "--no-gpg-sign",
+            "-m",
+            "fixture",
+        ],
+    ] {
+        let output = Command::new("git")
+            .args(args)
+            .current_dir(dir)
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .output()
+            .expect("git runs");
+        assert!(
+            output.status.success(),
+            "git {args:?}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+}
+
+/// `[run.clone]` into a Docker sandbox: the checkout belongs to the user the
+/// stages run as (root), not to the host user that packed it, so `git` in
+/// the workspace accepts it. The image has no `safe.directory` override,
+/// which would hide a wrong owner.
+#[tokio::test]
+async fn a_docker_checkout_belongs_to_the_sandbox_user_and_git_accepts_it() {
+    if !testkit::is_docker_ready().await {
+        return;
+    }
+    let case = Case::new("docker-checkout").docker();
+    let workflow = case.workflow(
+        r#"digraph Checkout {
+    start [shape=Mdiamond]
+    exit [shape=Msquare]
+    owner [shape=parallelogram, script="test \"$(stat -c %u case.fabro)\" = \"$(id -u)\" && echo owned-by-the-sandbox-user"]
+    status [shape=parallelogram, script="git status --porcelain && git rev-parse --short HEAD >/dev/null && echo git-accepts-the-checkout"]
+    start -> owner -> status -> exit
+}"#,
+        Some(
+            "[run.environment]\nid = \"boxed\"\n\n[environments.boxed]\nprovider = \"docker\"\n\n[environments.boxed.image]\ndocker = \"buildpack-deps:noble\"\n",
+        ),
+    );
+    commit_all(workflow.parent().expect("the workflow dir"));
+    let finished = case.run(&workflow, &[]).await;
+    let (code, prune) = case.prune().await;
+    assert!(
+        finished.stderr.contains("checkout: "),
+        "the repository was checked out: {}",
+        finished.stderr
+    );
+    finished.assert_code(0);
+    assert_eq!(
+        finished.status_line(),
+        Some("success"),
+        "{}",
+        finished.stderr
+    );
+    let echoed = finished.echoed();
+    let said = |node: &str, line: &str| echoed.iter().any(|(n, l)| n == node && l == line);
+    assert!(said("owner", "owned-by-the-sandbox-user"), "{echoed:?}");
+    assert!(said("status", "git-accepts-the-checkout"), "{echoed:?}");
+    assert_eq!(code, Some(0), "prune failed:\n{prune}");
+}
+
 /// Task 7: `[run.execution]` supplies the launch defaults: `approval = "auto"`
 /// answers a gate with its first choice and `mode = "dry_run"` simulates the
 /// stages, with the explicit options still winning.

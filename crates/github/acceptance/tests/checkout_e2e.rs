@@ -135,6 +135,20 @@ async fn local_checkout_reaches_containerized_jobs() {
     run_checkout("boxed", Some(RUNNER_IMAGE_2404)).await;
 }
 
+/// The same tree in a plain image with no `safe.directory` override: the
+/// job runs as root, so the checkout must belong to root, not to the host
+/// user that packed it, or every `git` step refuses the workspace.
+#[tokio::test(flavor = "multi_thread")]
+async fn local_checkout_belongs_to_the_container_user() {
+    if !is_tool_ready("git") {
+        return;
+    }
+    if !testkit::is_docker_ready().await {
+        return;
+    }
+    run_checkout("plain", Some("buildpack-deps:noble")).await;
+}
+
 /// A corpus-shaped source — detached at its pin, no branch at all — still
 /// materializes onto the run's branch, with the matching remote-tracking ref:
 /// the git shape GitHub's checkout guarantees, whatever the source's own.
