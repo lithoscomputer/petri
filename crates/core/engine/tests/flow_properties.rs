@@ -1,7 +1,8 @@
-//! §3/§4 over random flows, loops included: the join, generation and budget
-//! rules hold for every graph and every order a host finishes steps in, not
-//! only for the hand-written cases in `joins.rs` and `loops.rs`. §8 invariant
-//! 10 is checked against the same runs: a join it rejects never runs.
+//! §3/§4 over random flows, loops and retries included: the join,
+//! generation, budget and retry rules hold for every graph and every order a
+//! host finishes steps in, not only for the hand-written cases in `joins.rs`,
+//! `loops.rs` and `retries.rs`. §8 invariant 10 is checked against the same
+//! runs: a join it rejects never runs.
 
 mod flow;
 mod support;
@@ -9,8 +10,8 @@ mod support;
 use std::collections::{BTreeMap, BTreeSet};
 
 use engine::{EngineState, Event, RunError};
-use flow::{FlowCase, JoinSpec};
-use ir::{EdgeId, FiringId, Graph, NodeId, ValidationError, validate};
+use flow::{FlowCase, JoinSpec, Start};
+use ir::{EdgeId, FiringId, Graph, NodeId, Status, ValidationError, validate};
 use proptest::prelude::*;
 use proptest::test_runner::TestCaseError;
 
@@ -73,9 +74,27 @@ fn check_flow(case: &FlowCase) -> Result<(), TestCaseError> {
     let state = &run.harness.state;
     prop_assert_ne!(&run.observed.status, "unsettled", "every run ends");
 
+    // A firing's attempts are numbered 1, 2, … with no gap.
+    let mut firings_in_order: Vec<&Start> = Vec::new();
+    let mut attempts: BTreeMap<FiringId, Vec<&Start>> = BTreeMap::new();
+    for start in &run.starts {
+        let seen = attempts.entry(start.firing).or_default();
+        prop_assert_eq!(
+            start.attempt as usize,
+            seen.len() + 1,
+            "{} attempt {} out of order",
+            start.firing,
+            start.attempt
+        );
+        if seen.is_empty() {
+            firings_in_order.push(start);
+        }
+        seen.push(start);
+    }
+
     // At most one firing per (node, generation).
     let mut started = BTreeSet::new();
-    for start in &run.starts {
+    for start in &firings_in_order {
         prop_assert!(
             started.insert((start.node, start.generation)),
             "{} started twice in generation {}",
@@ -85,7 +104,7 @@ fn check_flow(case: &FlowCase) -> Result<(), TestCaseError> {
     }
 
     // Sound: a node starts only once its join is satisfied.
-    for start in &run.starts {
+    for start in &firings_in_order {
         let join = case.nodes[start.node.index()].join;
         let tokens: BTreeSet<EdgeId> = start.inputs.iter().copied().collect();
         prop_assert!(
@@ -146,7 +165,7 @@ fn check_flow(case: &FlowCase) -> Result<(), TestCaseError> {
     // Budgets: no node fires more often than its budget allows. A refused
     // firing comes only after the budget is spent, and it fails the run.
     let mut firings: BTreeMap<NodeId, u32> = BTreeMap::new();
-    for start in &run.starts {
+    for start in &firings_in_order {
         *firings.entry(start.node).or_default() += 1;
     }
     for (node, count) in &firings {
@@ -198,10 +217,65 @@ fn check_flow(case: &FlowCase) -> Result<(), TestCaseError> {
         );
     }
 
-    // Every started firing finished, and the run failed exactly when a firing
-    // failed or a budget refused one (`Completion::AnyFailure`).
-    prop_assert_eq!(run.observed.finished.len(), run.starts.len());
-    let any_failed = run.starts.iter().any(|start| start.fails);
+    // Retries: a firing retries only an outcome its policy retries, never a
+    // success, and never past its attempt limit; it stops at the first outcome
+    // it does not retry; and its record is the last attempt after the
+    // exhaustion policy. An accepted partial success keeps the failure behind
+    // it (§3.1 rule 3), as far as the status carries one: a timeout carries no
+    // `FailureInfo`. The rules are restated in `RetrySpec`, not read from the
+    // core's `RetryPolicy`.
+    for (firing, tries) in &attempts {
+        let retry = &case.nodes[tries[0].node.index()].retry;
+        prop_assert!(
+            tries.len() <= retry.max_attempts as usize,
+            "{firing} tried too often"
+        );
+        for tried in &tries[..tries.len() - 1] {
+            prop_assert!(
+                retry.retries(tried.outcome),
+                "{firing} retried {:?}",
+                tried.outcome
+            );
+        }
+        let last = tries[tries.len() - 1];
+        prop_assert!(
+            !retry.retries(last.outcome) || last.attempt == retry.max_attempts,
+            "{firing} stopped at attempt {} with {:?} left to retry",
+            last.attempt,
+            last.outcome
+        );
+        let raw = last.outcome.outcome();
+        let expected = retry.recorded(last.attempt, last.outcome);
+        let record = state
+            .history()
+            .iter()
+            .rev()
+            .find(|record| record.firing == *firing);
+        prop_assert!(record.is_some(), "{firing} has no record");
+        let record = &record.expect("checked above").outcome.status;
+        prop_assert_eq!(record, &expected, "{}'s record", firing);
+        if let Status::PartialSuccess { underlying } = record {
+            prop_assert_eq!(
+                underlying.as_ref(),
+                raw.status.failure_info(),
+                "{}'s partial success lost its failure",
+                firing
+            );
+        }
+    }
+
+    // Retries are invisible outside the log (§4): the same case with every
+    // firing cut to its final outcome runs the same way.
+    let finalized = flow::run(&case.finalized());
+    prop_assert_eq!(finalized.observed.routing(), run.observed.routing());
+
+    // Every started firing finished, and the run failed exactly when a record
+    // is a failure or a budget refused a firing (`Completion::AnyFailure`).
+    prop_assert_eq!(run.observed.finished.len(), firings_in_order.len());
+    let any_failed = state
+        .history()
+        .iter()
+        .any(|record| record.outcome.status.is_failure());
     let expected = if any_failed || !run.observed.budget_exceeded.is_empty() {
         "failed"
     } else {
@@ -223,12 +297,13 @@ proptest! {
     #![proptest_config(ProptestConfig::with_cases(512))]
 
     /// Joins are sound and complete per generation, each (node, generation)
-    /// fires at most once, tokens carry the right generation, budgets hold, a
-    /// join invariant 10 rejects never runs, the run status folds from the
-    /// records and the budget errors, and replay is byte-identical — for
-    /// every generated graph and host schedule.
+    /// fires at most once, tokens carry the right generation, budgets hold,
+    /// retries follow the policy and are invisible outside the log, a join
+    /// invariant 10 rejects never runs, the run status folds from the records
+    /// and the budget errors, and replay is byte-identical — for every
+    /// generated graph and host schedule.
     #[test]
-    fn random_flows_keep_the_join_generation_and_budget_rules(case in flow::flow_case()) {
+    fn random_flows_keep_the_join_generation_budget_and_retry_rules(case in flow::flow_case()) {
         check_flow(&case)?;
     }
 }

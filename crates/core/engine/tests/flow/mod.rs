@@ -7,6 +7,8 @@
 //! cycle holds a back edge (§8 invariant 1). Each node has a firing budget,
 //! and the host's outcome for a node can change from one firing to the next,
 //! so a loop runs a few times and then either exits or hits its budget. Each
+//! node also has a retry policy, and the host scripts every attempt: success,
+//! failure, a failure of class `flaky`, or a timeout. Each
 //! routing group picks its first arm whose guard passes: `always`,
 //! `success()` or `failure()` over the node's own outcome. Joins are `All`,
 //! `Any` or `Quorum { n }`.
@@ -26,11 +28,12 @@
 )]
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::time::Duration;
 
 use engine::{Command, Event, RunError};
 use ir::{
-    Arm, Budget, EdgeId, FiringId, Graph, GraphBuilder, JoinPolicy, NodeId, Outcome, RunStatus,
-    ScopeId, Value,
+    Arm, Backoff, Budget, EdgeId, FailureInfo, FiringId, Graph, GraphBuilder, JoinPolicy, NodeId,
+    Outcome, RetryOn, RetryPolicy, RunStatus, ScopeId, Status, Value,
 };
 use proptest::prelude::*;
 use serde::{Deserialize, Serialize};
@@ -39,6 +42,7 @@ use crate::support::{Harness, NOOP};
 
 const MAX_NODES: usize = 7;
 const MAX_FIRINGS: u32 = 4;
+const MAX_ATTEMPTS: u32 = 3;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
@@ -77,21 +81,138 @@ pub(crate) struct ArmSpec {
     pub edge:  u32,
 }
 
+/// What the host reports for one attempt.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum OutcomeSpec {
+    Success,
+    Failure,
+    /// A failure of class `flaky`.
+    Flaky,
+    TimedOut,
+}
+
+impl OutcomeSpec {
+    pub(crate) fn outcome(self) -> Outcome {
+        match self {
+            Self::Success => Outcome::success(Value::Null),
+            Self::Failure => Outcome::failure("scripted failure"),
+            Self::Flaky => Outcome::new(
+                Status::Failure(FailureInfo::new("scripted flake").with_class("flaky")),
+                Value::Null,
+            ),
+            Self::TimedOut => Outcome::new(Status::TimedOut, Value::Null),
+        }
+    }
+}
+
+/// Which outcomes a node retries.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum RetryOnSpec {
+    /// `RetryOn::default()`: the `Failure` and `TimedOut` statuses.
+    Default,
+    /// Only failures of class `flaky`.
+    Flaky,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub(crate) struct RetrySpec {
+    pub max_attempts:   u32,
+    pub retry_on:       RetryOnSpec,
+    pub accept_partial: bool,
+    pub initial_nanos:  u64,
+    /// `Backoff.factor` as its `f64` bit pattern: JSON cannot carry NaN or the
+    /// infinities.
+    pub factor_bits:    u64,
+    pub max_nanos:      u64,
+}
+
+impl RetrySpec {
+    /// Whether this policy retries an outcome, restated from §3.1 and §4
+    /// rather than read from `RetryPolicy::should_retry`, so a test that
+    /// relies on it checks the core instead of agreeing with it: a success is
+    /// never retried, the default retries a failure or a timeout, and the
+    /// `flaky` policy retries a failure of that class only.
+    pub(crate) fn retries(&self, outcome: OutcomeSpec) -> bool {
+        match (self.retry_on, outcome) {
+            (_, OutcomeSpec::Success) => false,
+            (RetryOnSpec::Default, _) => true,
+            (RetryOnSpec::Flaky, outcome) => outcome == OutcomeSpec::Flaky,
+        }
+    }
+
+    /// The status a firing records when its last attempt reports `outcome`
+    /// after `attempts` attempts: an exhausted retryable failure becomes a
+    /// partial success under `AcceptPartial`, keeping its failure (§3.1 rule
+    /// 3). Restated from the spec, like [`Self::retries`].
+    pub(crate) fn recorded(&self, attempts: u32, outcome: OutcomeSpec) -> Status {
+        let status = outcome.outcome().status;
+        if self.accept_partial && self.retries(outcome) && attempts >= self.max_attempts {
+            Status::PartialSuccess {
+                underlying: status.failure_info().cloned(),
+            }
+        } else {
+            status
+        }
+    }
+
+    pub(crate) fn policy(&self) -> RetryPolicy {
+        let retry_on = match self.retry_on {
+            RetryOnSpec::Default => RetryOn::default(),
+            RetryOnSpec::Flaky => RetryOn {
+                statuses:        Vec::new(),
+                failure_classes: vec!["flaky".into()],
+            },
+        };
+        let policy = RetryPolicy::attempts(self.max_attempts)
+            .with_retry_on(retry_on)
+            .with_backoff(Backoff {
+                initial: Duration::from_nanos(self.initial_nanos),
+                factor:  f64::from_bits(self.factor_bits),
+                max:     Duration::from_nanos(self.max_nanos),
+                jitter:  false,
+            });
+        if self.accept_partial {
+            policy.accepting_partial()
+        } else {
+            policy
+        }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 pub(crate) struct NodeSpec {
     pub join:        JoinSpec,
     /// `Budget.max_firings`.
     pub max_firings: u32,
-    /// Whether the host fails the node's first, second, … firing; the last
-    /// entry repeats.
-    pub outcomes:    Vec<bool>,
+    pub retry:       RetrySpec,
+    /// What the host reports for each attempt of the node's first, second, …
+    /// firing. The last firing's list repeats, and within a list the last
+    /// attempt repeats.
+    pub outcomes:    Vec<Vec<OutcomeSpec>>,
     pub groups:      Vec<Vec<ArmSpec>>,
 }
 
 impl NodeSpec {
-    /// Whether the host fails this node's firing number `ordinal`, from 0.
-    pub(crate) fn fails(&self, ordinal: usize) -> bool {
-        self.outcomes[ordinal.min(self.outcomes.len() - 1)]
+    /// What the host reports for attempt `attempt` (from 1) of firing
+    /// `ordinal` (from 0).
+    pub(crate) fn outcome(&self, ordinal: usize, attempt: u32) -> OutcomeSpec {
+        let attempts = &self.outcomes[ordinal.min(self.outcomes.len() - 1)];
+        attempts[(attempt.max(1) as usize - 1).min(attempts.len() - 1)]
+    }
+
+    /// The last attempt a firing's script reaches under this node's policy:
+    /// the first outcome it does not retry, or the attempt limit.
+    pub(crate) fn final_outcome(&self, ordinal: usize) -> OutcomeSpec {
+        let mut attempt = 1;
+        loop {
+            let outcome = self.outcome(ordinal, attempt);
+            if !self.retry.retries(outcome) || attempt >= self.retry.max_attempts {
+                return outcome;
+            }
+            attempt += 1;
+        }
     }
 }
 
@@ -102,6 +223,32 @@ pub(crate) struct FlowCase {
     /// `schedule[k] % live` in ascending `(node, generation)` order, or the
     /// first one once the schedule runs out.
     pub schedule: Vec<u32>,
+}
+
+impl FlowCase {
+    /// The same case with every firing cut to the last attempt its script
+    /// reaches, and one attempt allowed. Retries are invisible outside the
+    /// log (§4), so both run the same way.
+    pub(crate) fn finalized(&self) -> Self {
+        let nodes = self
+            .nodes
+            .iter()
+            .map(|node| NodeSpec {
+                retry: RetrySpec {
+                    max_attempts: 1,
+                    ..node.retry.clone()
+                },
+                outcomes: (0..node.outcomes.len())
+                    .map(|ordinal| vec![node.final_outcome(ordinal)])
+                    .collect(),
+                ..node.clone()
+            })
+            .collect();
+        Self {
+            nodes,
+            schedule: self.schedule.clone(),
+        }
+    }
 }
 
 /// What a run looks like from outside the core.
@@ -119,6 +266,30 @@ pub(crate) struct Observed {
     pub budget_exceeded: Vec<u32>,
     /// `success` or `failed`; `unsettled` when the run did not finish.
     pub status:          String,
+    /// `(node, generation, attempts, status)` per finished firing, in the
+    /// order the host finished them; the status is the record's tag.
+    #[serde(default)]
+    pub attempts:        Vec<(u32, u32, u32, String)>,
+    /// `(node, generation, next attempt, base delay in nanoseconds)` per
+    /// scheduled retry, in order.
+    #[serde(default)]
+    pub retries:         Vec<(u32, u32, u32, u64)>,
+}
+
+impl Observed {
+    /// What routing and the run context see: everything but the attempt
+    /// counts and the retries.
+    pub(crate) fn routing(&self) -> Self {
+        Self {
+            attempts: self
+                .attempts
+                .iter()
+                .map(|(node, generation, _, status)| (*node, *generation, 1, status.clone()))
+                .collect(),
+            retries: Vec::new(),
+            ..self.clone()
+        }
+    }
 }
 
 /// One `StartStep` the core issued.
@@ -128,8 +299,9 @@ pub(crate) struct Start {
     pub generation: u32,
     /// Which of the node's firings this is, from 0.
     pub ordinal:    usize,
-    /// Whether the host fails it.
-    pub fails:      bool,
+    pub attempt:    u32,
+    /// What the host reports for this attempt.
+    pub outcome:    OutcomeSpec,
     pub inputs:     Vec<EdgeId>,
 }
 
@@ -147,7 +319,14 @@ pub(crate) struct Run {
 type RawArm = (u8, u32, u8);
 /// A raw node: its join, whether a loop head keeps that join (and breaks
 /// invariant 8), its budget, its outcomes and its groups.
-type RawNode = (JoinSpec, bool, u32, Vec<bool>, Vec<Vec<RawArm>>);
+type RawNode = (
+    JoinSpec,
+    bool,
+    u32,
+    RetrySpec,
+    Vec<Vec<OutcomeSpec>>,
+    Vec<Vec<RawArm>>,
+);
 
 fn join_spec() -> impl Strategy<Value = JoinSpec> {
     prop_oneof![
@@ -155,6 +334,50 @@ fn join_spec() -> impl Strategy<Value = JoinSpec> {
         1 => Just(JoinSpec::Any),
         1 => (0u32..=3).prop_map(|n| JoinSpec::Quorum { n }),
     ]
+}
+
+fn outcome_spec() -> impl Strategy<Value = OutcomeSpec> {
+    prop_oneof![
+        5 => Just(OutcomeSpec::Success),
+        3 => Just(OutcomeSpec::Failure),
+        2 => Just(OutcomeSpec::Flaky),
+        1 => Just(OutcomeSpec::TimedOut),
+    ]
+}
+
+/// Retry policies, with backoffs that exercise the delay arithmetic: a zero,
+/// a huge value, a factor that is NaN, negative or infinite.
+fn retry_spec() -> impl Strategy<Value = RetrySpec> {
+    let nanos = || prop_oneof![0u64..=5_000_000_000, any::<u64>()];
+    let factor = prop_oneof![
+        prop::sample::select(vec![1.0, 1.5, 2.0, 0.0, -1.0, f64::NAN, f64::INFINITY]),
+        0.0f64..10.0,
+        any::<f64>(),
+    ];
+    (
+        1..=MAX_ATTEMPTS,
+        prop::bool::weighted(0.7),
+        prop::bool::weighted(0.3),
+        nanos(),
+        factor,
+        nanos(),
+    )
+        .prop_map(
+            |(max_attempts, default_on, accept_partial, initial_nanos, factor, max_nanos)| {
+                RetrySpec {
+                    max_attempts,
+                    retry_on: if default_on {
+                        RetryOnSpec::Default
+                    } else {
+                        RetryOnSpec::Flaky
+                    },
+                    accept_partial,
+                    initial_nanos,
+                    factor_bits: factor.to_bits(),
+                    max_nanos,
+                }
+            },
+        )
 }
 
 fn raw_node() -> impl Strategy<Value = RawNode> {
@@ -169,7 +392,8 @@ fn raw_node() -> impl Strategy<Value = RawNode> {
         join_spec(),
         prop::bool::weighted(0.1),
         1..=MAX_FIRINGS,
-        prop::collection::vec(prop::bool::weighted(0.25), 1..=3),
+        retry_spec(),
+        prop::collection::vec(prop::collection::vec(outcome_spec(), 1..=3), 1..=3),
         prop::collection::vec(group, 1..=3),
     )
 }
@@ -231,7 +455,7 @@ impl FlowCase {
             .zip(targets)
             .zip(0..)
             .map(
-                |(((join, keep_join, max_firings, outcomes, _), groups), index)| {
+                |(((join, keep_join, max_firings, retry, outcomes, _), groups), index)| {
                     let groups = groups
                         .into_iter()
                         .map(|arms| {
@@ -272,6 +496,7 @@ impl FlowCase {
                     NodeSpec {
                         join,
                         max_firings: *max_firings,
+                        retry: retry.clone(),
                         outcomes: outcomes.clone(),
                         groups,
                     }
@@ -310,6 +535,7 @@ impl FlowCase {
         for (node, id) in self.nodes.iter().zip(&ids) {
             b.set_join(*id, node.join.policy());
             b.set_budget(*id, Budget::looped(node.max_firings));
+            b.node_mut(*id).retry = node.retry.policy();
             if node.groups.is_empty() {
                 continue;
             }
@@ -348,6 +574,10 @@ impl FlowCase {
 // ── Running ───────────────────────────────────────────────────────────────
 
 /// Run a case through the real core with a host that follows the schedule.
+///
+/// The host finishes one live firing per step, running every attempt its
+/// script reaches before it picks the next: a retry is fed straight back, as
+/// `Harness::run` does.
 pub(crate) fn run(case: &FlowCase) -> Run {
     let mut harness = Harness::new(case.graph());
     harness.feed(Event::ExecutionStarted {
@@ -355,10 +585,11 @@ pub(crate) fn run(case: &FlowCase) -> Run {
     });
 
     let mut starts = Vec::new();
-    let mut live: BTreeMap<(u32, u32), (FiringId, bool)> = BTreeMap::new();
-    let mut ordinals: BTreeMap<u32, usize> = BTreeMap::new();
+    let mut live: BTreeMap<(u32, u32), FiringId> = BTreeMap::new();
+    let mut ordinals = Ordinals::default();
     let mut steps = Vec::new();
     let mut finished = Vec::new();
+    let mut attempts = Vec::new();
 
     let first = drain_starts(&mut harness, case, &mut ordinals);
     steps.push(started_keys(&first, &mut live));
@@ -373,20 +604,52 @@ pub(crate) fn run(case: &FlowCase) -> Run {
             break;
         }
         let choice = case.schedule.get(step).copied().unwrap_or(0) as usize % live.len();
-        let (&key, &(firing, fails)) = live.iter().nth(choice).expect("choice is below live.len()");
+        let (&key, &firing) = live.iter().nth(choice).expect("choice is below live.len()");
         live.remove(&key);
-        let outcome = if fails {
-            Outcome::failure("scripted failure")
-        } else {
-            Outcome::success(Value::Null)
+        let mut attempt = 1;
+        let batch = loop {
+            let ordinal = ordinals.of_firing[&firing];
+            let outcome = case.nodes[key.0 as usize].outcome(ordinal, attempt);
+            harness.finish(firing, outcome.outcome());
+            harness.drain_retries();
+            let mut batch = drain_starts(&mut harness, case, &mut ordinals);
+            // A retry re-admits the same firing; nothing routes until its last
+            // attempt.
+            if let Some(retry) = batch.iter().position(|start| start.firing == firing) {
+                attempt = batch[retry].attempt;
+                starts.push(batch.remove(retry));
+                assert!(batch.is_empty(), "a non-final attempt routes nothing");
+                continue;
+            }
+            break batch;
         };
-        harness.finish(firing, outcome);
         finished.push(key);
-        let batch = drain_starts(&mut harness, case, &mut ordinals);
+        let status = harness
+            .state
+            .history()
+            .iter()
+            .rev()
+            .find(|record| record.firing == firing)
+            .map_or("unrecorded", |record| record.outcome.status.tag());
+        attempts.push((key.0, key.1, attempt, status.to_owned()));
         steps.push(started_keys(&batch, &mut live));
         starts.extend(batch);
     }
 
+    let firing_keys: BTreeMap<FiringId, (u32, u32)> = starts
+        .iter()
+        .map(|start| (start.firing, (start.node.raw(), start.generation)))
+        .collect();
+    let retries = harness
+        .scheduled_retries
+        .iter()
+        .map(|(firing, next, delay)| {
+            let (node, generation) = firing_keys[firing];
+            let nanos = u64::try_from(delay.as_nanos())
+                .expect("a base delay is built from u64 nanoseconds");
+            (node, generation, next.raw(), nanos)
+        })
+        .collect();
     let parked = harness
         .state
         .pending_tokens()
@@ -416,53 +679,57 @@ pub(crate) fn run(case: &FlowCase) -> Run {
             parked,
             budget_exceeded,
             status: status.to_owned(),
+            attempts,
+            retries,
         },
         starts,
         harness,
     }
 }
 
+/// Which of its node's firings each firing is.
+#[derive(Default)]
+struct Ordinals {
+    per_node:  BTreeMap<u32, usize>,
+    of_firing: BTreeMap<FiringId, usize>,
+}
+
 /// Take the `StartStep` commands issued so far, keeping everything else, and
-/// decide each firing's scripted outcome.
-fn drain_starts(
-    harness: &mut Harness,
-    case: &FlowCase,
-    ordinals: &mut BTreeMap<u32, usize>,
-) -> Vec<Start> {
+/// look up each attempt's scripted outcome.
+fn drain_starts(harness: &mut Harness, case: &FlowCase, ordinals: &mut Ordinals) -> Vec<Start> {
     let mut starts = Vec::new();
     harness.commands.retain(|command| {
         let Command::StartStep(resolved) = command else {
             return true;
         };
         let node = resolved.node();
-        let ordinal = ordinals.entry(node.raw()).or_default();
+        let attempt = resolved.attempt().raw();
+        let ordinal = *ordinals.of_firing.entry(resolved.id()).or_insert_with(|| {
+            let next = ordinals.per_node.entry(node.raw()).or_default();
+            *next += 1;
+            *next - 1
+        });
         starts.push(Start {
             firing: resolved.id(),
             node,
             generation: resolved.generation().raw(),
-            ordinal: *ordinal,
-            fails: case.nodes[node.index()].fails(*ordinal),
+            ordinal,
+            attempt,
+            outcome: case.nodes[node.index()].outcome(ordinal, attempt),
             inputs: resolved.inputs().iter().map(|token| token.edge).collect(),
         });
-        *ordinal += 1;
         false
     });
     starts
 }
 
-fn started_keys(
-    starts: &[Start],
-    live: &mut BTreeMap<(u32, u32), (FiringId, bool)>,
-) -> Vec<(u32, u32)> {
+fn started_keys(starts: &[Start], live: &mut BTreeMap<(u32, u32), FiringId>) -> Vec<(u32, u32)> {
     let mut keys: Vec<(u32, u32)> = starts
         .iter()
         .map(|start| (start.node.raw(), start.generation))
         .collect();
     for start in starts {
-        live.insert(
-            (start.node.raw(), start.generation),
-            (start.firing, start.fails),
-        );
+        live.insert((start.node.raw(), start.generation), start.firing);
     }
     keys.sort_unstable();
     keys
