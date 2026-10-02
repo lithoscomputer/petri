@@ -853,6 +853,68 @@ fn kill_settles_a_firing_awaiting_admission() {
     );
 }
 
+/// A group kill withdraws the routing still open for an outcome recorded
+/// inside the group before it, as a root kill does: nothing routes out of a
+/// killed closure, however long the host took to decide.
+#[test]
+fn a_group_kill_withdraws_an_open_routing() {
+    let mut b = GraphBuilder::new();
+    let scope = ir::ScopeId::new(0);
+    let a = b.add_step("a", scope, NOOP);
+    let after = b.add_step("after", scope, NOOP);
+    b.link(a, after);
+    b.node_mut(a).cancel_group = Some(a);
+    let graph = b.build();
+    validate(&graph).expect("valid");
+
+    let mut h = Harness::new(graph).holding_decisions();
+    h.feed(Event::ExecutionStarted {
+        start: engine::EngineStart::default(),
+    });
+    while let Some(at) = h
+        .commands
+        .iter()
+        .position(|c| matches!(c, Command::Admit { .. }))
+    {
+        let admission = h.commands.remove(at);
+        h.answer(&admission);
+    }
+    let (firing, _) = h.take_starts()[0];
+    h.finish(firing, Outcome::success(Value::Null));
+    let routing = DecisionId::route(firing, Attempt::FIRST);
+    assert!(
+        h.state.has_pending_routing(routing),
+        "a waits on its routing"
+    );
+
+    let group = h
+        .state
+        .cancel_scope(CancelScopeId::ROOT)
+        .into_iter()
+        .flat_map(|root| root.children.iter().copied())
+        .find(|child| {
+            h.state
+                .cancel_scope(*child)
+                .is_some_and(|scope| scope.nodes.contains(&a))
+        })
+        .expect("a's group has its own scope");
+    h.feed(Event::KillRequested { scope: group });
+    assert!(
+        !h.state.has_pending_routing(routing),
+        "the kill withdrew the routing"
+    );
+    assert!(
+        !h.state
+            .log
+            .events()
+            .any(|event| matches!(event, Event::TokenEmitted { token } if token.from == firing)),
+        "nothing routed out of the killed group"
+    );
+    assert_eq!(h.start_count("after"), 0);
+    assert!(h.status.is_some(), "the run ends");
+    h.verify_replay();
+}
+
 // ── Kill (§5 tests 10–13) ─────────────────────────────────────────────────
 
 /// Kill is the pre-v3 cancel, kept under its own event: tokens drop, outcomes

@@ -20,13 +20,19 @@ retry decision in `on_step_finished` and the kill checks in `on_token` and
   recorded `cancelled` and routed unless killed;
 * a firing is never retried once a stop reached it.
 
-The core hands the host two kinds of decision, an admission for each firing
-it starts and a routing for each outcome it records, and the harness answers
-them depth first: a routing's tokens arrive in order, and the decisions they
-cause are answered before anything queued after it. A firing's number among
-its node's started firings, which picks its script, is fixed when its
-admission is answered. Firing ids order the signals and the settles, as
-`live_firings` does.
+The core hands the host two kinds of decision, an admission for each attempt
+it starts and a routing for each outcome it records. A host that answers at
+once answers them depth first: a routing's tokens arrive in order, and the
+decisions they cause are answered before anything queued after it. A host
+that holds its decisions keeps them open, oldest first, until a `decide` step
+answers one; stops and finishes land in between. A single attempt run past a
+backoff leaves the next attempt's admission open, and a finish answers its
+firing's admissions as it goes. A stop settles a firing waiting on its
+admission as it settles one waiting on its backoff, and withdraws the
+decision; a kill also withdraws the open routings of what it reached. A
+firing's number among its node's started firings, which picks its script, is
+fixed when its first admission is answered. Firing ids order the signals and
+the settles, as `live_firings` does.
 
 The run keeps a log of stops, starts, retries and routings, newest first.
 Each entry carries the proof of the rule it must satisfy against the entries
@@ -64,12 +70,16 @@ inductive Action where
   /-- Run only the chosen firing's next attempt. -/
   | attempt (choice : Nat)
   | stop (tier : Tier) (target : Target)
+  /-- Answer the open decision at position `choice % open`, oldest first. -/
+  | decide (choice : Nat)
   deriving Repr
 
 /-- A generated case with its host actions. -/
 structure Case where
   nodes : List SpecNode
   schedule : List Action
+  /-- The host holds each decision open until a step answers it. -/
+  holds : Bool
   deriving Repr
 
 /-- The case as routing sees its graph, to share `Flow`'s edges and seeds. -/
@@ -150,13 +160,15 @@ structure Token where
   cancelled : Bool
   deriving Repr
 
-/-- A running firing. -/
+/-- A live firing. -/
 structure Live where
   id : Nat
   key : Key
   /-- Which of its node's started firings it is. -/
   ordinal : Nat
   attempt : Nat
+  /-- Its first admission was answered: it has run, or may. -/
+  admitted : Bool
   waiting : Bool
   signalled : Bool
   deriving Repr
@@ -167,12 +179,24 @@ structure Routing where
   status : Status
   deriving Repr
 
-/-- A decision the host answers: admit a started firing, or route a recorded
-outcome. -/
+/-- A decision the host answers: admit a firing's first attempt, admit a
+started firing's next attempt, or route a recorded outcome. -/
 inductive Decision where
   | admit (id : Nat)
+  | retry (id : Nat)
   | route (r : Routing)
   deriving Repr
+
+/-- Whether a decision admits an attempt of firing `id`. -/
+def Decision.admits (id : Nat) : Decision → Bool
+  | .admit i => i == id
+  | .retry i => i == id
+  | .route _ => false
+
+/-- Whether a decision admits the next attempt of firing `id`. -/
+def Decision.retries (id : Nat) : Decision → Bool
+  | .retry i => i == id
+  | _ => false
 
 structure State (c : Case) where
   log : Log c
@@ -184,8 +208,10 @@ structure State (c : Case) where
   /-- Started firings per node. -/
   started : List Nat
   nextId : Nat
-  /-- Running firings, by id. -/
+  /-- Live firings, by id. -/
   live : List Live
+  /-- The decisions the host holds, oldest first. -/
+  held : List Decision
   steps : List (List Key)
   finished : List Key
   budgetExceeded : List Nat
@@ -208,6 +234,10 @@ def State.firingsOf (s : State c) (node : Nat) : Nat :=
 
 def State.startedOf (s : State c) (node : Nat) : Nat :=
   s.started[node]?.getD 0
+
+/-- Whether a firing waits on the admission of an attempt. -/
+def State.awaiting (s : State c) (id : Nat) : Bool :=
+  s.held.any (Decision.admits id)
 
 /-- Note that a key holds a token from a firing that recorded `cancelled`. -/
 @[reducible] def State.markTainted (s : State c) (k : Key) (taint : Bool) : State c :=
@@ -258,7 +288,7 @@ def deliverOne (s : State c) (t : Token) : State c × List Decision :=
               exact ha
             let f : Live := {
               id := s.nextId, key := k, ordinal := 0
-              attempt := 1, waiting := false, signalled := false }
+              attempt := 1, admitted := false, waiting := false, signalled := false }
             let s := { s with
               log := s.log.push (.started t.target taint) valid
               live := s.live ++ [f]
@@ -282,34 +312,53 @@ def tokensOf (c : Case) (k : Key) (status : Status) : List Token :=
   (groups.filterMap (emit status)).map fun arm =>
     ⟨arm.to, if arm.back then k.2 + 1 else k.2, arm.edge, status == .cancelled⟩
 
-/-- Answer decisions depth first: those one routing raises go before the
-rest. An admission fixes the firing's number among its node's started
-firings; the result lists the keys admitted. A killed firing routes nothing. -/
-def decideAll : Nat → State c → List Decision → State c × List Key
-  | 0, s, _ => (s, [])
-  | _ + 1, s, [] => (s, [])
-  | fuel + 1, s, .admit id :: rest =>
+/-- Admit a firing's first attempt: fix its number among its node's started
+firings. -/
+@[reducible] def State.admit (s : State c) (id node : Nat) : State c :=
+  { s with
+    live := s.live.map fun g =>
+      if g.id == id then { g with ordinal := s.startedOf node, admitted := true } else g
+    started := s.started.set node (s.startedOf node + 1) }
+
+/-- Answer one decision: the new state, the decisions it raises and the keys
+it admits. A killed firing routes nothing. -/
+def answer (s : State c) : Decision → State c × List Decision × List Key
+  | .admit id =>
     match s.live.find? (·.id == id) with
-    | none => decideAll fuel s rest
-    | some f =>
-      let node := f.key.1
-      let s := { s with
-        live := s.live.map fun g => if g.id == id then { g with ordinal := s.startedOf node } else g
-        started := s.started.set node (s.startedOf node + 1) }
-      let r := decideAll fuel s rest
-      (r.1, f.key :: r.2)
-  | fuel + 1, s, .route r :: rest =>
-    if hk : killedIn c s.log.entries r.key.1 = true then decideAll fuel s rest
+    | none => (s, [], [])
+    | some f => (s.admit id f.key.1, [], [f.key])
+  | .retry id =>
+    match s.live.find? (·.id == id) with
+    | none => (s, [], [])
+    | some f => (s, [], [f.key])
+  | .route r =>
+    if hk : killedIn c s.log.entries r.key.1 = true then (s, [], [])
     else
       let s := { s with log := s.log.push (.routed r.key.1) (by simpa [Valid] using hk) }
       let d := deliver s (tokensOf c r.key r.status)
-      decideAll fuel d.1 (d.2 ++ rest)
+      (d.1, d.2, [])
+
+/-- Answer decisions depth first: those one raises go before the rest. The
+result lists the keys admitted. Out of fuel, the rest stay open. -/
+def decideAll : Nat → State c → List Decision → State c × List Key
+  | 0, s, ds => ({ s with held := s.held ++ ds }, [])
+  | _ + 1, s, [] => (s, [])
+  | fuel + 1, s, d :: rest =>
+    let a := answer s d
+    let r := decideAll fuel a.1 (a.2.1 ++ rest)
+    (r.1, a.2.2 ++ r.2)
 
 /-- Enough fuel to answer everything one host step raises: every admission
 and every completion counts against a budget, and every firing a stop settles
 is live. -/
 def routeFuel (c : Case) (s : State c) : Nat :=
   2 * (c.nodes.map (·.maxFirings)).sum + s.live.length + 1
+
+/-- Hand the host the decisions a step raised: a host that holds them keeps
+them open, one that does not answers them depth first. The result lists the
+keys admitted. -/
+def raise (s : State c) (ds : List Decision) : State c × List Key :=
+  if c.holds then ({ s with held := s.held ++ ds }, []) else decideAll (routeFuel c s) s ds
 
 def State.update (s : State c) (f : Live) : State c :=
   { s with live := s.live.map fun g => if g.id == f.id then f else g }
@@ -360,77 +409,129 @@ def runAttempts (every : Bool) : Nat → State c → Live → State c × List Ke
         finished := s.finished ++ [f.key]
         attempts := s.attempts ++ [(f.key.1, f.key.2, f.attempt, status.tag)]
         failed := s.failed || status.isFailure }
-      decideAll (routeFuel c s) s [.route ⟨f.key, status⟩]
+      -- A killed firing's outcome is recorded, and routes nothing.
+      raise s (if killedIn c s.log.entries f.key.1 then [] else [.route ⟨f.key, status⟩])
 
-/-- `finish` and `attempt`: the chosen firing in ascending key order. A
-firing waiting on its backoff first gets its `RetryElapsed`. -/
+/-- Run the host's attempts of `f` from state `s`, and note the keys they
+admitted. -/
+def hostRun (every : Bool) (s : State c) (f : Live) : State c :=
+  let r := runAttempts every (attemptFuel c) (s.update f) f
+  { r.1 with steps := r.1.steps ++ [sorted r.2] }
+
+/-- `finish` and `attempt`: the chosen admitted firing in ascending key
+order. A firing waiting on its backoff first gets its `RetryElapsed`; a host
+that holds its decisions leaves the next attempt's admission open when it
+runs a single attempt. An open admission of the firing's next attempt is
+answered first. With nothing admitted, the step does nothing. -/
 def hostFinish (every : Bool) (s : State c) (choice : Nat) : State c :=
-  let byKey := s.live.mergeSort fun a b => keyLe a.key b.key
+  let byKey := (s.live.filter (·.admitted)).mergeSort fun a b => keyLe a.key b.key
   match byKey[choice % byKey.length]? with
-  | none => s
+  | none => { s with steps := s.steps ++ [[]] }
   | some f =>
-    let f := if f.waiting then { f with attempt := f.attempt + 1, waiting := false } else f
-    let r := runAttempts every (attemptFuel c) (s.update f) f
-    { r.1 with steps := r.1.steps ++ [sorted r.2] }
+    if f.waiting then
+      let f := { f with attempt := f.attempt + 1, waiting := false }
+      if c.holds && !every then
+        { s.update f with held := s.held ++ [.retry f.id], steps := s.steps ++ [[]] }
+      else hostRun every s f
+    else hostRun every { s with held := s.held.filter fun d => !d.retries f.id } f
+
+/-- `decide`: answer the chosen open decision, oldest first, and hand the host
+what it raises. -/
+def hostDecide (s : State c) (choice : Nat) : State c :=
+  match s.held[choice % s.held.length]? with
+  | none => { s with steps := s.steps ++ [[]] }
+  | some d =>
+    let a := answer { s with held := s.held.eraseIdx (choice % s.held.length) } d
+    let r := raise a.1 a.2.1
+    { r.1 with steps := r.1.steps ++ [sorted (a.2.2 ++ r.2)] }
 
 /-- A kill drops the tokens parked at the keys of its closure. -/
 @[reducible] def State.dropTokens (s : State c) (target : Target) (kill : Bool) : State c :=
   { s with keys := if kill then s.keys.map (fun (k, key) =>
       if c.covers target k.1 then (k, { key with tokens := [] }) else (k, key)) else s.keys }
 
+/-- Whether a held decision outlives a stop that left `rest` live: an
+admission while its firing is live, a routing unless the stop kills its node. -/
+def keeps (c : Case) (tier : Tier) (target : Target) (rest : List Live) : Decision → Bool
+  | .admit id => rest.any (·.id == id)
+  | .retry id => rest.any (·.id == id)
+  | .route r => !(tier == .kill && c.covers target r.key.1)
+
 /-- Cancel or kill (`stop_scope`): mark the closure, then settle every live
-firing it reaches that waits on its backoff and signal the others, in id
-order. A cancel skips a firing already signalled. -/
+firing it reaches that waits on its backoff or its admission, and signal the
+others, in id order. A cancel skips a firing already signalled. A settled
+firing that never ran completes without running. The settled firings'
+admissions are withdrawn, and a kill withdraws the routings of what it
+reached; under a cancel, the settled firings route. -/
 def hostStop (s : State c) (tier : Tier) (target : Target) : State c :=
   let s := { s with log := s.log.push (.stop tier target) trivial }
   let s := s.dropTokens target (tier == .kill)
-  let parts := s.live.partition fun f => c.covers target f.key.1 && f.waiting
+  let parts := s.live.partition fun f => c.covers target f.key.1 && (f.waiting || s.awaiting f.id)
   let settled := parts.1
+  let ran := settled.filter (·.admitted)
   let signals := fun f : Live => c.covers target f.key.1 && (tier == .kill || !f.signalled)
   let s := { s with
     live := parts.2.map fun f => if signals f then { f with signalled := true } else f
+    held := s.held.filter (keeps c tier target parts.2)
     controls := s.controls ++ (parts.2.filter signals).map fun f => (f.key.1, f.key.2, tier.tag)
-    finished := s.finished ++ sorted (settled.map (·.key))
-    attempts := s.attempts ++ (settled.mergeSort fun a b => keyLe a.key b.key).map fun f =>
-      (f.key.1, f.key.2, f.attempt, Status.cancelled.tag) }
-  let r := decideAll (routeFuel c s + settled.length) s
-    (settled.map fun f => .route ⟨f.key, .cancelled⟩)
+    finished := s.finished ++ sorted (ran.map (·.key))
+    attempts := s.attempts ++ (ran.mergeSort fun a b => keyLe a.key b.key).map fun f =>
+      (f.key.1, f.key.2, f.attempt, Status.cancelled.tag)
+    completed := s.completed ++ (settled.filter (!·.admitted)).map (·.key) }
+  let r := raise s (if tier == .kill then [] else settled.map fun f => .route ⟨f.key, .cancelled⟩)
   { r.1 with steps := r.1.steps ++ [sorted r.2] }
 
 def act (s : State c) : Action → State c
   | .finish choice => hostFinish true s choice
   | .attempt choice => hostFinish false s choice
   | .stop tier target => hostStop s tier target
+  | .decide choice => hostDecide s choice
 
 def start (c : Case) : State c :=
   let s₀ : State c := {
     log := ⟨[], trivial⟩, keys := [], tainted := []
     firings := List.replicate c.nodes.length 0, started := List.replicate c.nodes.length 0
-    nextId := 1, live := [], steps := [], finished := [], budgetExceeded := []
+    nextId := 1, live := [], held := [], steps := [], finished := [], budgetExceeded := []
     completed := [], attempts := [], retries := [], controls := [], failed := false }
   let d := deliver s₀ ((seeds c.flow).map fun (node, edge) => ⟨node, 0, edge, false⟩)
-  let r := decideAll (routeFuel c d.1) d.1 d.2
+  let r := raise d.1 d.2
   { r.1 with steps := [sorted r.2] }
 
-/-- Host steps until nothing runs: the schedule, then the first live firing
-each step. -/
+/-- After the schedule, the host answers the oldest open decision, or else
+finishes the first admitted firing. -/
+def fallback (s : State c) : Action :=
+  if s.held.isEmpty then .finish 0 else .decide 0
+
+/-- Host steps until nothing is live or open: the schedule, then the
+fallback. -/
 def loop (c : Case) : Nat → Nat → State c → State c
   | 0, _, s => s
   | fuel + 1, k, s =>
-    if s.live.isEmpty then s
-    else loop c fuel (k + 1) (act s ((c.schedule[k]?).getD (.finish 0)))
+    if s.live.isEmpty && s.held.isEmpty then s
+    else loop c fuel (k + 1) (act s ((c.schedule[k]?).getD (fallback s)))
 
-/-- The final state: the schedule's steps plus one per firing the budgets
-allow. -/
+/-- The firings the budgets allow in all. -/
+def budget (c : Case) : Nat :=
+  (c.nodes.map (·.maxFirings)).sum
+
+/-- What the host still owes: its open decisions, twice its live firings and
+three times the firings the budgets have left. Every step after the schedule
+lowers it. -/
+def owed (s : State c) : Nat :=
+  s.held.length + 2 * s.live.length + 3 * (budget c - s.firings.sum)
+
+/-- The final state: the schedule's steps, then one step per unit the host
+owes. -/
 def runState (c : Case) : State c :=
-  loop c (c.schedule.length + (c.nodes.map (·.maxFirings)).sum + 1) 0 (start c)
+  let s := loop c c.schedule.length 0 (start c)
+  loop c (owed s + 1) c.schedule.length s
 
 def run (c : Case) : Observed :=
   let s := runState c
   let parked := (s.keys.flatMap fun ((node, generation), key) =>
       if key.fired then [] else key.tokens.map fun edge => (node, generation, edge)).mergeSort parkedLe
   let status :=
-    if !s.live.isEmpty then "unsettled"
+    if !s.live.isEmpty || !s.held.isEmpty then "unsettled"
     else if rootStopped s.log.entries then "cancelled"
     else if s.failed || !s.budgetExceeded.isEmpty then "failed"
     else "success"

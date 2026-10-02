@@ -1,10 +1,10 @@
-//! §6 resume over random flows, loops, retries and stops included. A run's
-//! log cut at any record, between two host events or inside one before the
-//! core's records for it were flushed, resumes to the state the live run had
-//! after its last whole host event. It owes exactly what the live run had
-//! outstanding there, and fed the rest of the host's events it writes the
-//! same log byte for byte: resume is invisible in the log. A log that is no
-//! prefix of its own replay is refused.
+//! §6 resume over random flows, loops, retries, stops and decisions the host
+//! holds open included. A run's log cut at any record, between two host events
+//! or inside one before the core's records for it were flushed, resumes to the
+//! state the live run had after its last whole host event. It owes exactly
+//! what the live run had outstanding there, and fed the rest of the host's
+//! events it writes the same log byte for byte: resume is invisible in the
+//! log. A log that is no prefix of its own replay is refused.
 
 mod flow;
 mod support;
@@ -85,6 +85,11 @@ fn boundaries(case: &FlowCase, wanted: BTreeSet<usize>) -> BTreeMap<usize, Bound
                 _ => {}
             }
         }
+        // A stop withdraws the admissions of the firings it settles, and a
+        // kill the routings of what it reached: the driver drops their late
+        // answers, and a resumed one does not ask again.
+        owed.decisions
+            .retain(|id, _| state.has_pending_admission(*id) || state.has_pending_routing(*id));
         if wanted.contains(&applied) {
             sink.borrow_mut().insert(applied, Boundary {
                 state: state.clone(),

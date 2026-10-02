@@ -22,6 +22,15 @@
 //! attempt and leave the firing waiting on its retry backoff, so a stop can
 //! catch it there.
 //!
+//! In some cases the host holds its decisions open, as a driver whose hooks
+//! and resolver take time does. Each admission and each routing the core asks
+//! for waits until a host step picks it and answers it, so stops, finishes and
+//! other answers land while decisions are open. Only the
+//! execution's own admission is answered at once. A host that runs a single
+//! attempt past a backoff leaves the next attempt's admission open; one that
+//! finishes a firing answers its admissions as it goes. After the schedule it
+//! answers the oldest open decision before it finishes anything.
+//!
 //! Some generated graphs break a load-time rule on purpose: an `All` join over
 //! two arms of one routing group, a `Quorum { n }` fed by fewer than `n`
 //! groups (§8 invariant 10), or a loop head that does not join with `Any`
@@ -39,7 +48,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::time::Duration;
 
-use engine::{Command, EngineState, Event, RunError};
+use engine::{Command, DecisionId, EngineState, Event, RunError};
 use ir::{
     Arm, Attempt, Backoff, Budget, CancelScopeId, Control, EdgeId, FailureInfo, FiringId, Graph,
     GraphBuilder, JoinPolicy, NodeId, Outcome, RetryOn, RetryPolicy, RunStatus, ScopeId, Status,
@@ -267,6 +276,8 @@ pub(crate) enum Action {
     Attempt(u32),
     Cancel(Target),
     Kill(Target),
+    /// Answer the open decision at position `choice % open`, oldest first.
+    Decide(u32),
 }
 
 impl Action {
@@ -290,6 +301,7 @@ impl Serialize for Action {
             Self::Attempt(choice) => Self::map_entry(serializer, "attempt", choice),
             Self::Cancel(target) => Self::map_entry(serializer, "cancel", target),
             Self::Kill(target) => Self::map_entry(serializer, "kill", target),
+            Self::Decide(choice) => Self::map_entry(serializer, "decide", choice),
         }
     }
 }
@@ -297,17 +309,22 @@ impl Serialize for Action {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 pub(crate) struct FlowCase {
     pub nodes:    Vec<NodeSpec>,
-    /// The host's steps. Once they run out, the host finishes the first live
-    /// firing until nothing runs.
+    /// The host's steps. Once they run out, the host answers the oldest open
+    /// decision, or finishes the first live firing, until nothing runs.
     pub schedule: Vec<Action>,
+    /// The host holds each decision open until a step answers it.
+    pub holds:    bool,
 }
 
 impl FlowCase {
-    /// Whether every step finishes a firing: no stop, and no single attempt.
+    /// Whether every step finishes a firing: no stop, no single attempt, and
+    /// no decision held open.
     pub(crate) fn only_finishes(&self) -> bool {
-        self.schedule
-            .iter()
-            .all(|action| matches!(action, Action::Finish(_)))
+        !self.holds
+            && self
+                .schedule
+                .iter()
+                .all(|action| matches!(action, Action::Finish(_)))
     }
 
     /// The same case with every firing cut to the last attempt its script
@@ -332,6 +349,7 @@ impl FlowCase {
         Self {
             nodes,
             schedule: self.schedule.clone(),
+            holds: self.holds,
         }
     }
 
@@ -438,9 +456,13 @@ pub(crate) struct StopAt {
     pub step:      usize,
     pub stop:      Stop,
     pub target:    Target,
+    /// The started firings still live.
     pub live:      BTreeSet<FiringId>,
     /// The live firings waiting on a retry backoff.
     pub waiting:   BTreeSet<FiringId>,
+    /// The firings whose admission the host held open, started before or
+    /// not.
+    pub admitting: BTreeSet<FiringId>,
     /// The firings an earlier stop already signalled.
     pub signalled: BTreeSet<FiringId>,
 }
@@ -455,16 +477,18 @@ pub(crate) struct ControlAt {
 /// A finished run: what was observed, plus what the host saw and the harness
 /// for invariant checks.
 pub(crate) struct Run {
-    pub observed: Observed,
-    pub starts:   Vec<Start>,
-    pub stops:    Vec<StopAt>,
-    pub controls: Vec<ControlAt>,
-    /// Firings a stop settled while they waited on a retry backoff, with the
-    /// stop's step.
-    pub settled:  BTreeMap<FiringId, usize>,
+    pub observed:  Observed,
+    pub starts:    Vec<Start>,
+    pub stops:     Vec<StopAt>,
+    pub controls:  Vec<ControlAt>,
+    /// Started firings a stop settled while they waited on a retry backoff
+    /// or on the admission of their next attempt, with the stop's step.
+    pub settled:   BTreeMap<FiringId, usize>,
     /// Each budget error's node, with the host step that raised it.
-    pub refusals: Vec<(usize, NodeId)>,
-    pub harness:  Harness,
+    pub refusals:  Vec<(usize, NodeId)>,
+    /// The held decisions a stop withdrew, in order, with the stop's step.
+    pub withdrawn: Vec<(usize, Command)>,
+    pub harness:   Harness,
 }
 
 // ── Generation ────────────────────────────────────────────────────────────
@@ -489,8 +513,8 @@ type RawNode = (
     Vec<Vec<RawArm>>,
     RawStopping,
 );
-/// A raw host step: a choice, and whether it runs a single attempt.
-type RawStep = (u32, bool);
+/// A raw host step: a choice, and a roll for what it does.
+type RawStep = (u32, u8);
 /// A raw stop: where it goes in the schedule, which tier (a cancel, a kill,
 /// or a cancel the host escalates to a kill), a target roll, and the choice
 /// of a single attempt the host runs just before it, if any.
@@ -571,9 +595,14 @@ fn raw_node() -> impl Strategy<Value = RawNode> {
     )
 }
 
-/// A case, with stops about half the time.
+/// A case: a third only finish firings, a third stop work, and a third also
+/// hold their decisions open.
 pub(crate) fn flow_case() -> impl Strategy<Value = FlowCase> {
-    prop_oneof![flow_case_without_stops(), flow_case_with_stops()]
+    prop_oneof![
+        flow_case_without_stops(),
+        flow_case_with_stops(false),
+        flow_case_with_stops(true),
+    ]
 }
 
 /// A case whose host only finishes firings: no groups, no `run_on_cancel`,
@@ -587,19 +616,21 @@ pub(crate) fn flow_case_without_stops() -> impl Strategy<Value = FlowCase> {
             )
         })
         .prop_map(|(raw, choices)| {
-            let steps: Vec<RawStep> = choices.into_iter().map(|choice| (choice, false)).collect();
-            FlowCase::from_raw(&raw, &steps, &[], false)
+            let steps: Vec<RawStep> = choices.into_iter().map(|choice| (choice, 0)).collect();
+            FlowCase::from_raw(&raw, &steps, &[], false, false)
         })
 }
 
 /// A case with one to three stops, and a host that sometimes runs a single
-/// attempt.
-fn flow_case_with_stops() -> impl Strategy<Value = FlowCase> {
+/// attempt. A host that holds its decisions also answers them, in more
+/// steps, and sometimes stops nothing.
+fn flow_case_with_stops(holds: bool) -> impl Strategy<Value = FlowCase> {
+    let stops = if holds { 0..=MAX_STOPS } else { 1..=MAX_STOPS };
     (2..=MAX_NODES)
-        .prop_flat_map(|n| {
+        .prop_flat_map(move |n| {
             (
                 prop::collection::vec(raw_node(), n),
-                prop::collection::vec((0u32..8, prop::bool::weighted(0.25)), 0..=2 * n),
+                prop::collection::vec((0u32..8, 0u8..20), 0..=if holds { 4 * n } else { 2 * n }),
                 prop::collection::vec(
                     (
                         any::<u32>(),
@@ -607,11 +638,11 @@ fn flow_case_with_stops() -> impl Strategy<Value = FlowCase> {
                         any::<u32>(),
                         prop::option::weighted(0.7, 0u32..8),
                     ),
-                    1..=MAX_STOPS,
+                    stops.clone(),
                 ),
             )
         })
-        .prop_map(|(raw, steps, stops)| FlowCase::from_raw(&raw, &steps, &stops, true))
+        .prop_map(move |(raw, steps, stops)| FlowCase::from_raw(&raw, &steps, &stops, true, holds))
 }
 
 /// `always()` only ends a group (§8 invariant 2). Forward arms are mostly
@@ -628,7 +659,13 @@ fn guard_spec(roll: u8, last: bool, back: bool, cancelled: bool) -> GuardSpec {
 }
 
 impl FlowCase {
-    fn from_raw(raw: &[RawNode], steps: &[RawStep], stops: &[RawStop], stopping: bool) -> Self {
+    fn from_raw(
+        raw: &[RawNode],
+        steps: &[RawStep],
+        stops: &[RawStop],
+        stopping: bool,
+        holds: bool,
+    ) -> Self {
         let count = u32::try_from(raw.len()).expect("a case holds at most MAX_NODES nodes");
         // Targets first: an arm with nowhere to go is dropped, and guards
         // depend on an arm's final position in its group.
@@ -734,14 +771,16 @@ impl FlowCase {
             })
             .collect();
 
+        // A quarter of the steps run a single attempt when the case stops
+        // work. A host that holds its decisions answers one in two steps, and
+        // runs single attempts as often as it finishes firings.
         let mut schedule: Vec<Action> = steps
             .iter()
-            .map(|&(choice, attempt)| {
-                if attempt {
-                    Action::Attempt(choice)
-                } else {
-                    Action::Finish(choice)
-                }
+            .map(|&(choice, roll)| match roll {
+                0..=9 if holds => Action::Decide(choice),
+                0..=4 if stopping => Action::Attempt(choice),
+                10..=14 if holds => Action::Attempt(choice),
+                _ => Action::Finish(choice),
             })
             .collect();
         // Stops land early in the run, while most of its work is still live.
@@ -749,14 +788,26 @@ impl FlowCase {
         // its backoff for the stop to settle. A cancel the host escalates to a
         // kill a few steps later, as the driver does when its cleanup grace
         // runs out (§10), lets some cancelled work route on and reaches the
-        // rest still cancelling.
+        // rest still cancelling. A host that holds its decisions starts work
+        // only as it answers them, so its stops land anywhere, and a second
+        // single attempt may leave the firing waiting on its next attempt's
+        // admission instead.
         for &(position, tier, roll, attempt) in stops {
             let target = match roll as usize % (anchors.len() + 1) {
                 0 => Target::Root,
                 group => Target::Group(anchors[group - 1]),
             };
-            let at = (position as usize % (raw.len() / 2 + 2)).min(schedule.len());
-            let mut actions: Vec<Action> = attempt.map(Action::Attempt).into_iter().collect();
+            let spread = if holds {
+                schedule.len() + 1
+            } else {
+                raw.len() / 2 + 2
+            };
+            let at = (position as usize % spread).min(schedule.len());
+            let repeats = if holds { 2 } else { 1 };
+            let mut actions: Vec<Action> = attempt
+                .into_iter()
+                .flat_map(|choice| [Action::Attempt(choice); 2].into_iter().take(repeats))
+                .collect();
             actions.push(if (5..=6).contains(&tier) {
                 Action::Kill(target)
             } else {
@@ -769,7 +820,11 @@ impl FlowCase {
                 schedule.insert(kill_at, Action::Kill(target));
             }
         }
-        Self { nodes, schedule }
+        Self {
+            nodes,
+            schedule,
+            holds,
+        }
     }
 
     /// Nodes no forward arm reaches: the entries, seeded in node order. A loop
@@ -859,25 +914,33 @@ pub(crate) fn run_observed(
 }
 
 fn run_with(case: &FlowCase, harness: Harness) -> Run {
+    let harness = if case.holds {
+        harness.holding_decisions()
+    } else {
+        harness
+    };
     let mut host = Host::new(case, harness);
-    // Every step after the schedule finishes one firing, and a node fires at
-    // most its budget, so a run that needs more steps has broken that rule;
-    // stop and report it.
-    let limit = case.schedule.len()
-        + case
-            .nodes
-            .iter()
-            .map(|node| node.max_firings as usize)
-            .sum::<usize>();
+    // Every step after the schedule answers a decision or finishes a firing.
+    // Either lowers the open decisions plus twice the live firings plus three
+    // times the firings the budgets have left, which starts below seven times
+    // the budgets, so a run that needs more steps has broken a rule; stop and
+    // report it.
+    let budgets = case
+        .nodes
+        .iter()
+        .map(|node| node.max_firings as usize)
+        .sum::<usize>();
+    let limit = case.schedule.len() + 7 * budgets + 1;
     for index in 0..=limit {
-        if host.live.is_empty() {
+        if host.live.is_empty() && host.open.is_empty() {
             break;
         }
-        let action = case
-            .schedule
-            .get(index)
-            .copied()
-            .unwrap_or(Action::Finish(0));
+        let fallback = if host.open.is_empty() {
+            Action::Finish(0)
+        } else {
+            Action::Decide(0)
+        };
+        let action = case.schedule.get(index).copied().unwrap_or(fallback);
         let step = host.steps.len();
         let errors = host.harness.state.errors().len();
         match action {
@@ -885,6 +948,7 @@ fn run_with(case: &FlowCase, harness: Harness) -> Run {
             Action::Attempt(choice) => host.finish(step, choice, false),
             Action::Cancel(target) => host.stop(step, Stop::Cancel, target),
             Action::Kill(target) => host.stop(step, Stop::Kill, target),
+            Action::Decide(choice) => host.decide(step, choice),
         }
         host.take_controls(step);
         host.take_refusals(step, errors);
@@ -897,8 +961,10 @@ struct Host<'a> {
     case:      &'a FlowCase,
     harness:   Harness,
     starts:    Vec<Start>,
-    /// Live firings by key.
+    /// Started firings still live, by key.
     live:      BTreeMap<(u32, u32), FiringId>,
+    /// The decisions the host holds, in the order the core asked for them.
+    open:      Vec<Command>,
     /// Live firings waiting on a retry backoff, with the attempt the driver
     /// feeds back next.
     waiting:   BTreeMap<FiringId, Attempt>,
@@ -912,6 +978,7 @@ struct Host<'a> {
     controls:  Vec<ControlAt>,
     settled:   BTreeMap<FiringId, usize>,
     refusals:  Vec<(usize, NodeId)>,
+    withdrawn: Vec<(usize, Command)>,
 }
 
 impl<'a> Host<'a> {
@@ -924,6 +991,7 @@ impl<'a> Host<'a> {
             harness,
             starts: Vec::new(),
             live: BTreeMap::new(),
+            open: Vec::new(),
             waiting: BTreeMap::new(),
             signalled: BTreeSet::new(),
             ordinals: Ordinals::default(),
@@ -934,16 +1002,112 @@ impl<'a> Host<'a> {
             controls: Vec::new(),
             settled: BTreeMap::new(),
             refusals: Vec::new(),
+            withdrawn: Vec::new(),
         };
+        // The execution's own admission is answered at once; its firings'
+        // decisions wait.
+        host.take_decisions();
+        if let Some(execution) = host.open.pop() {
+            assert!(
+                host.open.is_empty(),
+                "the execution asks for its admission alone"
+            );
+            host.harness.answer(&execution);
+            host.take_decisions();
+        }
         let seeded = host.drain_starts(0);
         host.started(seeded);
         host
     }
 
-    /// Finish the chosen firing, or run its next attempt only. A firing
-    /// waiting on its backoff first gets the `RetryElapsed` the driver's
-    /// sleeper feeds.
+    /// Hold the decisions the core just asked for, in the order it asked. A
+    /// host that answers at once has none: the harness answered them.
+    fn take_decisions(&mut self) {
+        if !self.case.holds {
+            return;
+        }
+        let open = &mut self.open;
+        self.harness.commands.retain(|command| {
+            let decision = matches!(
+                command,
+                Command::Admit { .. } | Command::ResolveRouting { .. }
+            );
+            if decision {
+                open.push(command.clone());
+            }
+            !decision
+        });
+    }
+
+    /// Forget the held decisions the core withdrew: a stop settles a firing
+    /// awaiting its admission, and a kill of the root drops every routing.
+    /// The driver drops a late answer to either.
+    fn drop_withdrawn(&mut self, step: usize) {
+        let state = &self.harness.state;
+        let withdrawn = &mut self.withdrawn;
+        self.open.retain(|command| {
+            let pending = match command {
+                Command::Admit { decision_id } => state.has_pending_admission(*decision_id),
+                Command::ResolveRouting { decision_id, .. } => {
+                    state.has_pending_routing(*decision_id)
+                }
+                _ => true,
+            };
+            if !pending {
+                withdrawn.push((step, command.clone()));
+            }
+            pending
+        });
+    }
+
+    /// Where the held admission of a firing's attempt is.
+    fn admission_of(&self, firing: FiringId) -> Option<usize> {
+        self.open.iter().position(|command| {
+            matches!(
+                command,
+                Command::Admit {
+                    decision_id: DecisionId::AttemptStart { firing: held, .. },
+                } if *held == firing
+            )
+        })
+    }
+
+    /// The firings whose admission the host holds.
+    fn admitting(&self) -> BTreeSet<FiringId> {
+        self.open
+            .iter()
+            .filter_map(|command| match command {
+                Command::Admit {
+                    decision_id: DecisionId::AttemptStart { firing, .. },
+                } => Some(*firing),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// Answer the held decision at position `choice % open`, and take what it
+    /// starts. The decisions it raises are held in turn.
+    fn decide(&mut self, step: usize, choice: u32) {
+        if self.open.is_empty() {
+            self.steps.push(Vec::new());
+            return;
+        }
+        let decision = self.open.remove(choice as usize % self.open.len());
+        self.harness.answer(&decision);
+        self.take_decisions();
+        let batch = self.drain_starts(step);
+        self.started(batch);
+    }
+
+    /// Finish the chosen started firing, or run its next attempt only. A
+    /// firing waiting on its backoff first gets the `RetryElapsed` the
+    /// driver's sleeper feeds; one whose next attempt waits on its admission
+    /// gets the answer. With nothing started, the step does nothing.
     fn finish(&mut self, step: usize, choice: u32, every_attempt: bool) {
+        if self.live.is_empty() {
+            self.steps.push(Vec::new());
+            return;
+        }
         let index = choice as usize % self.live.len();
         let (&key, &firing) = self
             .live
@@ -951,11 +1115,17 @@ impl<'a> Host<'a> {
             .nth(index)
             .expect("the index is below live.len()");
         if let Some(next_attempt) = self.waiting.remove(&firing) {
-            self.resume(step, firing, next_attempt);
+            if !self.resume(step, firing, next_attempt, every_attempt) {
+                self.steps.push(Vec::new());
+                return;
+            }
+        } else if self.admission_of(firing).is_some() {
+            self.take_attempt(step, firing);
         }
         loop {
             self.report(step, firing);
             let retry = self.take_retry(firing);
+            self.take_decisions();
             let batch = self.drain_starts(step);
             let Some(next_attempt) = retry else {
                 self.live.remove(&key);
@@ -970,20 +1140,44 @@ impl<'a> Host<'a> {
                 self.steps.push(Vec::new());
                 return;
             }
-            self.resume(step, firing, next_attempt);
+            self.resume(step, firing, next_attempt, true);
         }
     }
 
-    /// Feed a firing's `RetryElapsed` and take the attempt it starts.
-    fn resume(&mut self, step: usize, firing: FiringId, next_attempt: Attempt) {
+    /// Feed a firing's `RetryElapsed` and take the attempt it starts. A host
+    /// that holds its decisions answers the attempt's admission only when
+    /// `answer` is set; otherwise it stays open, and this returns false.
+    fn resume(
+        &mut self,
+        step: usize,
+        firing: FiringId,
+        next_attempt: Attempt,
+        answer: bool,
+    ) -> bool {
         self.harness.feed(Event::RetryElapsed {
             firing,
             next_attempt,
         });
+        self.take_decisions();
+        if self.case.holds && !answer {
+            return false;
+        }
+        self.take_attempt(step, firing);
+        true
+    }
+
+    /// Take the attempt a firing's admission starts, answering the admission
+    /// first when the host holds it.
+    fn take_attempt(&mut self, step: usize, firing: FiringId) {
+        if let Some(position) = self.admission_of(firing) {
+            let admission = self.open.remove(position);
+            self.harness.answer(&admission);
+            self.take_decisions();
+        }
         let batch = self.drain_starts(step);
         assert!(
             batch.len() == 1 && batch[0].firing == firing,
-            "a retry starts its own firing's next attempt and nothing else"
+            "an admission starts its own firing's attempt and nothing else"
         );
         self.starts.extend(batch);
     }
@@ -1027,10 +1221,11 @@ impl<'a> Host<'a> {
         }
     }
 
-    /// Cancel or kill a scope. A firing waiting on its backoff has no work in
-    /// flight, so the stop settles it at once (§5); the driver's sleeper
-    /// cannot be recalled, and its `RetryElapsed` still arrives, unless the
-    /// settle ended the run: the driver stops feeding the core at the finish.
+    /// Cancel or kill a scope. A firing waiting on its backoff or on its
+    /// admission has no work in flight, so the stop settles it at once (§5).
+    /// The driver's sleeper cannot be recalled, and its `RetryElapsed` still
+    /// arrives, unless the settle ended the run: the driver stops feeding the
+    /// core at the finish.
     fn stop(&mut self, step: usize, stop: Stop, target: Target) {
         self.stops.push(StopAt {
             step,
@@ -1038,6 +1233,7 @@ impl<'a> Host<'a> {
             target,
             live: self.live.values().copied().collect(),
             waiting: self.waiting.keys().copied().collect(),
+            admitting: self.admitting(),
             signalled: self.signalled.clone(),
         });
         let event = match (stop, target) {
@@ -1051,27 +1247,25 @@ impl<'a> Host<'a> {
         let settled: Vec<((u32, u32), FiringId)> = self
             .live
             .iter()
-            .filter(|(_, firing)| {
-                self.waiting.contains_key(*firing) && self.harness.state.firing(**firing).is_none()
-            })
+            .filter(|(_, firing)| self.harness.state.firing(**firing).is_none())
             .map(|(key, firing)| (*key, *firing))
             .collect();
         for (key, firing) in settled {
-            let next_attempt = self
-                .waiting
-                .remove(&firing)
-                .expect("only waiting firings settle");
             self.live.remove(&key);
             self.finished.push(key);
             self.settled.insert(firing, step);
             self.record_attempts(key, firing);
-            if self.harness.status.is_none() {
+            if let Some(next_attempt) = self.waiting.remove(&firing)
+                && self.harness.status.is_none()
+            {
                 self.harness.feed(Event::RetryElapsed {
                     firing,
                     next_attempt,
                 });
             }
         }
+        self.take_decisions();
+        self.drop_withdrawn(step);
         let batch = self.drain_starts(step);
         self.started(batch);
     }
@@ -1106,6 +1300,10 @@ impl<'a> Host<'a> {
             _ => true,
         });
         for (firing, ctl) in delivered {
+            assert!(
+                self.starts.iter().any(|start| start.firing == firing),
+                "the core sent {ctl:?} to {firing}, which never started"
+            );
             let stop = match ctl {
                 Control::Cancel => Stop::Cancel,
                 Control::Kill => Stop::Kill,
@@ -1125,25 +1323,22 @@ impl<'a> Host<'a> {
         }
     }
 
-    /// The attempts entry for a firing that just finished or settled.
+    /// The attempts entry for a firing that just finished or settled: the
+    /// attempt its record names, which is the next one when a stop settled it
+    /// awaiting that attempt's admission.
     fn record_attempts(&mut self, key: (u32, u32), firing: FiringId) {
-        let attempt = self
-            .starts
-            .iter()
-            .rev()
-            .find(|start| start.firing == firing)
-            .map_or(1, |start| start.attempt);
-        let status = self
+        let record = self
             .harness
             .state
             .history()
             .iter()
             .rev()
-            .find(|record| record.firing == firing)
-            .map_or_else(
-                || "unrecorded".to_owned(),
-                |record| record_tag(&record.outcome.status),
-            );
+            .find(|record| record.firing == firing);
+        let attempt = record.map_or(1, |record| record.attempt.raw());
+        let status = record.map_or_else(
+            || "unrecorded".to_owned(),
+            |record| record_tag(&record.outcome.status),
+        );
         self.attempts.push((key.0, key.1, attempt, status));
     }
 
@@ -1268,6 +1463,7 @@ impl<'a> Host<'a> {
             controls: self.controls,
             settled: self.settled,
             refusals: self.refusals,
+            withdrawn: self.withdrawn,
             harness,
         }
     }

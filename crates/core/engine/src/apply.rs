@@ -1778,7 +1778,8 @@ fn on_cancel(state: &mut EngineState, scope: CancelScopeId, cmds: &mut Vec<Comma
 /// The forced tier: the pre-v3 cancel behavior, kept under its own event.
 /// Tokens drop, nothing routes, nothing is admitted — `run_on_cancel` included
 /// — and `Control::Kill` reaches every live firing, already-cancelling ones
-/// too.
+/// too. An outcome recorded before the kill whose routing is still open does
+/// not route either.
 fn on_kill(state: &mut EngineState, scope: CancelScopeId, cmds: &mut Vec<Command>) {
     if scope == CancelScopeId::ROOT {
         state.clear_restart();
@@ -1789,6 +1790,8 @@ fn on_kill(state: &mut EngineState, scope: CancelScopeId, cmds: &mut Vec<Command
     // never ran.
     if scope == CancelScopeId::ROOT {
         state.clear_pending_decisions();
+    } else {
+        state.withdraw_killed_routings();
     }
 }
 

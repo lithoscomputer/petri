@@ -1,23 +1,24 @@
-//! §3/§4/§5 over random flows, loops, retries and stops included: the join,
-//! generation, budget, retry, cancel and kill rules hold for every graph and
-//! every order a host takes its steps in, not only for the hand-written cases
-//! in `joins.rs`, `loops.rs`, `retries.rs` and `cancellation.rs`. §8
-//! invariant 10 is checked against the same runs: a join it rejects never
-//! runs.
+//! §3/§4/§5 over random flows, loops, retries, stops and decisions the host
+//! holds open included: the join, generation, budget, retry, cancel and kill
+//! rules hold for every graph and every order a host takes its steps and
+//! answers its decisions in, not only for the hand-written cases in
+//! `joins.rs`, `loops.rs`, `retries.rs` and `cancellation.rs`. §8 invariant 10
+//! is checked against the same runs: a join it rejects never runs.
 
 mod flow;
 mod support;
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use engine::{EngineState, Event, RunError};
+use engine::{Command, EngineState, Event, RunError};
 use flow::{FlowCase, JoinSpec, Run, Start, Stop, Target};
 use ir::{
     CancelScopeId, EdgeId, FiringId, Graph, NodeId, Status, UnderlyingFailure, ValidationError,
     validate,
 };
 use proptest::prelude::*;
-use proptest::test_runner::TestCaseError;
+use proptest::strategy::ValueTree;
+use proptest::test_runner::{TestCaseError, TestRunner};
 
 /// The edges that count toward a node's join: its declared incoming edges
 /// plus the seed edge an entry node gets.
@@ -415,8 +416,14 @@ fn check_stops(case: &FlowCase, run: &Run, firings: &Firings<'_>) -> Result<(), 
     }
 
     // A key that completes without running is unmarked work a stop reached,
-    // directly or through its inputs, and it records `Cancelled`.
+    // directly or through its inputs, or a firing a stop settled while its
+    // admission was open, and it records `Cancelled`.
     let started: BTreeSet<FiringId> = run.starts.iter().map(|start| start.firing).collect();
+    let settled_admitting = |record: &engine::FiringRecord| {
+        run.stops.iter().any(|stop| {
+            stop.admitting.contains(&record.firing) && case.covers(stop.target, record.node.raw())
+        })
+    };
     for record in state
         .history()
         .iter()
@@ -429,7 +436,8 @@ fn check_stops(case: &FlowCase, run: &Run, firings: &Firings<'_>) -> Result<(), 
             record.node
         );
         prop_assert!(
-            !case.nodes[record.node.index()].run_on_cancel && !run.stops.is_empty(),
+            settled_admitting(record)
+                || !case.nodes[record.node.index()].run_on_cancel && !run.stops.is_empty(),
             "{} completed without running, but it is marked or nothing was stopped",
             record.node
         );
@@ -438,12 +446,16 @@ fn check_stops(case: &FlowCase, run: &Run, firings: &Firings<'_>) -> Result<(), 
     for stop in &run.stops {
         let covered = |firing: &FiringId| case.covers(stop.target, node_of[firing].raw());
         // Each live firing the stop reaches gets one signal, unless it waits
-        // on its backoff, which the stop settles instead. A cancel skips a
-        // firing already signalled; a kill reaches it anyway.
+        // on its backoff or its admission, which the stop settles instead. A
+        // cancel skips a firing already signalled; a kill reaches it anyway.
         let expected: BTreeSet<FiringId> = stop
             .live
             .iter()
-            .filter(|firing| covered(firing) && !stop.waiting.contains(firing))
+            .filter(|firing| {
+                covered(firing)
+                    && !stop.waiting.contains(firing)
+                    && !stop.admitting.contains(firing)
+            })
             .filter(|firing| stop.stop == Stop::Kill || !stop.signalled.contains(firing))
             .copied()
             .collect();
@@ -469,7 +481,8 @@ fn check_stops(case: &FlowCase, run: &Run, firings: &Firings<'_>) -> Result<(), 
             stop.stop
         );
         // A firing waiting on its backoff is settled at once, and records
-        // `Cancelled`.
+        // `Cancelled`; so is one waiting on its admission, started before or
+        // not.
         for firing in stop.waiting.iter().filter(|firing| covered(firing)) {
             prop_assert_eq!(
                 run.settled.get(firing),
@@ -478,6 +491,31 @@ fn check_stops(case: &FlowCase, run: &Run, firings: &Firings<'_>) -> Result<(), 
                 firing,
                 stop.stop,
                 stop.step
+            );
+        }
+        for firing in &stop.admitting {
+            let record = state
+                .history()
+                .iter()
+                .find(|record| record.firing == *firing);
+            let Some(record) = record else {
+                continue;
+            };
+            if !case.covers(stop.target, record.node.raw()) {
+                continue;
+            }
+            prop_assert!(
+                !stop.live.contains(firing) || run.settled.get(firing) == Some(&stop.step),
+                "{} waited on its admission through the {:?} in step {}",
+                firing,
+                stop.stop,
+                stop.step
+            );
+            prop_assert_eq!(
+                &record.outcome.status,
+                &Status::Cancelled,
+                "{} settled awaiting its admission",
+                firing
             );
         }
     }
@@ -572,6 +610,66 @@ fn check_flow(case: &FlowCase) -> Result<(), TestCaseError> {
         return Err(TestCaseError::fail(format!("replay diverged: {mismatch}")));
     }
     Ok(())
+}
+
+/// The generated cases reach each path a held decision opens, so the rules
+/// above are checked on them: a stop settles a firing waiting on its first
+/// admission, and one waiting on its next attempt's, and a kill of the root
+/// or of a group withdraws the routings still open inside it.
+#[test]
+fn held_decisions_reach_their_paths() {
+    let mut runner = TestRunner::deterministic();
+    let mut seen: BTreeMap<&str, usize> = BTreeMap::new();
+    for _ in 0..2048 {
+        let case = flow::flow_case()
+            .new_tree(&mut runner)
+            .expect("a case generates")
+            .current();
+        let run = flow::run(&case);
+        let state = &run.harness.state;
+        let started: BTreeSet<FiringId> = run.starts.iter().map(|start| start.firing).collect();
+        for stop in &run.stops {
+            for firing in &stop.admitting {
+                let covered = state.history().iter().any(|record| {
+                    record.firing == *firing && case.covers(stop.target, record.node.raw())
+                });
+                let path = if run.settled.get(firing) == Some(&stop.step) {
+                    "a stop settled a firing waiting on its next attempt's admission"
+                } else if covered && !started.contains(firing) {
+                    "a stop settled a firing waiting on its first admission"
+                } else {
+                    continue;
+                };
+                *seen.entry(path).or_default() += 1;
+            }
+        }
+        for (step, command) in &run.withdrawn {
+            let Command::ResolveRouting { .. } = command else {
+                continue;
+            };
+            let stop = run
+                .stops
+                .iter()
+                .find(|stop| stop.step == *step)
+                .expect("only a stop withdraws a decision");
+            let path = match stop.target {
+                Target::Root => "a root kill withdrew an open routing",
+                Target::Group(_) => "a group kill withdrew an open routing",
+            };
+            *seen.entry(path).or_default() += 1;
+        }
+    }
+    for path in [
+        "a stop settled a firing waiting on its first admission",
+        "a stop settled a firing waiting on its next attempt's admission",
+        "a root kill withdrew an open routing",
+        "a group kill withdrew an open routing",
+    ] {
+        assert!(
+            seen.get(path).copied().unwrap_or_default() > 0,
+            "no case reached {path}: {seen:?}"
+        );
+    }
 }
 
 proptest! {

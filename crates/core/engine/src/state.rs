@@ -837,6 +837,20 @@ impl EngineState {
         route
     }
 
+    /// Withdraw the routing decisions still open for nodes a kill reached: a
+    /// killed closure routes nothing, whenever its outcome was recorded.
+    pub(crate) fn withdraw_killed_routings(&mut self) {
+        let killed: Vec<FiringId> = self
+            .pending_routing
+            .values()
+            .filter(|pending| self.is_node_killed(pending.node.id))
+            .map(|pending| pending.firing)
+            .collect();
+        for firing in killed {
+            self.take_pending_routing(firing);
+        }
+    }
+
     pub(crate) fn clear_pending_decisions(&mut self) {
         self.pending_admissions.clear();
         let nodes: Vec<_> = self

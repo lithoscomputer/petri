@@ -102,16 +102,19 @@ def action (j : Json) : Except String Control.Action :=
   match j.getNat? with
   | .ok choice => pure (.finish choice)
   | .error _ =>
-    match j.getObjValD "attempt", j.getObjValD "cancel", j.getObjValD "kill" with
-    | .null, .null, .null => throw s!"unknown host step `{j.compress}`"
-    | .null, .null, t => return .stop .kill (← target t)
-    | .null, t, _ => return .stop .cancel (← target t)
-    | n, _, _ => return .attempt (← n.getNat?)
+    match j.getObjValD "attempt", j.getObjValD "cancel", j.getObjValD "kill",
+        j.getObjValD "decide" with
+    | .null, .null, .null, .null => throw s!"unknown host step `{j.compress}`"
+    | .null, .null, .null, n => return .decide (← n.getNat?)
+    | .null, .null, t, _ => return .stop .kill (← target t)
+    | .null, t, _, _ => return .stop .cancel (← target t)
+    | n, _, _, _ => return .attempt (← n.getNat?)
 
 def flowCase (j : Json) : Except String Control.Case := do
   return {
     nodes := ← list (← field j "nodes") node
-    schedule := ← list (← field j "schedule") action }
+    schedule := ← list (← field j "schedule") action
+    holds := ← (j.getObjValD "holds").getBool? <|> pure false }
 
 def nats (ns : List Nat) : Json :=
   .arr (ns.map toJson).toArray

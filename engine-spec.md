@@ -301,7 +301,9 @@ scope-addressed like `CancelRequested` (a kill of `ROOT` kills the run).
 Killing marks the scope closure killed (killed implies cancelled), drops its
 pending and deferred tokens, swallows tokens aimed inside it, records live
 firings' outcomes **without routing**, and admits nothing — `run_on_cancel`
-included. Delivery is `Control::Kill`, sent to **every** live firing in the
+included. It also withdraws the routing decisions still open for outcomes
+recorded inside it before the kill, so nothing routes out of a killed closure,
+however long the host took to decide; the driver drops the late answers. Delivery is `Control::Kill`, sent to **every** live firing in the
 closure, already-cancelling ones included; a step kind receiving it goes
 straight to `SIGKILL`, no ladder. No new `Status` or `RunStatus` variant: how a
 firing was stopped is a mode, not an outcome — a killed firing records

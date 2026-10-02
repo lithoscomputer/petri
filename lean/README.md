@@ -18,7 +18,7 @@ Nothing here translates Rust into Lean.
 | `PetriModel/Pick.lean` | `deterministic_pick` in `crates/core/engine/src/apply.rs` | `engine-spec.md` §2, §6 |
 | `PetriModel/Flow.lean` | a whole run of the flows the Rust generator makes, loops and budgets included, as routing sees it | `crates/core/engine/tests/flow/mod.rs`, `engine-spec.md` §4 |
 | `PetriModel/Retry.lean` | `RetryPolicy` (`should_retry`, `finalize`, `base_delay`) and the retry path of `on_step_finished` | `crates/core/ir/src/graph.rs`, `engine-spec.md` §3.1, §4 |
-| `PetriModel/Control.lean` | a whole run with stops: `stop_scope`, the cancel admission and quiet budget refusal in `try_fire`, the kill checks in `on_token` and `on_step_finished`, and a host that can run a single attempt | `crates/core/engine/tests/flow/mod.rs`, `engine-spec.md` §4, §5 |
+| `PetriModel/Control.lean` | a whole run with stops: `stop_scope`, `on_kill`, the cancel admission and quiet budget refusal in `try_fire`, the kill checks in `on_token` and `on_step_finished`, and a host that can run a single attempt and hold its decisions open | `crates/core/engine/tests/flow/mod.rs`, `engine-spec.md` §4, §5 |
 
 In the flow model, a back arm starts the next generation, joins match per
 `(node, generation)`, and a node fires at most its budget; a key the budget
@@ -31,11 +31,16 @@ The control model runs the same cases with the host's stops: a cancel or
 kill of the root or of a declared group, `run_on_cancel`, the `cancelled()`
 guard, a host that honors or ignores a stop signal, and a firing left waiting
 on its retry backoff. It follows the engine's order exactly. The core hands
-the host an admission for each firing it starts and a routing for each
-outcome it records, and the harness answers them depth first. A firing's
-number among its node's started firings, which picks its script, is fixed
-when its admission is answered. Firing ids order the signals and the
-settles. All models leave out expansions, preconditions and splices. The Rust
+the host an admission for each attempt it starts and a routing for each
+outcome it records. A host that answers at once answers them depth first. A
+host that holds its decisions, as a driver whose hooks and resolver take
+time does, keeps them open, oldest first, until a step answers one, so stops
+and finishes land in between. A stop settles a firing waiting on its
+admission, as it settles one waiting on its backoff, and withdraws the
+decision; a kill also withdraws the open routings of what it reached. A
+firing's number among its node's started firings, which picks its script, is
+fixed when its first admission is answered. Firing ids order the signals and
+the settles. All models leave out expansions, preconditions and splices. The Rust
 generator does not produce them either.
 
 The base delay is computed in `Float`, which is IEEE 754 double precision
@@ -105,11 +110,17 @@ break one. These theorems read the rules back out of any run:
 - `killed_routes_nothing`: nothing routes out of a killed closure.
 - `stop_status`: a settled run ends `cancelled` exactly when its log holds a
   stop of the root.
-- `run_settles`: every run ends with nothing live within the steps of its
-  schedule plus one per firing its budgets allow, so it never reports
-  `unsettled` (`run_not_unsettled`). A completion without running counts
-  against the budget, and each host step after the schedule finishes a
-  firing.
+- `run_settles`: every run ends with nothing live and no decision open, so
+  it never reports `unsettled` (`run_not_unsettled`), even when the host
+  holds its decisions and stops land between them. Two invariants carry it.
+  The budget counts stay within the budgets. And every live firing was
+  admitted, or its admission is open (`Held`). A stop keeps `Held` only
+  because it settles each firing whose admission it withdraws. A kill that
+  dropped the open admissions and left their firings live, as the engine's
+  once did, breaks the proof. After the schedule, each host step answers a
+  decision or finishes a firing, and lowers what the host owes: its open
+  decisions, twice its live firings, and three times the firings the budgets
+  have left.
 
 Not proved yet: that the control model, with a host that only finishes
 firings, runs as `Spec.run` does, which would carry the flow and retry
@@ -153,7 +164,8 @@ real core's:
   after each host step, the order they finish in, the tokens left waiting at
   the end, the budget refusals, the run status, each firing's attempts and
   recorded status, each retry's base delay, the stop signals, and the keys
-  that completed without running. It runs `Control.run`, stops included.
+  that completed without running. It runs `Control.run`, stops and held
+  decisions included.
 - `deterministic_pick_matches_the_lean_model`: the picked edge, or the
   reason for a refusal. A new refusal message in Rust fails the test until
   the model has it too.

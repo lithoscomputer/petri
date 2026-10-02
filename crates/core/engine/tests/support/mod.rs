@@ -99,6 +99,9 @@ pub(crate) struct Harness {
     /// Called after every `apply` with the new state and the commands it
     /// produced.
     observer:              Option<Observer>,
+    /// Leave each `Admit` and `ResolveRouting` in `commands` for the test to
+    /// answer, instead of answering it at once.
+    hold_decisions:        bool,
 }
 
 impl Harness {
@@ -113,7 +116,15 @@ impl Harness {
             scheduled_retries: Vec::new(),
             status:            None,
             observer:          None,
+            hold_decisions:    false,
         }
+    }
+
+    /// Leave every decision the core asks for open: the test answers each
+    /// one with [`Self::answer`], when it chooses.
+    pub(crate) fn holding_decisions(mut self) -> Self {
+        self.hold_decisions = true;
+        self
     }
 
     /// Watch the run as it goes: every `apply`'s new state and the commands
@@ -251,43 +262,53 @@ impl Harness {
             }
         }
         self.commands.extend(commands.iter().cloned());
-        for command in commands {
-            match &command {
-                Command::Admit { decision_id } => {
-                    let event = Event::AdmissionDecided {
-                        decision_id: *decision_id,
-                        decision:    Admission::Admit,
-                        trace:       Vec::new(),
-                    };
-                    self.feed(event);
-                }
-                Command::ResolveRouting {
-                    decision_id,
-                    restart_allowed,
-                    groups,
-                } => {
-                    let decisions = groups
-                        .iter()
-                        .map(|proposal| {
-                            let (decision, draw) = resolve_group(proposal);
-                            let decision =
-                                engine::enforce_restart_limit(*restart_allowed, proposal, decision);
-                            GroupDecision {
-                                group: proposal.group,
-                                draw,
-                                trace: Vec::new(),
-                                decision,
-                            }
-                        })
-                        .collect();
-                    let event = Event::RoutingResolved {
-                        decision_id: *decision_id,
-                        groups:      decisions,
-                    };
-                    self.feed(event);
-                }
-                _ => {}
+        if self.hold_decisions {
+            return;
+        }
+        for command in &commands {
+            self.answer(command);
+        }
+    }
+
+    /// Answer a decision the core asked for, as the host does: admit the
+    /// attempt, or resolve each routing group. Any other command is no
+    /// decision, and is left alone.
+    pub(crate) fn answer(&mut self, command: &Command) {
+        match command {
+            Command::Admit { decision_id } => {
+                let event = Event::AdmissionDecided {
+                    decision_id: *decision_id,
+                    decision:    Admission::Admit,
+                    trace:       Vec::new(),
+                };
+                self.feed(event);
             }
+            Command::ResolveRouting {
+                decision_id,
+                restart_allowed,
+                groups,
+            } => {
+                let decisions = groups
+                    .iter()
+                    .map(|proposal| {
+                        let (decision, draw) = resolve_group(proposal);
+                        let decision =
+                            engine::enforce_restart_limit(*restart_allowed, proposal, decision);
+                        GroupDecision {
+                            group: proposal.group,
+                            draw,
+                            trace: Vec::new(),
+                            decision,
+                        }
+                    })
+                    .collect();
+                let event = Event::RoutingResolved {
+                    decision_id: *decision_id,
+                    groups:      decisions,
+                };
+                self.feed(event);
+            }
+            _ => {}
         }
     }
 
