@@ -29,4 +29,5 @@ pub use run::{
     ResumeInfo, RunConfig, RunGuard, RunHandle, SandboxAssignment, ScopeLease, ScopeLeaseAllocator,
     ScopeLeases,
 };
+pub use sink::{StepLogDir, StepLogStore};
 pub use view::{BRANCH_ROLE_META, BranchMap, BranchRef, BranchRole, FiringView};

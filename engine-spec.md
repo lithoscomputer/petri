@@ -856,8 +856,9 @@ ordered. Every duration it records, such as `scope.acquired`'s
 records comes from `RunConfig.recording_clock`, the wall clock by default. Its
 one draw, for a weighted routing tier, comes from the operating system in
 `DefaultDecisionResolver` and from a seed in `SeededDecisionResolver`; the
-draw is in the log either way, so replay never needs it. The step-log sink
-still writes through `tokio::fs`, outside a single-threaded simulation.
+draw is in the log either way, so replay never needs it. Step output goes
+to `RunConfig.step_logs`, a `StepLogStore`: the run directory's `logs/` by
+default, memory in a simulation.
 
 **Timeout accounting.** `Budget.timeout_policy` says who enforces the
 per-attempt timeout. `ExecutorEnforced` (the default): the driver arms the

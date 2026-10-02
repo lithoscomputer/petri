@@ -22,6 +22,7 @@ pub(crate) use testkit::*;
 use tokio::time;
 
 pub(crate) mod sim;
+pub(crate) mod world;
 
 // ── Helpers over the log and report ───────────────────────────────────────
 

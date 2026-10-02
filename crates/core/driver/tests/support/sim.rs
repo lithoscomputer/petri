@@ -138,7 +138,9 @@ impl Step for ScriptedStep {
         let work = time::sleep(Duration::from_millis(pick(&config.work_ms).unwrap_or(0)));
         tokio::pin!(work);
         loop {
+            // In a fixed order, as everything in a simulation.
             tokio::select! {
+                biased;
                 () = &mut work => break,
                 ctl = ctx.control.recv() => match ctl {
                     Some(Control::Deliver(_)) => {}

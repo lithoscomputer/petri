@@ -42,7 +42,7 @@ use crate::lifecycle::{
     apply_transition,
 };
 use crate::observe::{EventObserver, ObserveError, RecordingClock};
-use crate::sink::LogSink;
+use crate::sink::{LogSink, StepLogStore};
 use crate::view::{BranchMap, live_view, routing_view};
 use crate::{
     AdmissionResolution, AdmitRequest, DecisionResolver, DefaultDecisionResolver, RoutingRequest,
@@ -125,6 +125,9 @@ pub struct RunConfig {
     /// The clock the driver stamps each observed record with: the wall clock
     /// unless a host passes a virtual one.
     pub recording_clock:     RecordingClock,
+    /// Where step output goes: the run directory's `logs/` unless a host
+    /// passes another store.
+    pub step_logs:           Option<Arc<dyn StepLogStore>>,
 }
 
 /// Which durable lease each scope of an execution acquires its sandbox under.
@@ -185,6 +188,7 @@ impl RunConfig {
             scope_leases:        ScopeLeases::None,
             run_owner:           true,
             recording_clock:     RecordingClock::default(),
+            step_logs:           None,
         }
     }
 
@@ -198,6 +202,13 @@ impl RunConfig {
     #[must_use]
     pub fn with_recording_clock(mut self, clock: RecordingClock) -> Self {
         self.recording_clock = clock;
+        self
+    }
+
+    /// Keep step output in `store` instead of the run directory.
+    #[must_use]
+    pub fn with_step_logs(mut self, store: Arc<dyn StepLogStore>) -> Self {
+        self.step_logs = Some(store);
         self
     }
 
@@ -872,8 +883,10 @@ impl Driver {
         config: RunConfig,
     ) -> Self {
         let start = engine.start().cloned().unwrap_or_default();
-        let sink =
-            Arc::new(LogSink::new(&config.run_dir, secrets.masker()).with_echo(config.echo_logs));
+        let sink = Arc::new(
+            LogSink::new(&config.run_dir, config.step_logs.as_ref(), secrets.masker())
+                .with_echo(config.echo_logs),
+        );
         let (tx, rx) = mpsc::channel(SIGNAL_CHANNEL_CAPACITY);
         let (abandoned_tx, abandoned_rx) = mpsc::unbounded_channel();
         Self {
@@ -1011,9 +1024,13 @@ impl Driver {
         self.config.run_owner = run_owner;
         if !run_owner && let Some(prefix) = self.config.workspace_prefix.clone() {
             self.sink = Arc::new(
-                LogSink::new(&self.config.run_dir, self.secrets.masker())
-                    .with_echo(self.config.echo_logs)
-                    .with_label(&prefix),
+                LogSink::new(
+                    &self.config.run_dir,
+                    self.config.step_logs.as_ref(),
+                    self.secrets.masker(),
+                )
+                .with_echo(self.config.echo_logs)
+                .with_label(&prefix),
             );
         }
         self

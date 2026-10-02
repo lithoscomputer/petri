@@ -101,6 +101,25 @@ skips the comparison; `mise run test:lean` builds the model and requires it,
 as the `lean model` CI job does. A new Lean or elan version must be at least
 a day old, like every other tool here.
 
+## Driver simulation
+
+`crates/core/driver/tests/simulation.rs` is deterministic simulation testing
+of the driver. Each seed builds a workflow, host stops and crashes, and runs
+the real driver against a simulated sandbox world on a paused, single-threaded
+runtime; every choice comes from the seed, so a seed always runs the same way.
+`mise run test` runs 128 seeds in well under a second. To run more, or to
+replay a failing seed with a trace of what it did:
+
+```sh
+PETRI_DST_SEEDS=50000 cargo nextest run -p petri-driver --test simulation
+PETRI_DST_SEED=1234 PETRI_DST_TRACE=1 cargo nextest run -p petri-driver \
+  --test simulation --no-capture
+```
+
+Keep the simulation deterministic: every `select!` it or the driver runs is
+`biased;`, maps it iterates are ordered, and time comes from the runtime's
+clock. `a_seeded_world_replays_byte_for_byte` checks it.
+
 ## Diagnostics
 
 Set `PETRI_LOG` to see tracing output on stderr. The default is `warn`. Use
