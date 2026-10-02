@@ -162,3 +162,70 @@ fn every_iteration_appears_in_the_event_log() {
     assert_eq!(finished, 4, "plan, work, work, done");
     assert_eq!(h.state.log.version(), engine::LOG_VERSION);
 }
+
+/// A token leaving a loop keeps the loop's generation, and a join matches
+/// tokens of one generation. So an `All` join that meets a loop's exit and a
+/// branch that skips the loop fires only when the loop exits in generation
+/// 0: with two items the exit arrives in generation 1, the join waits
+/// forever, and the run still reports success. Validation warns about the
+/// shape (`lint.join_across_generations`).
+#[test]
+fn an_all_join_after_a_loop_matches_only_a_loop_that_never_iterated() {
+    let run = |items: Value| {
+        let mut b = GraphBuilder::new();
+        let scope = ir::ScopeId::new(0);
+        let start = b.add_step("start", scope, NOOP);
+        let plan = b.add_step("plan", scope, NOOP);
+        let work = b.add_step("work", scope, NOOP);
+        let side = b.add_step("side", scope, NOOP);
+        let report = b.add_step("report", scope, NOOP);
+        b.fan_out(start, &[plan, side]);
+        sequential_for_each(&mut b, plan, work, work, report, 10);
+        b.link(side, report);
+        b.set_join(report, JoinPolicy::All);
+        let graph = b.build();
+        validate(&graph).expect("valid");
+        let warnings: Vec<&str> = ir::check(&graph)
+            .warnings
+            .iter()
+            .map(ir::ValidationWarning::code)
+            .collect();
+        assert_eq!(warnings, ["lint.join_across_generations"]);
+
+        let mut h = Harness::new(graph).respond_with(move |info| match info.base.as_str() {
+            "plan" => Outcome::success(items.clone()),
+            _ => Outcome::success(Value::Null),
+        });
+        let status = h.run();
+        let waiting: Vec<u32> = h
+            .state
+            .pending_tokens()
+            .filter(|((node, _), _)| *node == report)
+            .map(|((_, generation), _)| generation.raw())
+            .collect();
+        (status, h, waiting)
+    };
+
+    let (status, h, waiting) = run(json!(["a"]));
+    assert_eq!(status, RunStatus::Success);
+    assert_eq!(
+        h.start_count("report"),
+        1,
+        "one item: the loop exits in generation 0"
+    );
+    assert!(waiting.is_empty());
+
+    let (status, h, waiting) = run(json!(["a", "b"]));
+    assert_eq!(
+        status,
+        RunStatus::Success,
+        "nothing failed, so the run reports success"
+    );
+    assert_eq!(h.start_count("work"), 2);
+    assert_eq!(h.start_count("report"), 0, "report never runs");
+    assert_eq!(
+        waiting,
+        vec![0, 1],
+        "the side branch waits in generation 0, the loop's exit in generation 1"
+    );
+}

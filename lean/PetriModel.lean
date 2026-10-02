@@ -4,3 +4,4 @@ import PetriModel.Flow
 import PetriModel.Wire
 import PetriModel.Thm.Join
 import PetriModel.Thm.Pick
+import PetriModel.Thm.Flow
