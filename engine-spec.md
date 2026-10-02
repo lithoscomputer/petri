@@ -290,7 +290,11 @@ the request by node name and is available as a driver-provided step capability.
    recalled, and replay must stay clean. Every other invalid `RetryElapsed` —
    unknown firing, not awaiting, duplicate after the tombstone is consumed —
    still raises `UnknownFiring` / `UnexpectedRetry`; the no-op is
-   cancellation-specific, never a blanket swallow of malformed input.
+   cancellation-specific, never a blanket swallow of malformed input. A
+   firing **awaiting its admission** has no step either, and settles the same
+   way: its pending decision is withdrawn, and the driver drops the late
+   answer. A kill of `ROOT` settles these firings before it drops the run's
+   other pending decisions.
 
 **Kill** (`Event::KillRequested { scope }`) stops the scope: the forced tier,
 scope-addressed like `CancelRequested` (a kill of `ROOT` kills the run).

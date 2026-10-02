@@ -1782,9 +1782,14 @@ fn on_cancel(state: &mut EngineState, scope: CancelScopeId, cmds: &mut Vec<Comma
 fn on_kill(state: &mut EngineState, scope: CancelScopeId, cmds: &mut Vec<Command>) {
     if scope == CancelScopeId::ROOT {
         state.clear_restart();
-        state.clear_pending_decisions();
     }
     stop_scope(state, scope, true, true, cmds);
+    // After the stop: a firing awaiting admission is settled by its pending
+    // decision. Cleared first, it would look started and wait for a step that
+    // never ran.
+    if scope == CancelScopeId::ROOT {
+        state.clear_pending_decisions();
+    }
 }
 
 fn begin_restart_shutdown(state: &mut EngineState, cmds: &mut Vec<Command>) {

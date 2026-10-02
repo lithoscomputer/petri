@@ -1,14 +1,15 @@
 //! A simulated world for the driver, for deterministic simulation testing.
 //!
 //! A sandbox provider whose environments run simulated processes on the
-//! runtime's clock, and a step that runs one process per attempt, as the
-//! process step does. The world outlives any one driver. A crash ends the
-//! driver's own tasks, but its processes keep running, as real ones do, and
-//! the next acquisition of the same scope fences them. An acquisition the
-//! driver drops while alive removes the sandbox it was creating, as the stock
-//! executors' lease records make sure; one a crash cuts short leaves it for
-//! the next fence. A dead driver's executor does nothing more: its releases
-//! never happen. The world keeps a
+//! runtime's clock, a step that runs one process per attempt, as the process
+//! step does, sometimes after it asks the host a question, and a host's hooks
+//! that delay, block, skip or fail attempts. The world outlives any one
+//! driver. A crash ends the driver's own tasks, but its processes keep
+//! running, as real ones do, and the next acquisition of the same scope
+//! fences them. An acquisition the driver drops while alive removes the
+//! sandbox it was creating, as the stock executors' lease records make sure;
+//! one a crash cuts short leaves it for the next fence. A dead driver's
+//! executor does nothing more: its releases never happen. The world keeps a
 //! ledger of every acquisition, release and process across driver lifetimes,
 //! and notes each rule a run broke, for the simulation's oracles to read.
 //!
@@ -23,6 +24,11 @@ use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::Duration;
 
 use driver::StepLogStore;
+use driver::lifecycle::{
+    AdmitAttempt, AttemptDecision, ExecutionHooks, HookContext, PrepareError, PrepareResult,
+    Prepared,
+};
+use engine::Admission;
 use executor::{
     AcquireContext, EnvError, EnvHandle, ExecEnv, Executor, ExitStatus, LogLine, ProcessHandle,
     ProcessSpec, ReleaseReport, ScopeOutcome, ScopeSpec, Sig,
@@ -30,7 +36,7 @@ use executor::{
 use ir::{Control, LogStream, Outcome, SandboxInstance, ScopeId, StepKindId, Value};
 use serde::Deserialize;
 use smol_str::SmolStr;
-use steps::{Registry, Step, StepCtx};
+use steps::{Answer, Question, Registry, Step, StepCtx};
 use tokio::sync::{Notify, mpsc};
 use tokio::time;
 
@@ -132,20 +138,26 @@ impl ProcessState {
 
 #[derive(Debug)]
 struct WorldState {
-    dice:         Dice,
-    faults:       Faults,
-    lifetime:     u32,
-    generations:  BTreeMap<ScopeId, u32>,
-    acquisitions: Vec<Acquired>,
-    processes:    Vec<Ran>,
+    dice:          Dice,
+    faults:        Faults,
+    lifetime:      u32,
+    generations:   BTreeMap<ScopeId, u32>,
+    acquisitions:  Vec<Acquired>,
+    processes:     Vec<Ran>,
     /// `(firing, attempt)` whose finish was in the log the current lifetime
     /// resumed from.
-    finished:     BTreeSet<(u64, u32)>,
+    finished:      BTreeSet<(u64, u32)>,
     /// Firings a stop had reached, still stopping, in that log.
-    stopping:     BTreeSet<u64>,
+    stopping:      BTreeSet<u64>,
+    /// A sibling execution holds the attempt slot the driver shares with it.
+    sibling:       bool,
+    /// How often the sibling took the slot.
+    sibling_turns: usize,
+    /// `(firing, attempt)` whose result preparation the host failed, fatally.
+    fatal:         BTreeSet<(u64, u32)>,
     /// Processes a fence ended.
-    fenced:       usize,
-    violations:   Vec<String>,
+    fenced:        usize,
+    violations:    Vec<String>,
 }
 
 /// The world a simulated run's drivers share.
@@ -166,6 +178,9 @@ impl World {
                 processes: Vec::new(),
                 finished: BTreeSet::new(),
                 stopping: BTreeSet::new(),
+                sibling: false,
+                sibling_turns: 0,
+                fatal: BTreeSet::new(),
                 fenced: 0,
                 violations: Vec::new(),
             }),
@@ -211,6 +226,22 @@ impl World {
 
     pub(crate) fn fenced(&self) -> usize {
         self.lock().fenced
+    }
+
+    /// A sibling execution took, or gave back, the shared attempt slot.
+    pub(crate) fn sibling_holds_slot(&self, holds: bool) {
+        let mut state = self.lock();
+        state.sibling = holds;
+        state.sibling_turns += usize::from(holds);
+    }
+
+    pub(crate) fn sibling_turns(&self) -> usize {
+        self.lock().sibling_turns
+    }
+
+    /// The attempts whose result preparation the host failed, fatally.
+    pub(crate) fn fatal(&self) -> BTreeSet<(u64, u32)> {
+        self.lock().fatal.clone()
     }
 
     /// The current driver lifetime: 0 until the first crash.
@@ -441,6 +472,11 @@ impl ExecEnv for WorldEnv {
                 self.scope, self.generation
             ));
         }
+        if state.sibling {
+            state.violations.push(format!(
+                "firing {firing} attempt {attempt} ran while a sibling execution held the slot"
+            ));
+        }
         if lifetime > 0 && state.stopping.contains(&firing) {
             state.violations.push(format!(
                 "firing {firing} was stopping at the crash and ran again (attempt {attempt})"
@@ -577,6 +613,9 @@ pub(crate) struct SandboxedConfig {
     /// Lines the process prints.
     #[serde(default)]
     lines:      u32,
+    /// Ask the host a question before the work, and wait for its answer.
+    #[serde(default)]
+    asks:       bool,
 }
 
 fn yes() -> bool {
@@ -617,6 +656,25 @@ impl Step for SandboxedStep {
             ("SIM_LINES", config.lines.to_string()),
         ] {
             spec.env.insert(key.into(), value.into());
+        }
+        if config.asks {
+            let id = format!("q{}.{}", ctx.firing.raw(), ctx.attempt.raw());
+            let _ = ctx.logs.send(Question::new(&id, "Go on?").to_event()).await;
+            loop {
+                match ctx.control.recv().await {
+                    Some(Control::Deliver(value)) => {
+                        if Answer::from_value(&value)
+                            .and_then(|answer| answer.question)
+                            .is_some_and(|question| question == id)
+                        {
+                            break;
+                        }
+                    }
+                    Some(Control::Cancel | Control::Kill) if config.wedged => {}
+                    // A stop, or anything newer, while waiting ends the attempt.
+                    _ => return Outcome::cancelled(),
+                }
+            }
         }
         let mut process = match ctx.env.spawn(spec).await {
             Ok(process) => process,
@@ -688,5 +746,78 @@ impl StepLogStore for MemoryLogs {
             .or_default()
             .push(line.to_owned());
         Ok(())
+    }
+}
+
+// ── A host's hooks ────────────────────────────────────────────────────────
+
+/// A roll for one attempt and purpose, independent of the order hooks run in,
+/// so an attempt a resumed driver runs again gets the same verdict.
+fn attempt_roll(seed: u64, firing: u64, attempt: u32, purpose: u64) -> u64 {
+    let mut dice = Dice(
+        seed ^ firing.wrapping_mul(0x9E37_79B9_7F4A_7C15)
+            ^ u64::from(attempt).wrapping_mul(0xC2B2_AE3D_27D4_EB4F)
+            ^ purpose.wrapping_mul(0x1656_67B1_9E37_79F9),
+    );
+    dice.roll(100)
+}
+
+/// A host whose hooks take time, and sometimes block or skip an attempt or
+/// fail its result preparation, fatally or not.
+pub(crate) struct WorldHooks {
+    pub world: Arc<World>,
+    pub seed:  u64,
+}
+
+/// The reason a hook's block carries.
+pub(crate) const HOOK_BLOCK: &str = "simulated hook block";
+/// The message a fatal result preparation failure carries.
+pub(crate) const PREPARATION_FAILURE: &str = "simulated preparation failure";
+
+#[async_trait::async_trait]
+impl ExecutionHooks for WorldHooks {
+    async fn before_attempt(
+        &self,
+        _context: &HookContext,
+        request: AdmitAttempt,
+    ) -> AttemptDecision {
+        let (firing, attempt) = (request.view.firing.raw(), request.view.attempt.raw());
+        time::sleep(Duration::from_millis(
+            attempt_roll(self.seed, firing, attempt, 1) % 6,
+        ))
+        .await;
+        let admission = match attempt_roll(self.seed, firing, attempt, 2) {
+            0..=2 => Admission::Block {
+                reason: HOOK_BLOCK.into(),
+            },
+            3..=5 => Admission::Skip {
+                outcome: Outcome::success(Value::Null),
+            },
+            _ => Admission::Admit,
+        };
+        AttemptDecision {
+            admission,
+            notes: Vec::new(),
+        }
+    }
+
+    async fn prepare_result(
+        &self,
+        _context: &HookContext,
+        request: PrepareResult,
+    ) -> Result<Prepared, PrepareError> {
+        let (firing, attempt) = (request.view.firing.raw(), request.view.attempt.raw());
+        time::sleep(Duration::from_millis(
+            attempt_roll(self.seed, firing, attempt, 3) % 6,
+        ))
+        .await;
+        match attempt_roll(self.seed, firing, attempt, 4) {
+            0..=2 => {
+                self.world.lock().fatal.insert((firing, attempt));
+                Err(PrepareError::fatal(PREPARATION_FAILURE))
+            }
+            3..=5 => Err(PrepareError::best_effort("simulated preparation hiccup")),
+            _ => Ok(Prepared::unchanged()),
+        }
     }
 }

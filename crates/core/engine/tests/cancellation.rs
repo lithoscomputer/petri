@@ -12,7 +12,7 @@ mod support;
 use std::cell::RefCell;
 use std::rc::Rc;
 
-use engine::{Command, Event};
+use engine::{Admission, Command, DecisionId, EngineExit, EngineState, Event, apply, resume};
 use ir::{
     Attempt, CancelScopeId, Control, ExpandTarget, FiringId, GraphBuilder, JoinPolicy, Outcome,
     RetryPolicy, RunStatus, Status, Value, collector_exprs, parallel_for_each, validate,
@@ -791,6 +791,66 @@ fn kill_settles_an_awaiting_retry_firing_without_routing() {
     assert_eq!(h.take_starts(), vec![], "nothing is admitted");
     assert_eq!(h.status, Some(RunStatus::Cancelled));
     h.verify_replay();
+}
+
+/// A firing still waiting for its admission has no step to stop either. A
+/// root kill withdraws the decision and records the firing `Cancelled`, and the
+/// run ends: the firing must not look started, waiting on a step that never
+/// ran. The harness answers every admission at once, so this drives the core
+/// by hand.
+#[test]
+fn kill_settles_a_firing_awaiting_admission() {
+    let graph = retry_then_cleanup_graph();
+    let decide = |state, decision_id| {
+        apply(state, Event::AdmissionDecided {
+            decision_id,
+            decision: Admission::Admit,
+            trace: Vec::new(),
+        })
+    };
+    let (state, _) = apply(EngineState::new(graph.clone()), Event::ExecutionStarted {
+        start: engine::EngineStart::default(),
+    });
+    let (state, commands) = decide(state, DecisionId::ExecutionStart);
+    let Some(DecisionId::AttemptStart { firing, .. }) = commands.iter().find_map(|c| match c {
+        Command::Admit { decision_id } => Some(*decision_id),
+        _ => None,
+    }) else {
+        panic!("the entry asks for its admission: {commands:?}");
+    };
+    assert!(state.is_awaiting_admission(firing));
+
+    let (state, commands) = apply(state, Event::KillRequested {
+        scope: CancelScopeId::ROOT,
+    });
+    assert!(state.firing(firing).is_none(), "settled, not left live");
+    assert_eq!(
+        state.pending_admissions().count(),
+        0,
+        "the decision is withdrawn"
+    );
+    assert!(
+        !commands
+            .iter()
+            .any(|c| matches!(c, Command::DeliverControl { .. } | Command::StartStep(_))),
+        "nothing to signal and nothing admitted: {commands:?}"
+    );
+    assert!(
+        commands
+            .iter()
+            .any(|c| matches!(c, Command::FinishExecution {
+                exit: EngineExit::Terminal {
+                    status: RunStatus::Cancelled,
+                },
+            })),
+        "the run ends: {commands:?}"
+    );
+    let point = resume(graph, &state.log).expect("the log resumes");
+    assert!(
+        point.pending.is_empty(),
+        "nothing is owed: {:?}",
+        point.pending
+    );
 }
 
 // ── Kill (§5 tests 10–13) ─────────────────────────────────────────────────

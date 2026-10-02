@@ -158,12 +158,18 @@ depends = ["plugins:build"]
 env = { CARGO_PROFILE_TEST_DEBUG = "0", PETRI_SANDBOX_DOCKER_PLUGIN = "{{config_root}}/target/plugins/bin/sandbox-driver-docker", PETRI_SANDBOX_HOST_PLUGIN = "{{config_root}}/target/plugins/bin/sandbox-driver-host" }
 run = "cargo nextest run --locked -p petri-execution --test admission --run-ignored ignored-only --no-tests=fail"
 
+[tasks."test:dst"]
+description = "Run the driver simulation over 50,000 seeds; the routine gate runs 128"
+env = { CARGO_PROFILE_TEST_DEBUG = "0", PETRI_DST_SEEDS = "50000" }
+run = "cargo nextest run --locked -p petri-driver --test simulation -E 'test(seeded_worlds)' --no-tests=fail"
+
 [tasks."check:nightly"]
 description = "Run the extended nightly verification gate"
 depends = ["check"]
 run = [
   "mise run check:msrv",
   "mise run test:long",
+  "mise run test:dst",
   "mise run test:fabro:blackbox:repeat",
   "mise run test:fabro:differential",
   "cargo clean --profile dev",

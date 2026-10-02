@@ -104,14 +104,17 @@ a day old, like every other tool here.
 ## Driver simulation
 
 `crates/core/driver/tests/simulation.rs` is deterministic simulation testing
-of the driver. Each seed builds a workflow, host stops and crashes, and runs
-the real driver against a simulated sandbox world on a paused, single-threaded
-runtime; every choice comes from the seed, so a seed always runs the same way.
-`mise run test` runs 128 seeds in well under a second. To run more, or to
-replay a failing seed with a trace of what it did:
+of the driver. Each seed builds a workflow, host stops and crashes, and a host
+that answers questions, delays and fails hooks and decisions, and shares the
+attempt slot with a sibling execution. It runs the real driver against a
+simulated sandbox world on a paused, single-threaded runtime; every choice
+comes from the seed, so a seed always runs the same way. `mise run test` runs
+128 seeds in well under a second, and `mise run test:dst`, part of the nightly
+gate, runs 50,000. To run another number, or to replay a failing seed with a
+trace of what it did:
 
 ```sh
-PETRI_DST_SEEDS=50000 cargo nextest run -p petri-driver --test simulation
+PETRI_DST_SEEDS=2000 cargo nextest run -p petri-driver --test simulation
 PETRI_DST_SEED=1234 PETRI_DST_TRACE=1 cargo nextest run -p petri-driver \
   --test simulation --no-capture
 ```
