@@ -79,6 +79,7 @@ pub(crate) fn registry() -> Kinds {
 pub(crate) const NOOP: StepKindId = StepKindId::new_static("noop");
 
 type Responder = Box<dyn FnMut(&StartInfo) -> Outcome>;
+type Observer = Box<dyn FnMut(&EngineState, &[Command])>;
 
 pub(crate) struct Harness {
     pub state:             EngineState,
@@ -95,6 +96,9 @@ pub(crate) struct Harness {
     /// Every `ScheduleRetry` the core issued, in order.
     pub scheduled_retries: Vec<(FiringId, Attempt, Duration)>,
     pub status:            Option<RunStatus>,
+    /// Called after every `apply` with the new state and the commands it
+    /// produced.
+    observer:              Option<Observer>,
 }
 
 impl Harness {
@@ -108,7 +112,15 @@ impl Harness {
             max_concurrent:    0,
             scheduled_retries: Vec::new(),
             status:            None,
+            observer:          None,
         }
+    }
+
+    /// Watch the run as it goes: every `apply`'s new state and the commands
+    /// it produced.
+    pub(crate) fn observe(mut self, f: impl FnMut(&EngineState, &[Command]) + 'static) -> Self {
+        self.observer = Some(Box::new(f));
+        self
     }
 
     /// Decide each step's result from the request.
@@ -227,6 +239,9 @@ impl Harness {
         let state = mem::replace(&mut self.state, EngineState::new(Graph::new()));
         let (state, commands) = apply(state, event);
         self.state = state;
+        if let Some(observer) = self.observer.as_mut() {
+            observer(&self.state, &commands);
+        }
         for command in &commands {
             if let Command::FinishExecution {
                 exit: EngineExit::Terminal { status },

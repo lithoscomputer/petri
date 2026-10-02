@@ -39,7 +39,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::time::Duration;
 
-use engine::{Command, Event, RunError};
+use engine::{Command, EngineState, Event, RunError};
 use ir::{
     Arm, Attempt, Backoff, Budget, CancelScopeId, Control, EdgeId, FailureInfo, FiringId, Graph,
     GraphBuilder, JoinPolicy, NodeId, Outcome, RetryOn, RetryPolicy, RunStatus, ScopeId, Status,
@@ -846,7 +846,20 @@ impl FlowCase {
 
 /// Run a case through the real core with a host that follows the schedule.
 pub(crate) fn run(case: &FlowCase) -> Run {
-    let mut host = Host::new(case);
+    run_with(case, Harness::new(case.graph()))
+}
+
+/// [`run`], reporting every `apply` to `observer`: the new state and the
+/// commands it produced.
+pub(crate) fn run_observed(
+    case: &FlowCase,
+    observer: impl FnMut(&EngineState, &[Command]) + 'static,
+) -> Run {
+    run_with(case, Harness::new(case.graph()).observe(observer))
+}
+
+fn run_with(case: &FlowCase, harness: Harness) -> Run {
+    let mut host = Host::new(case, harness);
     // Every step after the schedule finishes one firing, and a node fires at
     // most its budget, so a run that needs more steps has broken that rule;
     // stop and report it.
@@ -902,8 +915,7 @@ struct Host<'a> {
 }
 
 impl<'a> Host<'a> {
-    fn new(case: &'a FlowCase) -> Self {
-        let mut harness = Harness::new(case.graph());
+    fn new(case: &'a FlowCase, mut harness: Harness) -> Self {
         harness.feed(Event::ExecutionStarted {
             start: engine::EngineStart::default(),
         });
