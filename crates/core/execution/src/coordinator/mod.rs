@@ -239,8 +239,15 @@ impl Coordinator {
         CoordinatorOptions::check_limit(options.max_invocations)?;
         let keys = middleware.iter().map(|item| item.key()).collect();
         let logs = runtime.open(RunAccess::Create).await?;
-        let store = CoordinatorStore::create(logs.clone(), runtime.run_key().clone(), keys).await?;
-        let resources = ResourceStore::load(&logs).await?;
+        let clock = runtime.recording_clock();
+        let store = CoordinatorStore::create_with_clock(
+            logs.clone(),
+            runtime.run_key().clone(),
+            keys,
+            clock.clone(),
+        )
+        .await?;
+        let resources = ResourceStore::load(&logs).await?.with_clock(clock);
         Ok((store, resources))
     }
 
@@ -271,8 +278,11 @@ impl Coordinator {
     ) -> Result<(CoordinatorStore, ResourceStore), CoordinatorError> {
         CoordinatorOptions::check_limit(options.max_invocations)?;
         let logs = runtime.open(RunAccess::Write).await?;
-        let mut store = CoordinatorStore::resume(logs.clone(), runtime.run_key().clone()).await?;
-        let resources = ResourceStore::load(&logs).await?;
+        let clock = runtime.recording_clock();
+        let mut store = CoordinatorStore::resume(logs.clone(), runtime.run_key().clone())
+            .await?
+            .with_clock(clock.clone());
+        let resources = ResourceStore::load(&logs).await?.with_clock(clock);
         let keys: Vec<MiddlewareKey> = middleware.iter().map(|item| item.key()).collect();
         if store.state().middleware_chain != keys {
             return Err(StoreError::State(crate::StateError::MiddlewareChain).into());
@@ -470,16 +480,23 @@ impl Coordinator {
             }
             self.last_root_report = Some(report);
             self.run_invocations().await?;
+            // A crash can land between the root's result and the run's end:
+            // the resumed run ends it.
+            self.finish_run(result.status).await?;
             return Ok(result);
         }
         let result = self.run_invocations().await?;
-        if self.store.state().run_status.is_none() {
-            self.append(CoordinatorEvent::RunFinished {
-                status: result.status,
-            })
-            .await?;
-        }
+        self.finish_run(result.status).await?;
         Ok(result)
+    }
+
+    /// Append the run's end, unless the log already has it.
+    async fn finish_run(&mut self, status: RunStatus) -> Result<(), CoordinatorError> {
+        if self.store.state().run_status.is_none() {
+            self.append(CoordinatorEvent::RunFinished { status })
+                .await?;
+        }
+        Ok(())
     }
 
     /// End the run: release every lease still holding a sandbox — an
@@ -571,31 +588,18 @@ impl Coordinator {
             {
                 return Ok(result);
             }
+            // In a fixed order, so the same inputs append the same records:
+            // the host's commands first, then what ended, then new work.
             tokio::select! {
-                result = running.join_next(), if !running.is_empty() => {
-                    let done = result.expect("the execution set is not empty")?;
-                    let done = self.on_execution_done(done, running).await?;
-                    completed.insert(done.invocation, done);
-                }
-                admitted = self.admit_rx.recv() => {
-                    if let Some(admitted) = admitted {
-                        self.dispatch_admitted(admitted, running).await?;
-                    }
-                }
-                result = releasing.join_next(), if !releasing.is_empty() => {
-                    let released = result.expect("the release set is not empty")?;
-                    self.on_invocation_released(released).await?;
-                }
-                request = self.start_rx.recv() => {
-                    if let Some(request) = request
-                        && let Some(invocation) = self.handle_start(request).await?
-                    {
-                        self.start_invocation(invocation, running).await?;
-                    }
-                }
+                biased;
                 cancelled = self.cancel_rx.recv() => {
                     if let Some(cancelled) = cancelled {
                         self.handle_cancel(cancelled).await?;
+                    }
+                }
+                request = self.pause_rx.recv() => {
+                    if let Some(request) = request {
+                        self.handle_pause(request).await?;
                     }
                 }
                 request = self.control_rx.recv() => {
@@ -603,9 +607,25 @@ impl Coordinator {
                         self.handle_control(request);
                     }
                 }
-                request = self.pause_rx.recv() => {
-                    if let Some(request) = request {
-                        self.handle_pause(request).await?;
+                result = running.join_next(), if !running.is_empty() => {
+                    let done = result.expect("the execution set is not empty")?;
+                    let done = self.on_execution_done(done, running).await?;
+                    completed.insert(done.invocation, done);
+                }
+                result = releasing.join_next(), if !releasing.is_empty() => {
+                    let released = result.expect("the release set is not empty")?;
+                    self.on_invocation_released(released).await?;
+                }
+                admitted = self.admit_rx.recv() => {
+                    if let Some(admitted) = admitted {
+                        self.dispatch_admitted(admitted, running).await?;
+                    }
+                }
+                request = self.start_rx.recv() => {
+                    if let Some(request) = request
+                        && let Some(invocation) = self.handle_start(request).await?
+                    {
+                        self.start_invocation(invocation, running).await?;
                     }
                 }
             }
@@ -965,7 +985,8 @@ impl Coordinator {
             .map_err(|error| CoordinatorError::EventWriter {
                 execution,
                 message: error.to_string(),
-            })?,
+            })?
+            .with_rolls(self.runtime.decision_rolls(execution)),
         );
         let decoded = read_execution_log(&**self.store.logs(), execution).await?;
         let context = self.hook_context(invocation, execution);

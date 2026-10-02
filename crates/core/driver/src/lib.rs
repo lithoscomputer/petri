@@ -18,8 +18,9 @@ mod sink;
 mod view;
 
 pub use decision::{
-    AdmissionResolution, AdmitRequest, DecisionError, DecisionResolver, DefaultDecisionResolver,
-    RoutingRequest, RoutingResolution, SeededDecisionResolver, default_group_decision,
+    AdmissionResolution, AdmitRequest, DecisionError, DecisionResolver, DecisionRolls,
+    DefaultDecisionResolver, RoutingRequest, RoutingResolution, SeededDecisionResolver,
+    default_group_decision, default_group_decision_rolled, default_routing_with,
 };
 pub use lifecycle::{ExecutionHooks, HookContext, ParentLink};
 pub use observe::{EventObserver, ObserveError, RecordingClock, recorded_now};

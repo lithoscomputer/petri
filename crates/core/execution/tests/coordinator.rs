@@ -222,6 +222,81 @@ async fn resume_folds_a_final_outcome_before_reissuing_pending_routing() {
     coordinator.finish().await;
 }
 
+/// A crash after the root's result is stored but before the run's end is:
+/// the resumed run replays the finished root and still ends the run, once.
+#[tokio::test]
+async fn a_crash_between_the_roots_end_and_the_runs_end_still_ends_the_run() {
+    let directory = RunDir::new("coordinator-run-finished-on-resume");
+    let mut options = RunOptions::new(directory.path());
+    options.retention = Retention::Always;
+    let runtime = Runtime::standard().options(options);
+    let mut coordinator = Coordinator::create(
+        runtime.prepare_run(directory.path()),
+        Vec::new(),
+        CoordinatorOptions::default(),
+    )
+    .await
+    .expect("the coordinator starts");
+    let mut builder = GraphBuilder::bare();
+    let scope = builder.add_scope(Scope::new(ScopeId::new(0)));
+    builder.add_step("only", scope, "noop");
+    let digest = coordinator
+        .register_graph(&builder.build())
+        .await
+        .expect("graph registers");
+    coordinator
+        .run_root(digest, BTreeMap::new())
+        .await
+        .expect("the first run completes");
+    drop(coordinator);
+
+    // The crash: the log ends at the root's result.
+    let decoded = read_coordinator_log(&*testkit::read_run_dir(directory.path()).await)
+        .await
+        .expect("coordinator log decodes");
+    let mut prefix = Vec::new();
+    for record in decoded {
+        let root_finished = matches!(
+            record.body,
+            CoordinatorEvent::InvocationFinished { invocation, .. } if invocation == InvocationId::ROOT
+        );
+        serde_json::to_writer(&mut prefix, &record).expect("record encodes");
+        prefix.push(b'\n');
+        if root_finished {
+            break;
+        }
+    }
+    fs::write(directory.path().join("coordinator.jsonl"), prefix).expect("coordinator prefix");
+
+    let runtime = Runtime::standard().options(RunOptions::new(directory.path()));
+    let mut coordinator = Coordinator::resume(
+        runtime.prepare_run(directory.path()),
+        Vec::new(),
+        CoordinatorOptions::default(),
+    )
+    .await
+    .expect("the coordinator resumes");
+    let result = coordinator
+        .run_root(digest, BTreeMap::new())
+        .await
+        .expect("the finished root replays");
+    let ends: Vec<RunStatus> = read_coordinator_log(&**coordinator.store().logs())
+        .await
+        .expect("coordinator log decodes")
+        .into_iter()
+        .filter_map(|record| match record.body {
+            CoordinatorEvent::RunFinished { status } => Some(status),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        ends,
+        vec![result.status],
+        "the run ends once, as its root did"
+    );
+    coordinator.finish().await;
+}
+
 #[derive(Deserialize)]
 struct InvokeConfig {
     graph:              GraphDigest,

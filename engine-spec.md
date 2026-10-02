@@ -866,6 +866,16 @@ draw is in the log either way, so replay never needs it. Step output goes
 to `RunConfig.step_logs`, a `StepLogStore`: the run directory's `logs/` by
 default, memory in a simulation.
 
+The coordinator above it is a function of its inputs the same way. Its loop
+is biased too: the host's commands (cancel, pause, control), then finished
+drivers and lease releases, then fork admissions, then start requests, so new
+work comes last. The runtime passes one recording clock to every driver of a
+run and to the coordinator and resource logs (`Runtime::recording_clock`),
+one step-log store per execution directory (`Runtime::step_logs`), and a seed
+for every execution's weighted draws (`Runtime::decision_seed`, mixed with
+the execution's id). With a fixed `RunOptions::run_key`, a seeded run stores
+the same logs byte for byte.
+
 **Timeout accounting.** `Budget.timeout_policy` says who enforces the
 per-attempt timeout. `ExecutorEnforced` (the default): the driver arms the
 timer at dispatch and it counts **active work only**. A `Question` on the

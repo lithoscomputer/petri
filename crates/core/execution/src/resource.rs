@@ -17,6 +17,7 @@
 use std::collections::BTreeMap;
 use std::sync::{Arc, Weak};
 
+use driver::RecordingClock;
 use executor::WorkspaceId;
 use executor_sandbox::{LeaseLedger, LeaseRecord, LedgerError};
 pub use executor_sandbox::{LeaseState, PendingIntent};
@@ -115,6 +116,8 @@ pub struct ResourceStore {
     by_allocation: BTreeMap<SandboxAllocationKey, SandboxLeaseId>,
     next_lease:    u64,
     next_seq:      u64,
+    /// What each record's `recorded_at` reads.
+    clock:         RecordingClock,
 }
 
 impl ResourceStore {
@@ -147,7 +150,15 @@ impl ResourceStore {
             by_allocation,
             next_lease,
             next_seq: stored.len() as u64,
+            clock: RecordingClock::default(),
         })
+    }
+
+    /// Stamp every record appended from now on with `clock`.
+    #[must_use]
+    pub fn with_clock(mut self, clock: RecordingClock) -> Self {
+        self.clock = clock;
+        self
     }
 
     pub fn records(&self) -> impl Iterator<Item = &SandboxResourceRecord> {
@@ -264,7 +275,7 @@ impl ResourceStore {
     async fn write(&mut self, record: &SandboxResourceRecord) -> Result<(), ResourceError> {
         let line = ResourceLogRecord {
             seq:         self.next_seq,
-            recorded_at: driver::recorded_now(),
+            recorded_at: self.clock.now(),
             body:        record.clone(),
         };
         let stored = Record::encode(&line).map_err(|error| match error {

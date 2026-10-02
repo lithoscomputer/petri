@@ -1,6 +1,6 @@
 //! Host-side admission and routing decisions.
 
-use std::sync::{Mutex, PoisonError};
+use std::sync::{Arc, Mutex, PoisonError};
 
 use engine::{
     Admission, DecisionId, GroupDecision, MiddlewareKey, RouteDecision, RoutingProposal,
@@ -111,6 +111,14 @@ pub(crate) fn default_routing(
     routing_with(request, &mut os_roll)
 }
 
+/// The default routing, with its weighted draws from `rolls`.
+pub fn default_routing_with(
+    request: &RoutingRequest,
+    rolls: &DecisionRolls,
+) -> Result<RoutingResolution, DecisionError> {
+    routing_with(request, &mut || rolls.roll())
+}
+
 fn routing_with(
     request: &RoutingRequest,
     roll: &mut dyn FnMut() -> Result<u64, DecisionError>,
@@ -132,6 +140,15 @@ pub fn default_group_decision(
     restart_allowed: bool,
 ) -> Result<GroupDecision, DecisionError> {
     group_decision_with(proposal, restart_allowed, &mut os_roll)
+}
+
+/// [`default_group_decision`], with its weighted draw from `rolls`.
+pub fn default_group_decision_rolled(
+    proposal: &RoutingProposal,
+    restart_allowed: bool,
+    rolls: &DecisionRolls,
+) -> Result<GroupDecision, DecisionError> {
+    group_decision_with(proposal, restart_allowed, &mut || rolls.roll())
 }
 
 fn group_decision_with(
@@ -192,33 +209,50 @@ fn weighted_draw(
     }))
 }
 
+/// Where weighted routing draws come from: the operating system by default,
+/// or a seed, so a simulated run routes the same way every time. The draws
+/// are recorded either way, so replay never needs the seed. Clones share one
+/// sequence.
+#[derive(Clone, Debug, Default)]
+pub struct DecisionRolls(Option<Arc<Mutex<u64>>>);
+
+impl DecisionRolls {
+    /// Draws from `SplitMix64` over `seed`.
+    pub fn seeded(seed: u64) -> Self {
+        Self(Some(Arc::new(Mutex::new(seed))))
+    }
+
+    /// The next draw.
+    pub fn roll(&self) -> Result<u64, DecisionError> {
+        let Some(state) = &self.0 else {
+            return os_roll();
+        };
+        let mut state = state.lock().unwrap_or_else(PoisonError::into_inner);
+        *state = state.wrapping_add(0x9E37_79B9_7F4A_7C15);
+        let mut z = *state;
+        z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+        z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+        Ok(z ^ (z >> 31))
+    }
+}
+
 /// [`DefaultDecisionResolver`] with its weighted draws rolled from a seed
 /// instead of the operating system, so a simulated run routes the same way
 /// every time. The draws are recorded either way, so replay never needs the
 /// seed.
 pub struct SeededDecisionResolver {
-    state: Mutex<u64>,
+    rolls: DecisionRolls,
 }
 
 impl SeededDecisionResolver {
     pub fn new(seed: u64) -> Self {
         Self {
-            state: Mutex::new(seed),
+            rolls: DecisionRolls::seeded(seed),
         }
     }
 
-    /// The next draw: `SplitMix64` over the seed.
-    fn roll(&self) -> u64 {
-        let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
-        *state = state.wrapping_add(0x9E37_79B9_7F4A_7C15);
-        let mut z = *state;
-        z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
-        z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
-        z ^ (z >> 31)
-    }
-
     fn routing(&self, request: &RoutingRequest) -> Result<RoutingResolution, DecisionError> {
-        routing_with(request, &mut || Ok(self.roll()))
+        default_routing_with(request, &self.rolls)
     }
 }
 

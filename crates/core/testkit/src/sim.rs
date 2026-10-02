@@ -1,4 +1,5 @@
-//! A simulated world for the driver, for deterministic simulation testing.
+//! A simulated world for deterministic simulation testing of the driver and
+//! the layers above it.
 //!
 //! A sandbox provider whose environments run simulated processes on the
 //! runtime's clock, a step that runs one process per attempt, as the process
@@ -42,10 +43,10 @@ use tokio::time;
 
 /// `SplitMix64`.
 #[derive(Clone, Copy, Debug)]
-pub(crate) struct Dice(pub u64);
+pub struct Dice(pub u64);
 
 impl Dice {
-    pub(crate) fn roll(&mut self, sides: u64) -> u64 {
+    pub fn roll(&mut self, sides: u64) -> u64 {
         self.0 = self.0.wrapping_add(0x9E37_79B9_7F4A_7C15);
         let mut z = self.0;
         z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
@@ -53,14 +54,14 @@ impl Dice {
         (z ^ (z >> 31)) % sides.max(1)
     }
 
-    pub(crate) fn chance(&mut self, percent: u64) -> bool {
+    pub fn chance(&mut self, percent: u64) -> bool {
         self.roll(100) < percent
     }
 }
 
 /// How often the world's own operations go wrong.
 #[derive(Clone, Copy, Debug)]
-pub(crate) struct Faults {
+pub struct Faults {
     /// Percent of acquisitions that fail.
     pub acquire_failure: u64,
     /// The longest an acquisition takes, in milliseconds.
@@ -72,8 +73,14 @@ pub(crate) struct Faults {
 /// One acquisition of a scope's environment, from the moment the provider
 /// starts creating it.
 #[derive(Clone, Debug)]
-pub(crate) struct Acquired {
+pub struct Acquired {
     pub scope:      ScopeId,
+    /// The sandbox: its lease under a coordinator, else its scope.
+    pub key:        SmolStr,
+    /// The execution that acquired it, as its environment names it; empty
+    /// for a driver on its own.
+    pub execution:  SmolStr,
+    /// Counts this sandbox's acquisitions.
     pub generation: u32,
     pub lifetime:   u32,
     /// The acquisition failed, and left nothing behind.
@@ -88,8 +95,9 @@ pub(crate) struct Acquired {
 
 /// One process a step ran.
 #[derive(Clone, Debug)]
-pub(crate) struct Ran {
-    pub scope:      ScopeId,
+pub struct Ran {
+    pub key:        SmolStr,
+    pub execution:  SmolStr,
     pub generation: u32,
     pub lifetime:   u32,
     pub firing:     u64,
@@ -100,7 +108,7 @@ pub(crate) struct Ran {
 impl Ran {
     /// Whether the process still runs at `now`. One nobody waits on any
     /// more ends on time all the same.
-    pub(crate) fn running(&self, now: time::Instant) -> bool {
+    pub fn running(&self, now: time::Instant) -> bool {
         self.state.exit().is_none() && now < self.state.ends_at
     }
 }
@@ -141,14 +149,15 @@ struct WorldState {
     dice:          Dice,
     faults:        Faults,
     lifetime:      u32,
-    generations:   BTreeMap<ScopeId, u32>,
+    generations:   BTreeMap<SmolStr, u32>,
     acquisitions:  Vec<Acquired>,
     processes:     Vec<Ran>,
-    /// `(firing, attempt)` whose finish was in the log the current lifetime
-    /// resumed from.
-    finished:      BTreeSet<(u64, u32)>,
-    /// Firings a stop had reached, still stopping, in that log.
-    stopping:      BTreeSet<u64>,
+    /// `(execution, firing, attempt)` whose finish was in the logs the
+    /// current lifetime resumed from.
+    finished:      BTreeSet<(SmolStr, u64, u32)>,
+    /// `(execution, firing)` a stop had reached, still stopping, in those
+    /// logs.
+    stopping:      BTreeSet<(SmolStr, u64)>,
     /// A sibling execution holds the attempt slot the driver shares with it.
     sibling:       bool,
     /// How often the sibling took the slot.
@@ -162,12 +171,12 @@ struct WorldState {
 
 /// The world a simulated run's drivers share.
 #[derive(Debug)]
-pub(crate) struct World {
+pub struct World {
     state: Mutex<WorldState>,
 }
 
 impl World {
-    pub(crate) fn new(seed: u64, faults: Faults) -> Arc<Self> {
+    pub fn new(seed: u64, faults: Faults) -> Arc<Self> {
         Arc::new(Self {
             state: Mutex::new(WorldState {
                 dice: Dice(seed ^ 0xA11C_E5ED),
@@ -191,61 +200,67 @@ impl World {
         self.state.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
-    /// A driver resumes after a crash, from a log in which `finished`
-    /// attempts had finished and `stopping` firings were still stopping.
-    pub(crate) fn begin_lifetime(&self, finished: BTreeSet<(u64, u32)>, stopping: BTreeSet<u64>) {
+    /// The drivers resume after a crash, from logs in which `finished`
+    /// attempts had finished and `stopping` firings were still stopping. A
+    /// firing is named by its execution, as its environment names it (empty
+    /// for a driver on its own), and its id.
+    pub fn begin_lifetime(
+        &self,
+        finished: BTreeSet<(SmolStr, u64, u32)>,
+        stopping: BTreeSet<(SmolStr, u64)>,
+    ) {
         let mut state = self.lock();
         state.lifetime += 1;
         state.finished = finished;
         state.stopping = stopping;
     }
 
-    pub(crate) fn violation(&self, message: String) {
+    pub fn violation(&self, message: String) {
         self.lock().violations.push(message);
     }
 
-    pub(crate) fn violations(&self) -> Vec<String> {
+    pub fn violations(&self) -> Vec<String> {
         self.lock().violations.clone()
     }
 
-    pub(crate) fn acquisitions(&self) -> Vec<Acquired> {
+    pub fn acquisitions(&self) -> Vec<Acquired> {
         self.lock().acquisitions.clone()
     }
 
-    pub(crate) fn processes(&self) -> Vec<Ran> {
+    pub fn processes(&self) -> Vec<Ran> {
         self.lock().processes.clone()
     }
 
     /// The executor a driver of the current lifetime acquires through.
-    pub(crate) fn executor(self: &Arc<Self>) -> WorldExecutor {
+    pub fn executor(self: &Arc<Self>) -> WorldExecutor {
         WorldExecutor {
             world:    Arc::clone(self),
             lifetime: self.lock().lifetime,
         }
     }
 
-    pub(crate) fn fenced(&self) -> usize {
+    pub fn fenced(&self) -> usize {
         self.lock().fenced
     }
 
     /// A sibling execution took, or gave back, the shared attempt slot.
-    pub(crate) fn sibling_holds_slot(&self, holds: bool) {
+    pub fn sibling_holds_slot(&self, holds: bool) {
         let mut state = self.lock();
         state.sibling = holds;
         state.sibling_turns += usize::from(holds);
     }
 
-    pub(crate) fn sibling_turns(&self) -> usize {
+    pub fn sibling_turns(&self) -> usize {
         self.lock().sibling_turns
     }
 
     /// The attempts whose result preparation the host failed, fatally.
-    pub(crate) fn fatal(&self) -> BTreeSet<(u64, u32)> {
+    pub fn fatal(&self) -> BTreeSet<(u64, u32)> {
         self.lock().fatal.clone()
     }
 
     /// The current driver lifetime: 0 until the first crash.
-    pub(crate) fn lifetime(&self) -> u32 {
+    pub fn lifetime(&self) -> u32 {
         self.lock().lifetime
     }
 }
@@ -253,12 +268,20 @@ impl World {
 /// What a release finds: the acquisition it ends.
 #[derive(Debug)]
 struct Lease {
-    scope:      ScopeId,
+    key:        SmolStr,
     generation: u32,
 }
 
+/// The execution an environment belongs to: the prefix a coordinator puts
+/// before `-scope-<n>`, empty for a driver on its own.
+fn execution_of(environment: &str) -> SmolStr {
+    environment
+        .rsplit_once("-scope-")
+        .map_or_else(SmolStr::default, |(prefix, _)| SmolStr::new(prefix))
+}
+
 /// The world's sandbox provider, as one driver lifetime reaches it.
-pub(crate) struct WorldExecutor {
+pub struct WorldExecutor {
     world:    Arc<World>,
     lifetime: u32,
 }
@@ -268,41 +291,47 @@ impl Executor for WorldExecutor {
     async fn acquire(
         &self,
         scope: &ScopeSpec,
-        _ctx: &AcquireContext,
+        ctx: &AcquireContext,
     ) -> Result<EnvHandle, EnvError> {
+        let key: SmolStr = ctx.lease().map_or_else(
+            || format!("scope-{}", scope.id.raw()).into(),
+            |lease| format!("lease-{}", lease.raw()).into(),
+        );
+        let execution = execution_of(scope.environment.as_str());
+        let lifetime = self.lifetime;
         let (generation, delay, fail) = {
             let mut state = self.world.lock();
             let generation = {
-                let next = state.generations.entry(scope.id).or_insert(0);
+                let next = state.generations.entry(key.clone()).or_insert(0);
                 *next += 1;
                 *next
             };
-            // The fence: nothing from an earlier acquisition of this scope
-            // runs on once this one starts.
+            // The fence: nothing a dead driver left in this sandbox runs on
+            // once a live one acquires it. A second acquisition in the same
+            // lifetime (a restarted execution, a child that inherits the
+            // sandbox) shares it.
             let now = time::Instant::now();
             let mut fenced = 0;
             for process in &state.processes {
-                if process.scope == scope.id
-                    && process.generation < generation
-                    && process.running(now)
-                {
+                if process.key == key && process.lifetime < lifetime && process.running(now) {
                     process.state.kill(9);
                     fenced += 1;
                 }
             }
             state.fenced += fenced;
             for earlier in &mut state.acquisitions {
-                if earlier.scope == scope.id && earlier.generation < generation {
+                if earlier.key == key && earlier.lifetime < lifetime {
                     earlier.fenced = true;
                 }
             }
             let faults = state.faults;
             let delay = state.dice.roll(faults.acquire_ms + 1);
             let fail = state.dice.chance(faults.acquire_failure);
-            let lifetime = self.lifetime;
             // The sandbox exists from here, whether or not the call returns.
             state.acquisitions.push(Acquired {
                 scope: scope.id,
+                key: key.clone(),
+                execution: execution.clone(),
                 generation,
                 lifetime,
                 failed: fail,
@@ -314,9 +343,9 @@ impl Executor for WorldExecutor {
         };
         let mut creating = Creating {
             world: Arc::clone(&self.world),
-            scope: scope.id,
+            key: key.clone(),
             generation,
-            lifetime: self.lifetime,
+            lifetime,
             returned: false,
         };
         time::sleep(Duration::from_millis(delay)).await;
@@ -341,13 +370,11 @@ impl Executor for WorldExecutor {
             },
             Arc::new(WorldEnv {
                 world: Arc::clone(&self.world),
-                scope: scope.id,
+                key: key.clone(),
+                execution,
                 generation,
             }),
-            Lease {
-                scope: scope.id,
-                generation,
-            },
+            Lease { key, generation },
         ))
     }
 
@@ -376,24 +403,22 @@ impl Executor for WorldExecutor {
         let mut state = self.world.lock();
         // A release ends whatever still runs in the environment.
         for process in &state.processes {
-            if process.scope == lease.scope && process.generation == lease.generation {
+            if process.key == lease.key && process.generation == lease.generation {
                 process.state.kill(9);
             }
         }
         let released = state
             .acquisitions
             .iter_mut()
-            .find(|acquired| {
-                acquired.scope == lease.scope && acquired.generation == lease.generation
-            })
+            .find(|acquired| acquired.key == lease.key && acquired.generation == lease.generation)
             .map(|acquired| {
                 acquired.releases += 1;
                 acquired.releases
             });
         if released != Some(1) {
-            let (scope, generation) = (lease.scope, lease.generation);
+            let (key, generation) = (&lease.key, lease.generation);
             state.violations.push(format!(
-                "{scope} generation {generation} released {released:?} times"
+                "{key} generation {generation} released {released:?} times"
             ));
         }
         ReleaseReport::default()
@@ -410,7 +435,7 @@ impl WorldExecutor {
 /// it removes the sandbox it was creating; a dead driver runs no cleanup.
 struct Creating {
     world:      Arc<World>,
-    scope:      ScopeId,
+    key:        SmolStr,
     generation: u32,
     lifetime:   u32,
     returned:   bool,
@@ -428,7 +453,7 @@ impl Drop for Creating {
         if let Some(acquired) = state
             .acquisitions
             .iter_mut()
-            .find(|a| a.scope == self.scope && a.generation == self.generation)
+            .find(|a| a.key == self.key && a.generation == self.generation)
         {
             acquired.abandoned = true;
         }
@@ -439,7 +464,8 @@ impl Drop for Creating {
 #[derive(Debug)]
 struct WorldEnv {
     world:      Arc<World>,
-    scope:      ScopeId,
+    key:        SmolStr,
+    execution:  SmolStr,
     generation: u32,
 }
 
@@ -458,18 +484,20 @@ impl ExecEnv for WorldEnv {
         let mut state = self.world.lock();
         let lifetime = state.lifetime;
         let now = time::Instant::now();
-        let current = state.generations.get(&self.scope) == Some(&self.generation);
+        let execution = self.execution.clone();
+        let current = !state
+            .acquisitions
+            .iter()
+            .any(|a| a.key == self.key && a.generation == self.generation && a.fenced);
         if current
             && state.processes.iter().any(|earlier| {
-                earlier.scope == self.scope
-                    && earlier.generation < self.generation
-                    && earlier.running(now)
+                earlier.key == self.key && earlier.lifetime < lifetime && earlier.running(now)
             })
         {
             state.violations.push(format!(
                 "firing {firing} attempt {attempt} ran in {} generation {} beside an unfenced \
-                 earlier process",
-                self.scope, self.generation
+                 process a dead driver left",
+                self.key, self.generation
             ));
         }
         if state.sibling {
@@ -477,23 +505,33 @@ impl ExecEnv for WorldEnv {
                 "firing {firing} attempt {attempt} ran while a sibling execution held the slot"
             ));
         }
-        if lifetime > 0 && state.stopping.contains(&firing) {
+        let at = if execution.is_empty() {
+            String::new()
+        } else {
+            format!(" of {execution}")
+        };
+        if lifetime > 0 && state.stopping.contains(&(execution.clone(), firing)) {
             state.violations.push(format!(
-                "firing {firing} was stopping at the crash and ran again (attempt {attempt})"
+                "firing {firing}{at} was stopping at the crash and ran again (attempt {attempt})"
             ));
         }
-        if lifetime > 0 && state.finished.contains(&(firing, attempt)) {
-            state.violations.push(format!(
-                "firing {firing} attempt {attempt} finished before the crash and ran again"
-            ));
-        }
-        if state
-            .processes
-            .iter()
-            .any(|ran| ran.lifetime == lifetime && ran.firing == firing && ran.attempt == attempt)
+        if lifetime > 0
+            && state
+                .finished
+                .contains(&(execution.clone(), firing, attempt))
         {
             state.violations.push(format!(
-                "firing {firing} attempt {attempt} ran twice in driver lifetime {lifetime}"
+                "firing {firing}{at} attempt {attempt} finished before the crash and ran again"
+            ));
+        }
+        if state.processes.iter().any(|ran| {
+            ran.lifetime == lifetime
+                && ran.execution == execution
+                && ran.firing == firing
+                && ran.attempt == attempt
+        }) {
+            state.violations.push(format!(
+                "firing {firing}{at} attempt {attempt} ran twice in driver lifetime {lifetime}"
             ));
         }
         let process = Arc::new(ProcessState {
@@ -508,7 +546,8 @@ impl ExecEnv for WorldEnv {
             process.kill(9);
         }
         state.processes.push(Ran {
-            scope: self.scope,
+            key: self.key.clone(),
+            execution,
             generation: self.generation,
             lifetime,
             firing,
@@ -593,10 +632,10 @@ impl ProcessHandle for WorldProcess {
 
 // ── A step that runs one process per attempt ──────────────────────────────
 
-pub(crate) const SANDBOXED: StepKindId = StepKindId::new_static("sandboxed");
+pub const SANDBOXED: StepKindId = StepKindId::new_static("sandboxed");
 
 #[derive(Deserialize)]
-pub(crate) struct SandboxedConfig {
+pub struct SandboxedConfig {
     /// Virtual milliseconds of work per attempt; the last repeats.
     #[serde(default)]
     work_ms:    Vec<u64>,
@@ -624,7 +663,7 @@ fn yes() -> bool {
 
 /// Spawns one process in the scope's environment, forwards its output, turns
 /// a cancel into `SIGTERM` and a kill into `SIGKILL`, and reports its exit.
-pub(crate) struct SandboxedStep;
+pub struct SandboxedStep;
 
 #[async_trait::async_trait]
 impl Step for SandboxedStep {
@@ -714,7 +753,7 @@ impl Step for SandboxedStep {
     }
 }
 
-pub(crate) fn sandboxed_registry() -> Registry {
+pub fn sandboxed_registry() -> Registry {
     let mut registry = Registry::new();
     registry.register(SandboxedStep);
     registry
@@ -722,11 +761,11 @@ pub(crate) fn sandboxed_registry() -> Registry {
 
 /// Step output kept in memory: the simulation writes no file.
 #[derive(Debug, Default)]
-pub(crate) struct MemoryLogs(Mutex<BTreeMap<String, Vec<String>>>);
+pub struct MemoryLogs(Mutex<BTreeMap<String, Vec<String>>>);
 
 impl MemoryLogs {
     /// How many lines the logs hold.
-    pub(crate) fn lines(&self) -> usize {
+    pub fn lines(&self) -> usize {
         self.0
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
@@ -764,15 +803,15 @@ fn attempt_roll(seed: u64, firing: u64, attempt: u32, purpose: u64) -> u64 {
 
 /// A host whose hooks take time, and sometimes block or skip an attempt or
 /// fail its result preparation, fatally or not.
-pub(crate) struct WorldHooks {
+pub struct WorldHooks {
     pub world: Arc<World>,
     pub seed:  u64,
 }
 
 /// The reason a hook's block carries.
-pub(crate) const HOOK_BLOCK: &str = "simulated hook block";
+pub const HOOK_BLOCK: &str = "simulated hook block";
 /// The message a fatal result preparation failure carries.
-pub(crate) const PREPARATION_FAILURE: &str = "simulated preparation failure";
+pub const PREPARATION_FAILURE: &str = "simulated preparation failure";
 
 #[async_trait::async_trait]
 impl ExecutionHooks for WorldHooks {

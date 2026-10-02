@@ -42,7 +42,8 @@ impl RecordingClock {
         Self(Arc::new(now))
     }
 
-    pub(crate) fn now(&self) -> u64 {
+    /// The current reading, in milliseconds since the Unix epoch.
+    pub fn now(&self) -> u64 {
         (self.0)()
     }
 }

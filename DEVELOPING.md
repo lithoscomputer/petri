@@ -101,27 +101,40 @@ skips the comparison; `mise run test:lean` builds the model and requires it,
 as the `lean model` CI job does. A new Lean or elan version must be at least
 a day old, like every other tool here.
 
-## Driver simulation
+## Simulations
 
 `crates/core/driver/tests/simulation.rs` is deterministic simulation testing
 of the driver. Each seed builds a workflow, host stops and crashes, and a host
 that answers questions, delays and fails hooks and decisions, and shares the
 attempt slot with a sibling execution. It runs the real driver against a
-simulated sandbox world on a paused, single-threaded runtime; every choice
-comes from the seed, so a seed always runs the same way. `mise run test` runs
-128 seeds in well under a second, and `mise run test:dst`, part of the nightly
-gate, runs 50,000. To run another number, or to replay a failing seed with a
-trace of what it did:
+simulated sandbox world (`testkit::sim`) on a paused, single-threaded
+runtime; every choice comes from the seed, so a seed always runs the same
+way.
+
+`crates/core/execution/tests/simulation.rs` does the same for the execution
+layer. Each seed builds a root graph and child graphs with invoke steps
+(single calls and forks, their own sandbox or the caller's, some through a
+fork gate) and restart arms, sometimes turns on the circuit breaker or a low
+invocation limit, plans host cancels and up to three crashes, at a time or
+right after a chosen coordinator record, and runs the coordinator through the
+host wrappers over one in-memory store, resuming after each crash.
+
+`mise run test` runs 128 and 64 seeds, each in a few seconds at most, and
+`mise run test:dst`, part of the nightly gate, runs 50,000 and 20,000. To
+run another number, or to replay a failing seed with a trace of what it did:
 
 ```sh
 PETRI_DST_SEEDS=2000 cargo nextest run -p petri-driver --test simulation
-PETRI_DST_SEED=1234 PETRI_DST_TRACE=1 cargo nextest run -p petri-driver \
+PETRI_DST_SEED=1234 PETRI_DST_TRACE=1 cargo nextest run -p petri-execution \
   --test simulation --no-capture
 ```
 
-Keep the simulation deterministic: every `select!` it or the driver runs is
-`biased;`, maps it iterates are ordered, and time comes from the runtime's
-clock. `a_seeded_world_replays_byte_for_byte` checks it.
+Keep the simulations deterministic: every `select!` they, the driver or the
+coordinator run is `biased;`, maps they iterate are ordered, time comes from
+the runtime's clock, and the runtime's `recording_clock`, `step_logs` and
+`decision_seed` take the rest. `a_seeded_world_replays_byte_for_byte`,
+`a_seeded_run_replays_byte_for_byte` and the two `determinism.rs` tests check
+it.
 
 ## Diagnostics
 

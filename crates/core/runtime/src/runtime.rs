@@ -12,8 +12,9 @@ use std::time::Duration;
 use std::{env, fs, io, mem, process};
 
 use driver::{
-    Driver, EventObserver, ExecutionHooks, ExecutionReport, HookContext, ResumeError, ResumeInfo,
-    RunConfig, RunGuard, SandboxAssignment,
+    DecisionRolls, Driver, EventObserver, ExecutionHooks, ExecutionReport, HookContext,
+    RecordingClock, ResumeError, ResumeInfo, RunConfig, RunGuard, SandboxAssignment,
+    SeededDecisionResolver, StepLogStore,
 };
 use engine::{EngineStart, EventLog, ReplayMismatch};
 use executor::{
@@ -166,6 +167,46 @@ pub struct Runtime {
     simulated:    bool,
     /// Built-in providers the standard router reaches instead of plugins.
     in_process:   Option<InProcessProviders>,
+    sources:      Sources,
+}
+
+/// Makes a store for the step output of the execution whose directory it is
+/// given.
+type StepLogs = Arc<dyn Fn(&Path) -> Arc<dyn StepLogStore> + Send + Sync>;
+
+/// Where a run's recording stamps, step output and weighted routing draws
+/// come from. The defaults are the wall clock, each execution directory's
+/// `logs/` and the operating system. A simulation passes a virtual clock,
+/// in-memory logs and a seed, so a run is a function of its inputs.
+#[derive(Clone, Default)]
+struct Sources {
+    clock:     Option<RecordingClock>,
+    step_logs: Option<StepLogs>,
+    seed:      Option<u64>,
+}
+
+impl Sources {
+    /// A driver's configuration with this run's clock and step logs.
+    fn configure(&self, mut config: RunConfig) -> RunConfig {
+        if let Some(clock) = &self.clock {
+            config = config.with_recording_clock(clock.clone());
+        }
+        if let Some(step_logs) = &self.step_logs {
+            let logs = step_logs(&config.run_dir);
+            config = config.with_step_logs(logs);
+        }
+        config
+    }
+
+    /// A standalone driver with this run's seeded draws, when it has a seed.
+    fn equip(&self, driver: Driver) -> Driver {
+        match self.seed {
+            Some(seed) => {
+                driver.with_decision_resolver(Arc::new(SeededDecisionResolver::new(seed)))
+            }
+            None => driver,
+        }
+    }
 }
 
 impl Runtime {
@@ -205,6 +246,7 @@ impl Runtime {
             ),
             simulated:    false,
             in_process:   None,
+            sources:      Sources::default(),
         }
     }
 
@@ -228,7 +270,35 @@ impl Runtime {
             ),
             simulated:    false,
             in_process:   None,
+            sources:      Sources::default(),
         }
+    }
+
+    /// Stamp every record a run appends, its drivers' and its coordinator's,
+    /// with `clock` instead of the wall clock.
+    #[must_use]
+    pub fn recording_clock(mut self, clock: RecordingClock) -> Self {
+        self.sources.clock = Some(clock);
+        self
+    }
+
+    /// Keep each driver's step output in the store `logs` makes for its
+    /// execution directory, instead of that directory's `logs/`.
+    #[must_use]
+    pub fn step_logs(
+        mut self,
+        logs: impl Fn(&Path) -> Arc<dyn StepLogStore> + Send + Sync + 'static,
+    ) -> Self {
+        self.sources.step_logs = Some(Arc::new(logs));
+        self
+    }
+
+    /// Roll every weighted routing draw from `seed` instead of the operating
+    /// system. The draws are recorded either way.
+    #[must_use]
+    pub fn decision_seed(mut self, seed: u64) -> Self {
+        self.sources.seed = Some(seed);
+        self
     }
 
     /// Register a frontend. It goes to the front of the list, so a specific
@@ -679,7 +749,7 @@ impl Runtime {
             self.secrets.clone(),
             self.run_config(),
         );
-        run.equip_standalone(driver)
+        run.equip_standalone(self.sources.equip(driver))
     }
 
     /// Prepare resources that are shared by every execution in one root run.
@@ -764,6 +834,7 @@ impl Runtime {
             hooks: self.hooks.clone(),
             caps,
             guards,
+            sources: self.sources.clone(),
         }
     }
 
@@ -800,12 +871,14 @@ impl Runtime {
             self.run_config(),
         )?;
         let run = self.provision_run(self.options.run_dir.clone(), key, executor, router);
-        Ok((run.equip_standalone(driver), info))
+        Ok((run.equip_standalone(self.sources.equip(driver)), info))
     }
 
     fn run_config(&self) -> RunConfig {
-        base_run_config(&self.options, self.options.run_dir.clone())
-            .with_retention(self.options.retention)
+        self.sources.configure(
+            base_run_config(&self.options, self.options.run_dir.clone())
+                .with_retention(self.options.retention),
+        )
     }
 
     /// Run a graph to completion. With `verify_replay` on (the default), the
@@ -901,6 +974,7 @@ pub struct RunRuntime {
     hooks:     Option<Arc<dyn ExecutionHooks>>,
     caps:      ::steps::Capabilities,
     guards:    Vec<RunServiceGuard>,
+    sources:   Sources,
 }
 
 impl RunRuntime {
@@ -1063,6 +1137,22 @@ impl RunRuntime {
         self.secrets.clone()
     }
 
+    /// The clock the run's records are stamped with.
+    pub fn recording_clock(&self) -> RecordingClock {
+        self.sources.clock.clone().unwrap_or_default()
+    }
+
+    /// Where an execution's weighted routing draws come from: the operating
+    /// system, or the run's seed mixed with the execution's id, so no two
+    /// executions draw the same sequence.
+    pub fn decision_rolls(&self, execution: ExecutionId) -> DecisionRolls {
+        self.sources
+            .seed
+            .map_or_else(DecisionRolls::default, |seed| {
+                DecisionRolls::seeded(seed ^ execution.raw().wrapping_mul(0xD1B5_4A32_D192_ED03))
+            })
+    }
+
     pub fn masker(&self) -> Masker {
         self.secrets.masker()
     }
@@ -1086,13 +1176,15 @@ impl RunRuntime {
         // An execution ends before its invocation can restart. Workspace
         // retention therefore belongs to the lease's release, not to an
         // individual driver release.
-        base_run_config(&self.options, execution_dir)
-            .with_retention(Retention::Always)
-            .with_scope_identities(
-                context.execution.environment_prefix(),
-                context.invocation.workspace_prefix(),
-            )
-            .with_sandbox_assignment(sandbox)
+        self.sources.configure(
+            base_run_config(&self.options, execution_dir)
+                .with_retention(Retention::Always)
+                .with_scope_identities(
+                    context.execution.environment_prefix(),
+                    context.invocation.workspace_prefix(),
+                )
+                .with_sandbox_assignment(sandbox),
+        )
     }
 }
 

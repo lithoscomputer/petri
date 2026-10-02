@@ -59,10 +59,11 @@ use ir::{
     validate,
 };
 use serde_json::json;
+use smol_str::SmolStr;
 use steps::{Answer, Question};
 use store::RunKey;
 use support::RunDir;
-use support::world::{
+use testkit::sim::{
     Dice, Faults, HOOK_BLOCK, MemoryLogs, PREPARATION_FAILURE, SANDBOXED, World, WorldHooks,
     sandboxed_registry,
 };
@@ -543,7 +544,7 @@ impl Lives {
             .filter_map(|event| match event {
                 Event::StepFinished {
                     firing, attempt, ..
-                } => Some((firing.raw(), attempt.raw())),
+                } => Some((SmolStr::default(), firing.raw(), attempt.raw())),
                 _ => None,
             })
             .collect();
@@ -581,7 +582,7 @@ impl Lives {
         let stopping = replayed
             .live_firings()
             .filter(|firing| firing.cancelling)
-            .map(|firing| firing.id.raw())
+            .map(|firing| (SmolStr::default(), firing.id.raw()))
             .collect();
         self.world.begin_lifetime(finished, stopping);
         self.lifetime += 1;
@@ -816,7 +817,7 @@ fn simulate_world(dir: &RunDir, seed: u64) -> Outcome {
                 continue;
             }
             let recovery = acquisitions.iter().any(|a| {
-                a.scope == process.scope
+                a.key == process.key
                     && a.generation == process.generation
                     && a.lifetime < last
                     && !a.fenced

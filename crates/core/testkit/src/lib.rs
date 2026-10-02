@@ -27,6 +27,7 @@ use tokio::time;
 
 pub mod in_process;
 pub mod run_store;
+pub mod sim;
 
 /// A process-unique counter, for run ids and directory names.
 pub fn unique_id() -> u64 {
