@@ -9,3 +9,4 @@ import PetriModel.Thm.Pick
 import PetriModel.Thm.Flow
 import PetriModel.Thm.Retry
 import PetriModel.Thm.Control
+import PetriModel.Thm.Agree

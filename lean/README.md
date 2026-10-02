@@ -126,9 +126,20 @@ break one. These theorems read the rules back out of any run:
   decisions, twice its live firings, and three times the firings the budgets
   have left.
 
-Not proved yet: that the control model, with a host that only finishes
-firings, runs as `Spec.run` does, which would carry the flow and retry
-theorems over to it. The comparison checks it on every such case.
+For the control model without stops (`PetriModel/Thm/Agree.lean`):
+
+- `control_free_agrees`: a host that only finishes firings, never holds a
+  decision and answers each one with the default observes the same run in
+  `Control.run` as in `Spec.run`. The theorem assumes no script reports
+  `cancelled`, which only a host honoring a stop does. The steps, records,
+  attempts, retries, parked tokens, budget refusals and status all match, and
+  there is no stop signal and no key completed without running. The proof
+  runs both models side by side. The host picks the same firing, runs its
+  attempts as the retry model counts them, and admits what the flow model
+  delivers, in the same order and with the same firing numbers.
+- The flow and retry theorems therefore hold for those runs of the control
+  model. `control_free_started_once`, `control_free_budget_exceeded_fails`
+  and `control_free_retries_invisible` carry three of them over.
 
 For retries (`PetriModel/Thm/Retry.lean`):
 
