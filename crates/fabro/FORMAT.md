@@ -73,3 +73,8 @@ would refuse), `fabro.petri_extension` (`[run.agent] skills`, which Fabro
 refuses), and the `unsupported.workflow_toml.*` and
 `ignored.workflow_toml.*` families ("other sections" above). Everything the
 DOT file itself raises is the language's, `attractor.*`.
+
+Workflow environment secret references also reach ACP agent launches (both
+`acp.command` and `acp.config`). They resolve at launch, and explicit
+`acp.config.env` entries override the workflow environment for the same name.
+Secret values never enter the admitted graph or unmasked run records.

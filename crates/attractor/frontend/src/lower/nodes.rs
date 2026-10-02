@@ -465,6 +465,14 @@ impl Ctx<'_> {
             .attrs
             .text("acp.config")
             .or_else(|| workflow.attrs.text("acp.config"));
+        let mut env = Map::new();
+        if let Some(environment) = &self.settings.environment {
+            for (key, value) in &environment.env {
+                if let EnvValue::Secret(_) = value {
+                    env.insert(key.clone(), value.to_json());
+                }
+            }
+        }
         match (command, acp_config) {
             (Some(_), Some(_)) => self.diags.error(
                 "attractor.acp_both",
@@ -489,6 +497,11 @@ impl Ctx<'_> {
             },
             (None, None) if acp_backend => lints::acp_requires_command(node, &mut self.diags),
             (None, None) => {}
+        }
+        if !env.is_empty()
+            && let Some(acp) = config.get_mut("acp")
+        {
+            acp["env"] = Value::Object(env);
         }
     }
 

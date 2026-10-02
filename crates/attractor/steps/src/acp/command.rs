@@ -87,6 +87,19 @@ impl AgentCommand {
         })
     }
 
+    /// Workflow secret references fill the launch environment beneath the
+    /// agent's explicit `acp.config.env` overrides. Values resolve only at
+    /// spawn.
+    pub fn with_workflow_env(mut self, env: Option<&Value>) -> Result<Self, String> {
+        if let Some(env) = env {
+            let mut inherited: BTreeMap<String, EnvValue> = serde_json::from_value(env.clone())
+                .map_err(|error| format!("invalid ACP workflow environment: {error}"))?;
+            inherited.append(&mut self.env);
+            self.env = inherited;
+        }
+        Ok(self)
+    }
+
     /// The process to start: the command with its environment resolved.
     /// Every product credential the provider knows comes first, then the
     /// command's own `env` on top; a `$secret` reference the provider cannot

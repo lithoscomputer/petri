@@ -402,3 +402,47 @@ async fn a_secret_reference_the_run_cannot_supply_fails_the_node() {
         "{output}"
     );
 }
+
+#[tokio::test]
+async fn workflow_secrets_reach_command_and_config_acp_agents_with_explicit_overrides() {
+    for config_launch in [false, true] {
+        let dir = RunDir::new("acp-workflow-secrets");
+        let agent = scripted_agent(&dir);
+        let record = dir.path().join("env.json");
+        let mut graph = with_env(agent_graph(&agent), &[
+            ("ACP_MODE", "tools"),
+            ("ACP_ENV_RECORD", record.to_str().expect("utf-8")),
+            ("ACP_ENV_RECORD_KEYS", "AGENT_KEY"),
+        ]);
+        let acp = &mut node_config(&mut graph, "a")["acp"];
+        acp["env"] = json!({ "AGENT_KEY": { "$secret": "WORKFLOW_KEY" } });
+        if config_launch {
+            *acp = json!({
+                "config": {"command":"python3", "args":[agent], "env":{"AGENT_KEY":{"$secret":"OVERRIDE_KEY"}}},
+                "env": {"AGENT_KEY":{"$secret":"WORKFLOW_KEY"}}
+            });
+        }
+        let secrets = MapSecrets::from_pairs(&[
+            ("WORKFLOW_KEY", "workflow-secret-value"),
+            ("OVERRIDE_KEY", "override-secret-value"),
+        ]);
+        let report = run(&dir, graph, secrets).await;
+        assert_eq!(
+            report.status,
+            RunStatus::Success,
+            "{:?}",
+            report.state.errors()
+        );
+        let seen: Value =
+            serde_json::from_str(&fs::read_to_string(record).expect("record")).expect("json");
+        let expected = if config_launch {
+            "override-secret-value"
+        } else {
+            "workflow-secret-value"
+        };
+        assert_eq!(seen, json!({"AGENT_KEY": expected}));
+        let logs = log_lines(&report);
+        assert!(logs.iter().any(|line| line == "AGENT_KEY=***"), "{logs:?}");
+        assert!(!format!("{logs:?}").contains("secret-value"));
+    }
+}

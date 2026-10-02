@@ -181,10 +181,12 @@ impl AgentConfig {
     fn command(&self) -> Result<AgentCommand, String> {
         if let Some(acp) = &self.acp {
             if let Some(line) = acp.get("command").and_then(Value::as_str) {
-                return AgentCommand::from_command_line(line);
+                let command = AgentCommand::from_command_line(line)?;
+                return command.with_workflow_env(acp.get("env"));
             }
             if let Some(config) = acp.get("config") {
-                return AgentCommand::from_config(config);
+                let command = AgentCommand::from_config(config)?;
+                return command.with_workflow_env(acp.get("env"));
             }
         }
         match env::var(DEFAULT_COMMAND_ENV) {

@@ -279,6 +279,16 @@ impl EnvHandle {
         }
     }
 
+    /// Replace the process environment while preserving the scope identity,
+    /// sandbox, container runner and the originating executor's teardown
+    /// record. An executor layer uses this to decorate the environment it
+    /// acquired.
+    #[must_use]
+    pub fn with_exec(mut self, env: Arc<dyn ExecEnv>) -> Self {
+        self.env = env;
+        self
+    }
+
     /// Bind a scope-bound one-shot container runner to this environment. An
     /// executor that can run containers in this scope's world attaches one;
     /// pure executors that cannot simply never call this.
