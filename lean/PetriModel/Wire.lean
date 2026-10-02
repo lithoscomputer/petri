@@ -114,7 +114,8 @@ def flowCase (j : Json) : Except String Control.Case := do
   return {
     nodes := ← list (← field j "nodes") node
     schedule := ← list (← field j "schedule") action
-    holds := ← (j.getObjValD "holds").getBool? <|> pure false }
+    holds := ← (j.getObjValD "holds").getBool? <|> pure false
+    verdicts := ← list (j.getObjValD "verdicts") (·.getNat?) <|> pure [] }
 
 def nats (ns : List Nat) : Json :=
   .arr (ns.map toJson).toArray

@@ -80,6 +80,8 @@ pub(crate) const NOOP: StepKindId = StepKindId::new_static("noop");
 
 type Responder = Box<dyn FnMut(&StartInfo) -> Outcome>;
 type Observer = Box<dyn FnMut(&EngineState, &[Command])>;
+/// Answers a decision itself, or leaves it to the default answer.
+type Decider = Box<dyn FnMut(&Command, &EngineState) -> Option<Event>>;
 
 pub(crate) struct Harness {
     pub state:             EngineState,
@@ -102,6 +104,8 @@ pub(crate) struct Harness {
     /// Leave each `Admit` and `ResolveRouting` in `commands` for the test to
     /// answer, instead of answering it at once.
     hold_decisions:        bool,
+    /// Answers decisions instead of the default, when it chooses to.
+    decider:               Option<Decider>,
 }
 
 impl Harness {
@@ -117,7 +121,18 @@ impl Harness {
             status:            None,
             observer:          None,
             hold_decisions:    false,
+            decider:           None,
         }
+    }
+
+    /// Let `decide` answer each decision: the event it returns is fed as the
+    /// answer, and `None` leaves the default answer.
+    pub(crate) fn deciding(
+        mut self,
+        decide: impl FnMut(&Command, &EngineState) -> Option<Event> + 'static,
+    ) -> Self {
+        self.decider = Some(Box::new(decide));
+        self
     }
 
     /// Leave every decision the core asks for open: the test answers each
@@ -274,6 +289,12 @@ impl Harness {
     /// attempt, or resolve each routing group. Any other command is no
     /// decision, and is left alone.
     pub(crate) fn answer(&mut self, command: &Command) {
+        if let Some(decide) = self.decider.as_mut()
+            && let Some(event) = decide(command, &self.state)
+        {
+            self.feed(event);
+            return;
+        }
         match command {
             Command::Admit { decision_id } => {
                 let event = Event::AdmissionDecided {
@@ -419,7 +440,9 @@ impl Harness {
 /// The engine's own deterministic pick, with a fixed roll of zero for weighted
 /// tiers — the host would roll randomly; a test walks the same cursor with a
 /// known draw.
-fn resolve_group(proposal: &engine::RoutingProposal) -> (RouteDecision, Option<WeightedDraw>) {
+pub(crate) fn resolve_group(
+    proposal: &engine::RoutingProposal,
+) -> (RouteDecision, Option<WeightedDraw>) {
     let draw = (proposal.pick == Some(ir::PickPolicy::WeightedRandom)
         && !proposal.candidates.is_empty())
     .then(|| WeightedDraw {

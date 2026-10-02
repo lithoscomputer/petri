@@ -37,10 +37,13 @@ host that holds its decisions, as a driver whose hooks and resolver take
 time does, keeps them open, oldest first, until a step answers one, so stops
 and finishes land in between. A stop settles a firing waiting on its
 admission, as it settles one waiting on its backoff, and withdraws the
-decision; a kill also withdraws the open routings of what it reached. A
-firing's number among its node's started firings, which picks its script, is
-fixed when its first admission is answered. Firing ids order the signals and
-the settles. All models leave out expansions, preconditions and splices. The Rust
+decision; a kill also withdraws the open routings of what it reached. The
+host also varies what it answers: an admission may be skipped, recording a
+success, a failure or a cancel without running, or blocked, which records a
+failure and fails the run; a routing group may take another of its arms, or
+be blocked. A firing's number among its node's started firings, which picks
+its script, is fixed when its first admission is answered. Firing ids order
+the signals and the settles. All models leave out expansions, preconditions and splices. The Rust
 generator does not produce them either.
 
 The base delay is computed in `Float`, which is IEEE 754 double precision
@@ -112,7 +115,8 @@ break one. These theorems read the rules back out of any run:
   stop of the root.
 - `run_settles`: every run ends with nothing live and no decision open, so
   it never reports `unsettled` (`run_not_unsettled`), even when the host
-  holds its decisions and stops land between them. Two invariants carry it.
+  holds its decisions, stops land between them, and the host skips, blocks
+  or overrides what the core proposes. Two invariants carry it.
   The budget counts stay within the budgets. And every live firing was
   admitted, or its admission is open (`Held`). A stop keeps `Held` only
   because it settles each firing whose admission it withdraws. A kill that
@@ -164,8 +168,8 @@ real core's:
   after each host step, the order they finish in, the tokens left waiting at
   the end, the budget refusals, the run status, each firing's attempts and
   recorded status, each retry's base delay, the stop signals, and the keys
-  that completed without running. It runs `Control.run`, stops and held
-  decisions included.
+  that completed without running. It runs `Control.run`, stops, held
+  decisions and the host's other answers included.
 - `deterministic_pick_matches_the_lean_model`: the picked edge, or the
   reason for a refusal. A new refusal message in Rust fails the test until
   the model has it too.

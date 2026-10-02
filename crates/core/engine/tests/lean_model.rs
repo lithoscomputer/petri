@@ -117,8 +117,8 @@ proptest! {
     /// they finish in, the tokens left waiting, the budget refusals, the run
     /// status, each firing's attempts and recorded status, each retry's base
     /// delay, bit for bit, the stop signals and the keys that completed
-    /// without running all match the model, stops and held decisions
-    /// included.
+    /// without running all match the model, stops, held decisions and the
+    /// host's skips, blocks and overrides included.
     #[test]
     fn flow_runs_match_the_lean_model(case in flow::flow_case()) {
         let Some(answer) = ask(&json!({ "flow": &case })) else {

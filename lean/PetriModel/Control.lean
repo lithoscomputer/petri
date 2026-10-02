@@ -34,6 +34,12 @@ firing's number among its node's started firings, which picks its script, is
 fixed when its first admission is answered. Firing ids order the signals and
 the settles, as `live_firings` does.
 
+The host also varies what it answers, one roll of the case's verdicts per
+admission and per routing group. An admission may be skipped, recording a
+success, a failure or a cancel without running, or blocked, recording a
+failure and failing the run. A routing group may take another of its arms or
+be blocked, which routes nothing from it and fails the run.
+
 The run keeps a log of stops, starts, retries and routings, newest first.
 Each entry carries the proof of the rule it must satisfy against the entries
 below it (`Valid`), so the model cannot build a run that breaks one; the
@@ -80,6 +86,9 @@ structure Case where
   schedule : List Action
   /-- The host holds each decision open until a step answers it. -/
   holds : Bool
+  /-- The rolls the host answers decisions with, in the order it answers
+  them; the default answer once they run out. -/
+  verdicts : List Nat
   deriving Repr
 
 /-- The case as routing sees its graph, to share `Flow`'s edges and seeds. -/
@@ -220,6 +229,8 @@ structure State (c : Case) where
   retries : List (Nat × Nat × Nat × Nat)
   controls : List (Nat × Nat × String)
   failed : Bool
+  /-- How many of the host's rolls it has taken. -/
+  used : Nat
 
 variable {c : Case}
 
@@ -250,6 +261,67 @@ def State.awaiting (s : State c) (id : Nat) : Bool :=
 /-- Count one more firing of `node` against its budget. -/
 @[reducible] def State.bump (s : State c) (node : Nat) : State c :=
   { s with firings := s.firings.set node (s.firingsOf node + 1) }
+
+/-! ## The host's answers -/
+
+/-- How the host answers an attempt's admission (`AdmitVerdict`). -/
+inductive Verdict where
+  | admit
+  /-- Record this outcome without running the attempt. -/
+  | skip (o : Outcome)
+  | block
+  deriving Repr
+
+/-- An admission's answer from its roll: mostly admit. -/
+def admitVerdict (roll : Nat) : Verdict :=
+  match roll % 20 with
+  | 14 | 15 | 16 => .skip .success
+  | 17 => .skip .failure
+  | 18 => .skip .cancelled
+  | 19 => .block
+  | _ => .admit
+
+/-- What a firing the host did not admit records: the skip's outcome, or the
+block's failure. -/
+def Verdict.status : Verdict → Status
+  | .skip o => o.status
+  | .admit | .block => .failure
+
+/-- How the host answers one routing group (`RouteVerdict`). -/
+inductive RouteVerdict where
+  /-- The core's pick. -/
+  | pick
+  /-- The group's arm at this position, modulo its arms. -/
+  | override (index : Nat)
+  | block
+  deriving Repr
+
+/-- A routing group's answer from its roll: mostly the core's pick. -/
+def routeVerdict (roll : Nat) : RouteVerdict :=
+  match roll % 10 with
+  | 8 => .override (roll / 10)
+  | 9 => .block
+  | _ => .pick
+
+/-- The host's next roll, and the state that took it. -/
+@[reducible] def State.roll (s : State c) : Nat × State c :=
+  ((c.verdicts[s.used]?).getD 0, { s with used := s.used + 1 })
+
+/-- A firing the host's answer ended without running the attempt: it
+records the verdict's status (a block's failure fails the run, as its engine
+error does) and asks for its routing. One that never ran completes without
+running; one that ran before finishes with the attempt the answer was
+for. -/
+def State.endBy (s : State c) (f : Live) (v : Verdict) : State c × List Decision :=
+  ({ s with
+      live := s.live.filter (·.id != f.id)
+      finished := if f.admitted then s.finished ++ [f.key] else s.finished
+      attempts := if f.admitted then
+          s.attempts ++ [(f.key.1, f.key.2, f.attempt, v.status.tag)]
+        else s.attempts
+      completed := if f.admitted then s.completed else s.completed ++ [f.key]
+      failed := s.failed || v.status.isFailure },
+    [.route ⟨f.key, v.status⟩])
 
 def keyLe (a b : Key) : Bool :=
   a.1 < b.1 || (a.1 == b.1 && a.2 ≤ b.2)
@@ -306,11 +378,30 @@ def deliver : State c → List Token → State c × List Decision
     let r := deliver one.1 rest
     (r.1, one.2 ++ r.2)
 
-/-- The tokens a recorded outcome routes, in group order. -/
-def tokensOf (c : Case) (k : Key) (status : Status) : List Token :=
-  let groups := (c.nodes[k.1]?.map (·.groups)).getD []
-  (groups.filterMap (emit status)).map fun arm =>
-    ⟨arm.to, if arm.back then k.2 + 1 else k.2, arm.edge, status == .cancelled⟩
+/-- The token an arm carries from key `k`'s outcome. -/
+def tokenOf (k : Key) (status : Status) (arm : Flow.Arm) : Token :=
+  ⟨arm.to, if arm.back then k.2 + 1 else k.2, arm.edge, status == .cancelled⟩
+
+/-- One routing group's arm, as the host answers it: the core's pick,
+another arm of the group, or none; a block fails the run, as its engine
+error does. -/
+def pickArm (s : State c) (status : Status) (arms : List Flow.Arm) (roll : Nat) :
+    State c × Option Flow.Arm :=
+  match routeVerdict roll with
+  | .pick => (s, emit status arms)
+  | .override index => (s, arms[index % arms.length]?)
+  | .block => ({ s with failed := true }, none)
+
+/-- The tokens a recorded outcome routes, group by group, each group taking
+one of the host's rolls. -/
+def routeTokens (s : State c) (k : Key) (status : Status) :
+    List (List Flow.Arm) → State c × List Token
+  | [] => (s, [])
+  | arms :: rest =>
+    let r := s.roll
+    let p := pickArm r.2 status arms r.1
+    let next := routeTokens p.1 k status rest
+    (next.1, (p.2.map (tokenOf k status)).toList ++ next.2)
 
 /-- Admit a firing's first attempt: fix its number among its node's started
 firings. -/
@@ -326,16 +417,25 @@ def answer (s : State c) : Decision → State c × List Decision × List Key
   | .admit id =>
     match s.live.find? (·.id == id) with
     | none => (s, [], [])
-    | some f => (s.admit id f.key.1, [], [f.key])
+    | some f =>
+      let r := s.roll
+      match admitVerdict r.1 with
+      | .admit => (r.2.admit id f.key.1, [], [f.key])
+      | v => let e := r.2.endBy f v; (e.1, e.2, [])
   | .retry id =>
     match s.live.find? (·.id == id) with
     | none => (s, [], [])
-    | some f => (s, [], [f.key])
+    | some f =>
+      let r := s.roll
+      match admitVerdict r.1 with
+      | .admit => (r.2, [], [f.key])
+      | v => let e := r.2.endBy f v; (e.1, e.2, [])
   | .route r =>
     if hk : killedIn c s.log.entries r.key.1 = true then (s, [], [])
     else
       let s := { s with log := s.log.push (.routed r.key.1) (by simpa [Valid] using hk) }
-      let d := deliver s (tokensOf c r.key r.status)
+      let t := routeTokens s r.key r.status ((c.nodes[r.key.1]?.map (·.groups)).getD [])
+      let d := deliver t.1 t.2
       (d.1, d.2, [])
 
 /-- Answer decisions depth first: those one raises go before the rest. The
@@ -399,8 +499,12 @@ def runAttempts (every : Bool) : Nat → State c → Live → State c × List Ke
         log := s.log.push (.retried f.key.1) valid
         retries := s.retries ++ [(f.key.1, f.key.2, f.attempt + 1, baseDelay retry f.attempt)] }
       if every then
+        -- The next attempt's admission, answered inline.
         let f := { f with attempt := f.attempt + 1 }
-        runAttempts every fuel (s.update f) f
+        let r := s.roll
+        match admitVerdict r.1 with
+        | .admit => runAttempts every fuel (r.2.update f) f
+        | v => let e := r.2.endBy f v; raise e.1 e.2
       else (s.update { f with waiting := true }, [])
     else
       let status := recorded retry f.attempt o
@@ -418,11 +522,23 @@ def hostRun (every : Bool) (s : State c) (f : Live) : State c :=
   let r := runAttempts every (attemptFuel c) (s.update f) f
   { r.1 with steps := r.1.steps ++ [sorted r.2] }
 
+/-- The host answers `f`'s next attempt's admission inline: it runs the
+attempts, or the answer ends the firing. -/
+def hostAnswer (every : Bool) (s : State c) (f : Live) : State c :=
+  let r := s.roll
+  match admitVerdict r.1 with
+  | .admit => hostRun every r.2 f
+  | v =>
+    let e := r.2.endBy f v
+    let d := raise e.1 e.2
+    { d.1 with steps := d.1.steps ++ [sorted d.2] }
+
 /-- `finish` and `attempt`: the chosen admitted firing in ascending key
-order. A firing waiting on its backoff first gets its `RetryElapsed`; a host
-that holds its decisions leaves the next attempt's admission open when it
-runs a single attempt. An open admission of the firing's next attempt is
-answered first. With nothing admitted, the step does nothing. -/
+order. A firing waiting on its backoff first gets its `RetryElapsed` and its
+next attempt's admission; a host that holds its decisions leaves that
+admission open when it runs a single attempt. An open admission of the
+firing's next attempt is answered first. With nothing admitted, the step
+does nothing. -/
 def hostFinish (every : Bool) (s : State c) (choice : Nat) : State c :=
   let byKey := (s.live.filter (·.admitted)).mergeSort fun a b => keyLe a.key b.key
   match byKey[choice % byKey.length]? with
@@ -432,8 +548,10 @@ def hostFinish (every : Bool) (s : State c) (choice : Nat) : State c :=
       let f := { f with attempt := f.attempt + 1, waiting := false }
       if c.holds && !every then
         { s.update f with held := s.held ++ [.retry f.id], steps := s.steps ++ [[]] }
-      else hostRun every s f
-    else hostRun every { s with held := s.held.filter fun d => !d.retries f.id } f
+      else hostAnswer every s f
+    else if s.held.any (·.retries f.id) then
+      hostAnswer every { s with held := s.held.filter fun d => !d.retries f.id } f
+    else hostRun every s f
 
 /-- `decide`: answer the chosen open decision, oldest first, and hand the host
 what it raises. -/
@@ -492,7 +610,7 @@ def start (c : Case) : State c :=
     log := ⟨[], trivial⟩, keys := [], tainted := []
     firings := List.replicate c.nodes.length 0, started := List.replicate c.nodes.length 0
     nextId := 1, live := [], held := [], steps := [], finished := [], budgetExceeded := []
-    completed := [], attempts := [], retries := [], controls := [], failed := false }
+    completed := [], attempts := [], retries := [], controls := [], failed := false, used := 0 }
   let d := deliver s₀ ((seeds c.flow).map fun (node, edge) => ⟨node, 0, edge, false⟩)
   let r := raise d.1 d.2
   { r.1 with steps := [sorted r.2] }

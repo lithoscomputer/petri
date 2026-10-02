@@ -1,9 +1,10 @@
 //! §3/§4/§5 over random flows, loops, retries, stops and decisions the host
-//! holds open included: the join, generation, budget, retry, cancel and kill
-//! rules hold for every graph and every order a host takes its steps and
-//! answers its decisions in, not only for the hand-written cases in
-//! `joins.rs`, `loops.rs`, `retries.rs` and `cancellation.rs`. §8 invariant 10
-//! is checked against the same runs: a join it rejects never runs.
+//! holds open or answers its own way included: the join, generation, budget,
+//! retry, cancel and kill rules hold for every graph and every order a host
+//! takes its steps and answers its decisions in, not only for the
+//! hand-written cases in `joins.rs`, `loops.rs`, `retries.rs` and
+//! `cancellation.rs`. §8 invariant 10 is checked against the same runs: a join
+//! it rejects never runs.
 
 mod flow;
 mod support;
@@ -11,7 +12,9 @@ mod support;
 use std::collections::{BTreeMap, BTreeSet};
 
 use engine::{Command, EngineState, Event, RunError};
-use flow::{FlowCase, JoinSpec, Run, Start, Stop, Target};
+use flow::{
+    AdmitVerdict, Applied, FlowCase, HOST_BLOCK, JoinSpec, RouteVerdict, Run, Start, Stop, Target,
+};
 use ir::{
     CancelScopeId, EdgeId, FiringId, Graph, NodeId, Status, UnderlyingFailure, ValidationError,
     validate,
@@ -252,11 +255,13 @@ fn check_budgets(case: &FlowCase, run: &Run) -> Result<(), TestCaseError> {
         );
     }
     prop_assert!(
-        state
-            .errors()
-            .iter()
-            .all(|error| matches!(error, RunError::BudgetExceeded { .. })),
-        "only a budget can stop a generated run: {:?}",
+        state.errors().iter().all(|error| matches!(
+            error,
+            RunError::BudgetExceeded { .. }
+                | RunError::AdmissionBlocked { .. }
+                | RunError::RoutingBlocked { .. }
+        )),
+        "only a budget or the host's block can stop a generated run: {:?}",
         state.errors()
     );
     // Only a key that would run is an error. Once a stop reached an unmarked
@@ -314,6 +319,21 @@ fn check_retries(case: &FlowCase, run: &Run, firings: &Firings<'_>) -> Result<()
             );
         }
         let last = tries[tries.len() - 1];
+        // The host skipped or blocked the attempt after the last one that
+        // ran: the firing records that instead.
+        let answered = verdict_of(run, *firing, last.attempt + 1);
+        if let Some(verdict) = answered {
+            let record = state
+                .history()
+                .iter()
+                .rev()
+                .find(|record| record.firing == *firing);
+            prop_assert!(record.is_some(), "{firing} has no record");
+            let record = record.expect("checked above");
+            prop_assert_eq!(record.attempt.raw(), last.attempt + 1);
+            prop_assert_eq!(&record.outcome.status, &verdict_status(verdict));
+            continue;
+        }
         let settled = run.settled.contains_key(firing);
         let stopped = last
             .reported
@@ -429,16 +449,30 @@ fn check_stops(case: &FlowCase, run: &Run, firings: &Firings<'_>) -> Result<(), 
         .iter()
         .filter(|record| !started.contains(&record.firing))
     {
+        // The host skipped or blocked its first attempt.
+        if let Some(verdict) = verdict_of(run, record.firing, 1) {
+            prop_assert_eq!(&record.outcome.status, &verdict_status(verdict));
+            continue;
+        }
         prop_assert_eq!(
             &record.outcome.status,
             &Status::Cancelled,
             "{} completed without running",
             record.node
         );
+        // Cancelled work comes from a stop, or from a host that skipped an
+        // attempt with a cancel.
+        let cancelled_work = !run.stops.is_empty()
+            || run.applied.iter().any(|applied| {
+                matches!(applied, Applied::Admission {
+                    verdict: AdmitVerdict::Skip(flow::OutcomeSpec::Cancelled),
+                    ..
+                })
+            });
         prop_assert!(
             settled_admitting(record)
-                || !case.nodes[record.node.index()].run_on_cancel && !run.stops.is_empty(),
-            "{} completed without running, but it is marked or nothing was stopped",
+                || !case.nodes[record.node.index()].run_on_cancel && cancelled_work,
+            "{} completed without running, but it is marked or nothing was cancelled",
             record.node
         );
     }
@@ -571,6 +605,105 @@ fn check_stops(case: &FlowCase, run: &Run, firings: &Firings<'_>) -> Result<(), 
     Ok(())
 }
 
+/// The host's answer to a firing's attempt's admission, when it was not to
+/// admit it.
+fn verdict_of(run: &Run, firing: FiringId, attempt: u32) -> Option<AdmitVerdict> {
+    run.applied.iter().find_map(|applied| match applied {
+        Applied::Admission {
+            firing: answered,
+            attempt: at,
+            verdict,
+        } if *answered == firing && *at == attempt => Some(*verdict),
+        _ => None,
+    })
+}
+
+/// What a firing the host did not admit records: the outcome of a skip, or
+/// the failure of a block.
+fn verdict_status(verdict: AdmitVerdict) -> Status {
+    match verdict {
+        AdmitVerdict::Skip(outcome) => outcome.outcome().status,
+        AdmitVerdict::Block | AdmitVerdict::Admit => {
+            Status::Failure(ir::FailureInfo::new(HOST_BLOCK).with_class("admission_blocked"))
+        }
+    }
+}
+
+/// What the host answers is what the core does: a skipped or blocked
+/// attempt never starts, and records the skip's outcome or the block's
+/// failure; a block is an engine error, which fails the run; an overridden
+/// group emits the host's arm; a blocked group emits nothing.
+fn check_verdicts(run: &Run) -> Result<(), TestCaseError> {
+    let state = &run.harness.state;
+    let started: BTreeSet<(FiringId, u32)> = run
+        .starts
+        .iter()
+        .map(|start| (start.firing, start.attempt))
+        .collect();
+    let emitted: BTreeSet<(FiringId, EdgeId)> = state
+        .log
+        .events()
+        .filter_map(|event| match event {
+            Event::TokenEmitted { token } => Some((token.from, token.edge)),
+            _ => None,
+        })
+        .collect();
+    let mut blocks = 0;
+    for applied in &run.applied {
+        match applied {
+            Applied::Admission {
+                firing,
+                attempt,
+                verdict,
+            } => {
+                prop_assert!(
+                    !started.contains(&(*firing, *attempt)),
+                    "{firing} attempt {attempt} started although the host answered {verdict:?}"
+                );
+                let record = state
+                    .history()
+                    .iter()
+                    .find(|record| record.firing == *firing);
+                prop_assert!(
+                    record.is_some_and(|record| record.attempt.raw() == *attempt
+                        && record.outcome.status == verdict_status(*verdict)),
+                    "{firing} attempt {attempt} answered {verdict:?} recorded {record:?}"
+                );
+                blocks += usize::from(*verdict == AdmitVerdict::Block);
+            }
+            Applied::Route {
+                firing,
+                group,
+                verdict,
+                edge,
+            } => match (verdict, edge) {
+                (RouteVerdict::Block, _) => blocks += 1,
+                (RouteVerdict::Override(_), Some(edge)) => prop_assert!(
+                    emitted.contains(&(*firing, *edge)),
+                    "{firing}'s group {group} was overridden to edge {edge}, which it never emitted"
+                ),
+                _ => {}
+            },
+        }
+    }
+    let host_errors = state
+        .errors()
+        .iter()
+        .filter(|error| {
+            matches!(
+                error,
+                RunError::AdmissionBlocked { .. } | RunError::RoutingBlocked { .. }
+            )
+        })
+        .count();
+    prop_assert_eq!(
+        host_errors,
+        blocks,
+        "the host's blocks and the core's errors"
+    );
+    Ok(())
+}
+
 fn check_flow(case: &FlowCase) -> Result<(), TestCaseError> {
     let rejected = rejected_joins(&case.graph())?;
     let run = flow::run(case);
@@ -583,6 +716,7 @@ fn check_flow(case: &FlowCase) -> Result<(), TestCaseError> {
     check_budgets(case, &run)?;
     check_retries(case, &run, &firings)?;
     check_stops(case, &run, &firings)?;
+    check_verdicts(&run)?;
 
     // Every started firing finished or was settled. A stop of the root ends
     // the run `cancelled`, ahead of every failure; otherwise the run failed
@@ -595,7 +729,7 @@ fn check_flow(case: &FlowCase) -> Result<(), TestCaseError> {
         .any(|record| record.outcome.status.is_failure());
     let expected = if run.stops.iter().any(|stop| stop.target == Target::Root) {
         "cancelled"
-    } else if any_failed || !run.observed.budget_exceeded.is_empty() {
+    } else if any_failed || !state.errors().is_empty() {
         "failed"
     } else {
         "success"
@@ -664,6 +798,65 @@ fn held_decisions_reach_their_paths() {
         "a stop settled a firing waiting on its next attempt's admission",
         "a root kill withdrew an open routing",
         "a group kill withdrew an open routing",
+    ] {
+        assert!(
+            seen.get(path).copied().unwrap_or_default() > 0,
+            "no case reached {path}: {seen:?}"
+        );
+    }
+}
+
+/// The generated cases reach each answer the host can give other than the
+/// default, so the rules above are checked on them: a skip of either kind
+/// and a block, of a first attempt and of a retry, and an overridden and a
+/// blocked route.
+#[test]
+fn host_answers_reach_their_paths() {
+    let mut runner = TestRunner::deterministic();
+    let mut seen: BTreeMap<&str, usize> = BTreeMap::new();
+    for _ in 0..2048 {
+        let case = flow::flow_case()
+            .new_tree(&mut runner)
+            .expect("a case generates")
+            .current();
+        for applied in flow::run(&case).applied {
+            let path = match applied {
+                Applied::Admission {
+                    attempt: 1,
+                    verdict: AdmitVerdict::Block,
+                    ..
+                } => "a blocked first attempt",
+                Applied::Admission {
+                    verdict: AdmitVerdict::Block,
+                    ..
+                } => "a blocked retry",
+                Applied::Admission {
+                    verdict: AdmitVerdict::Skip(flow::OutcomeSpec::Cancelled),
+                    ..
+                } => "a skip that cancels",
+                Applied::Admission { attempt: 1, .. } => "a skipped first attempt",
+                Applied::Admission { .. } => "a skipped retry",
+                Applied::Route {
+                    verdict: RouteVerdict::Override(_),
+                    ..
+                } => "an overridden route",
+                Applied::Route {
+                    verdict: RouteVerdict::Block,
+                    ..
+                } => "a blocked route",
+                Applied::Route { .. } => continue,
+            };
+            *seen.entry(path).or_default() += 1;
+        }
+    }
+    for path in [
+        "a blocked first attempt",
+        "a blocked retry",
+        "a skip that cancels",
+        "a skipped first attempt",
+        "a skipped retry",
+        "an overridden route",
+        "a blocked route",
     ] {
         assert!(
             seen.get(path).copied().unwrap_or_default() > 0,

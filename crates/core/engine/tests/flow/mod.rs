@@ -31,6 +31,13 @@
 //! finishes a firing answers its admissions as it goes. After the schedule it
 //! answers the oldest open decision before it finishes anything.
 //!
+//! In some cases the host also varies what it answers. Each admission it
+//! answers takes the next roll of the case's verdicts: run the attempt, skip
+//! it with a success, a failure or a cancel, or block it. Each routing group
+//! takes one too: the core's pick, an override to another arm of the group,
+//! or a block. Once the rolls run out, every answer is the default. The
+//! execution's own admission is always admitted.
+//!
 //! Some generated graphs break a load-time rule on purpose: an `All` join over
 //! two arms of one routing group, a `Quorum { n }` fed by fewer than `n`
 //! groups (§8 invariant 10), or a loop head that does not join with `Any`
@@ -45,10 +52,15 @@
     reason = "each test binary compiles the whole module, and no one test uses every helper"
 )]
 
+use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet};
+use std::rc::Rc;
 use std::time::Duration;
 
-use engine::{Command, DecisionId, EngineState, Event, RunError};
+use engine::{
+    Admission, Command, DecisionId, EngineState, Event, GroupDecision, Intervention, MiddlewareKey,
+    RouteDecision, RunError,
+};
 use ir::{
     Arm, Attempt, Backoff, Budget, CancelScopeId, Control, EdgeId, FailureInfo, FiringId, Graph,
     GraphBuilder, JoinPolicy, NodeId, Outcome, RetryOn, RetryPolicy, RunStatus, ScopeId, Status,
@@ -58,7 +70,7 @@ use proptest::prelude::*;
 use serde::ser::SerializeMap;
 use serde::{Deserialize, Serialize, Serializer};
 
-use crate::support::{Harness, NOOP};
+use crate::support::{Harness, NOOP, resolve_group};
 
 const MAX_NODES: usize = 7;
 const MAX_FIRINGS: u32 = 4;
@@ -314,6 +326,69 @@ pub(crate) struct FlowCase {
     pub schedule: Vec<Action>,
     /// The host holds each decision open until a step answers it.
     pub holds:    bool,
+    /// The rolls the host answers decisions with, in the order it answers
+    /// them; see [`admit_verdict`] and [`route_verdict`].
+    pub verdicts: Vec<u8>,
+}
+
+/// How the host answers an attempt's admission.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum AdmitVerdict {
+    Admit,
+    /// Record this outcome without running the attempt.
+    Skip(OutcomeSpec),
+    Block,
+}
+
+/// An admission's answer from its roll: mostly admit.
+pub(crate) fn admit_verdict(roll: u8) -> AdmitVerdict {
+    match roll % 20 {
+        14..=16 => AdmitVerdict::Skip(OutcomeSpec::Success),
+        17 => AdmitVerdict::Skip(OutcomeSpec::Failure),
+        18 => AdmitVerdict::Skip(OutcomeSpec::Cancelled),
+        19 => AdmitVerdict::Block,
+        _ => AdmitVerdict::Admit,
+    }
+}
+
+/// How the host answers one routing group.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum RouteVerdict {
+    /// The core's own pick.
+    Pick,
+    /// The group's arm at this position, modulo its arms.
+    Override(usize),
+    Block,
+}
+
+/// A routing group's answer from its roll: mostly the core's pick.
+pub(crate) fn route_verdict(roll: u8) -> RouteVerdict {
+    match roll % 10 {
+        8 => RouteVerdict::Override(usize::from(roll / 10)),
+        9 => RouteVerdict::Block,
+        _ => RouteVerdict::Pick,
+    }
+}
+
+/// The reason a host's block gives.
+pub(crate) const HOST_BLOCK: &str = "blocked by the host";
+
+/// One answer the host gave other than the default, or the default where
+/// the checks need it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum Applied {
+    Admission {
+        firing:  FiringId,
+        attempt: u32,
+        verdict: AdmitVerdict,
+    },
+    Route {
+        firing:  FiringId,
+        group:   u32,
+        verdict: RouteVerdict,
+        /// The edge the answer emits, if any.
+        edge:    Option<EdgeId>,
+    },
 }
 
 impl FlowCase {
@@ -321,6 +396,7 @@ impl FlowCase {
     /// no decision held open.
     pub(crate) fn only_finishes(&self) -> bool {
         !self.holds
+            && self.verdicts.is_empty()
             && self
                 .schedule
                 .iter()
@@ -350,6 +426,7 @@ impl FlowCase {
             nodes,
             schedule: self.schedule.clone(),
             holds: self.holds,
+            verdicts: self.verdicts.clone(),
         }
     }
 
@@ -488,6 +565,9 @@ pub(crate) struct Run {
     pub refusals:  Vec<(usize, NodeId)>,
     /// The held decisions a stop withdrew, in order, with the stop's step.
     pub withdrawn: Vec<(usize, Command)>,
+    /// The host's answers that were not the default admission, and every
+    /// routing answer, in order.
+    pub applied:   Vec<Applied>,
     pub harness:   Harness,
 }
 
@@ -596,13 +676,21 @@ fn raw_node() -> impl Strategy<Value = RawNode> {
 }
 
 /// A case: a third only finish firings, a third stop work, and a third also
-/// hold their decisions open.
+/// hold their decisions open. About a third of each also vary what the host
+/// answers.
 pub(crate) fn flow_case() -> impl Strategy<Value = FlowCase> {
-    prop_oneof![
-        flow_case_without_stops(),
-        flow_case_with_stops(false),
-        flow_case_with_stops(true),
-    ]
+    (
+        prop_oneof![
+            flow_case_without_stops(),
+            flow_case_with_stops(false),
+            flow_case_with_stops(true),
+        ],
+        prop::option::weighted(0.35, prop::collection::vec(any::<u8>(), 1..=24)),
+    )
+        .prop_map(|(case, verdicts)| FlowCase {
+            verdicts: verdicts.unwrap_or_default(),
+            ..case
+        })
 }
 
 /// A case whose host only finishes firings: no groups, no `run_on_cancel`,
@@ -824,6 +912,7 @@ impl FlowCase {
             nodes,
             schedule,
             holds,
+            verdicts: Vec::new(),
         }
     }
 
@@ -914,12 +1003,19 @@ pub(crate) fn run_observed(
 }
 
 fn run_with(case: &FlowCase, harness: Harness) -> Run {
+    let answers = Rc::new(RefCell::new(Answers {
+        rolls: case.verdicts.clone(),
+        ..Answers::default()
+    }));
+    let decider = Rc::clone(&answers);
+    let harness =
+        harness.deciding(move |command, state| decider.borrow_mut().answer(command, state));
     let harness = if case.holds {
         harness.holding_decisions()
     } else {
         harness
     };
-    let mut host = Host::new(case, harness);
+    let mut host = Host::new(case, harness, answers);
     // Every step after the schedule answers a decision or finishes a firing.
     // Either lowers the open decisions plus twice the live firings plus three
     // times the firings the budgets have left, which starts below seven times
@@ -956,6 +1052,144 @@ fn run_with(case: &FlowCase, harness: Harness) -> Run {
     host.into_run()
 }
 
+/// The host's rolls, and what it answered with them.
+#[derive(Default)]
+struct Answers {
+    rolls:   Vec<u8>,
+    used:    usize,
+    applied: Vec<Applied>,
+}
+
+fn host_key() -> MiddlewareKey {
+    MiddlewareKey::new("host")
+}
+
+impl Answers {
+    /// The next roll; the default answer once they run out.
+    fn next(&mut self) -> u8 {
+        let roll = self.rolls.get(self.used).copied().unwrap_or(0);
+        self.used += 1;
+        roll
+    }
+
+    /// The host's answer to a decision: an attempt's admission takes one
+    /// roll, a routing one roll per group. The execution's own admission is
+    /// left to the default.
+    fn answer(&mut self, command: &Command, state: &EngineState) -> Option<Event> {
+        match command {
+            Command::Admit {
+                decision_id: decision_id @ DecisionId::AttemptStart { firing, attempt },
+            } => {
+                let verdict = admit_verdict(self.next());
+                if verdict != AdmitVerdict::Admit {
+                    self.applied.push(Applied::Admission {
+                        firing: *firing,
+                        attempt: attempt.raw(),
+                        verdict,
+                    });
+                }
+                let decision = match verdict {
+                    AdmitVerdict::Admit => Admission::Admit,
+                    AdmitVerdict::Skip(outcome) => Admission::Skip {
+                        outcome: outcome.outcome(),
+                    },
+                    AdmitVerdict::Block => Admission::Block {
+                        reason: HOST_BLOCK.into(),
+                    },
+                };
+                Some(Event::AdmissionDecided {
+                    decision_id: *decision_id,
+                    decision,
+                    trace: Vec::new(),
+                })
+            }
+            Command::ResolveRouting {
+                decision_id,
+                restart_allowed,
+                groups,
+            } => {
+                let DecisionId::Route { firing, .. } = decision_id else {
+                    return None;
+                };
+                let node = state
+                    .pending_routings()
+                    .find(|pending| pending.firing == *firing)?
+                    .node
+                    .clone();
+                let decisions = groups
+                    .iter()
+                    .map(|proposal| {
+                        let verdict = route_verdict(self.next());
+                        let arms = &node.routing.groups[proposal.group as usize].arms;
+                        let (decision, draw, trace) = match verdict {
+                            RouteVerdict::Pick => {
+                                let (decision, draw) = resolve_group(proposal);
+                                let decision = engine::enforce_restart_limit(
+                                    *restart_allowed,
+                                    proposal,
+                                    decision,
+                                );
+                                (decision, draw, Vec::new())
+                            }
+                            RouteVerdict::Override(index) => {
+                                let edge = arms[index % arms.len()].id;
+                                (RouteDecision::Emit(edge), None, vec![
+                                    Intervention::Override {
+                                        middleware: host_key(),
+                                        edge,
+                                    },
+                                ])
+                            }
+                            RouteVerdict::Block => (
+                                RouteDecision::Block {
+                                    reason: HOST_BLOCK.into(),
+                                },
+                                None,
+                                vec![Intervention::Block {
+                                    middleware: host_key(),
+                                    reason:     HOST_BLOCK.into(),
+                                }],
+                            ),
+                        };
+                        let edge = match &decision {
+                            RouteDecision::Emit(edge) => Some(*edge),
+                            _ => None,
+                        };
+                        self.applied.push(Applied::Route {
+                            firing: *firing,
+                            group: proposal.group,
+                            verdict,
+                            edge,
+                        });
+                        GroupDecision {
+                            group: proposal.group,
+                            draw,
+                            trace,
+                            decision,
+                        }
+                    })
+                    .collect();
+                Some(Event::RoutingResolved {
+                    decision_id: *decision_id,
+                    groups:      decisions,
+                })
+            }
+            _ => None,
+        }
+    }
+}
+
+/// How resuming a firing past its backoff went.
+enum Resumed {
+    /// The next attempt started.
+    Started,
+    /// Its admission is held open.
+    Held,
+    /// The host's answer ended the firing without running the attempt; its
+    /// routing started these.
+    Ended(Vec<Start>),
+}
+
 /// The scripted host, and everything it saw.
 struct Host<'a> {
     case:      &'a FlowCase,
@@ -979,10 +1213,11 @@ struct Host<'a> {
     settled:   BTreeMap<FiringId, usize>,
     refusals:  Vec<(usize, NodeId)>,
     withdrawn: Vec<(usize, Command)>,
+    answers:   Rc<RefCell<Answers>>,
 }
 
 impl<'a> Host<'a> {
-    fn new(case: &'a FlowCase, mut harness: Harness) -> Self {
+    fn new(case: &'a FlowCase, mut harness: Harness, answers: Rc<RefCell<Answers>>) -> Self {
         harness.feed(Event::ExecutionStarted {
             start: engine::EngineStart::default(),
         });
@@ -1003,6 +1238,7 @@ impl<'a> Host<'a> {
             settled: BTreeMap::new(),
             refusals: Vec::new(),
             withdrawn: Vec::new(),
+            answers,
         };
         // The execution's own admission is answered at once; its firings'
         // decisions wait.
@@ -1095,7 +1331,28 @@ impl<'a> Host<'a> {
         let decision = self.open.remove(choice as usize % self.open.len());
         self.harness.answer(&decision);
         self.take_decisions();
+        // A skipped or blocked admission of a started firing's next attempt
+        // ends the firing.
+        let ended: Vec<((u32, u32), FiringId)> = self
+            .live
+            .iter()
+            .filter(|(_, firing)| self.harness.state.firing(**firing).is_none())
+            .map(|(key, firing)| (*key, *firing))
+            .collect();
+        for (key, firing) in ended {
+            self.live.remove(&key);
+            self.finished.push(key);
+            self.record_attempts(key, firing);
+        }
         let batch = self.drain_starts(step);
+        self.started(batch);
+    }
+
+    /// A firing ended: its record is in, and its routing started `batch`.
+    fn end(&mut self, key: (u32, u32), firing: FiringId, batch: Vec<Start>) {
+        self.live.remove(&key);
+        self.finished.push(key);
+        self.record_attempts(key, firing);
         self.started(batch);
     }
 
@@ -1115,12 +1372,18 @@ impl<'a> Host<'a> {
             .nth(index)
             .expect("the index is below live.len()");
         if let Some(next_attempt) = self.waiting.remove(&firing) {
-            if !self.resume(step, firing, next_attempt, every_attempt) {
-                self.steps.push(Vec::new());
-                return;
+            match self.resume(step, firing, next_attempt, every_attempt) {
+                Resumed::Started => {}
+                Resumed::Held => {
+                    self.steps.push(Vec::new());
+                    return;
+                }
+                Resumed::Ended(batch) => return self.end(key, firing, batch),
             }
-        } else if self.admission_of(firing).is_some() {
-            self.take_attempt(step, firing);
+        } else if self.admission_of(firing).is_some()
+            && let Err(batch) = self.take_attempt(step, firing)
+        {
+            return self.end(key, firing, batch);
         }
         loop {
             self.report(step, firing);
@@ -1128,11 +1391,7 @@ impl<'a> Host<'a> {
             self.take_decisions();
             let batch = self.drain_starts(step);
             let Some(next_attempt) = retry else {
-                self.live.remove(&key);
-                self.finished.push(key);
-                self.record_attempts(key, firing);
-                self.started(batch);
-                return;
+                return self.end(key, firing, batch);
             };
             assert!(batch.is_empty(), "a non-final attempt routes nothing");
             if !every_attempt {
@@ -1140,7 +1399,9 @@ impl<'a> Host<'a> {
                 self.steps.push(Vec::new());
                 return;
             }
-            self.resume(step, firing, next_attempt, true);
+            if let Resumed::Ended(batch) = self.resume(step, firing, next_attempt, true) {
+                return self.end(key, firing, batch);
+            }
         }
     }
 
@@ -1153,33 +1414,46 @@ impl<'a> Host<'a> {
         firing: FiringId,
         next_attempt: Attempt,
         answer: bool,
-    ) -> bool {
+    ) -> Resumed {
         self.harness.feed(Event::RetryElapsed {
             firing,
             next_attempt,
         });
         self.take_decisions();
         if self.case.holds && !answer {
-            return false;
+            return Resumed::Held;
         }
-        self.take_attempt(step, firing);
-        true
+        match self.take_attempt(step, firing) {
+            Ok(()) => Resumed::Started,
+            Err(batch) => Resumed::Ended(batch),
+        }
     }
 
     /// Take the attempt a firing's admission starts, answering the admission
-    /// first when the host holds it.
-    fn take_attempt(&mut self, step: usize, firing: FiringId) {
+    /// first when the host holds it. When the host's answer skipped or
+    /// blocked the attempt instead, the firing has ended: what its routing
+    /// started comes back.
+    fn take_attempt(&mut self, step: usize, firing: FiringId) -> Result<(), Vec<Start>> {
         if let Some(position) = self.admission_of(firing) {
             let admission = self.open.remove(position);
             self.harness.answer(&admission);
             self.take_decisions();
         }
-        let batch = self.drain_starts(step);
+        let mut batch = self.drain_starts(step);
+        if let Some(at) = batch.iter().position(|start| start.firing == firing) {
+            let own = batch.remove(at);
+            assert!(
+                batch.is_empty(),
+                "an admission starts its own firing's attempt and nothing else"
+            );
+            self.starts.push(own);
+            return Ok(());
+        }
         assert!(
-            batch.len() == 1 && batch[0].firing == firing,
-            "an admission starts its own firing's attempt and nothing else"
+            self.harness.state.firing(firing).is_none(),
+            "an answered admission either starts its attempt or ends the firing"
         );
-        self.starts.extend(batch);
+        Err(batch)
     }
 
     /// Report the firing's running attempt: the scripted outcome, or
@@ -1464,6 +1738,7 @@ impl<'a> Host<'a> {
             settled: self.settled,
             refusals: self.refusals,
             withdrawn: self.withdrawn,
+            applied: self.answers.borrow().applied.clone(),
             harness,
         }
     }
