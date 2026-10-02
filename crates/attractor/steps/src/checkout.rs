@@ -14,6 +14,12 @@
 //! (a fresh clone from the host path would otherwise name that path), and
 //! the remote-tracking refs the local clone created stay, so
 //! `origin/main` resolves offline. Nothing is fetched from a remote.
+//!
+//! A non-empty `sparse` list checks out only those directories, in Git's
+//! cone mode: the clone skips its checkout, `git sparse-checkout set --cone`
+//! names the directories, and `git checkout` fills the work tree with them
+//! and the root's own files. The cone lives in the clone's `.git`, which the
+//! tarball carries, so the extracted workspace stays sparse.
 
 use std::collections::VecDeque;
 use std::fs::DirEntry;
@@ -43,6 +49,9 @@ const ARCHIVE: &str = ".petri-checkout.tar";
 pub struct Checkout {
     pub enabled:    bool,
     pub depth:      i64,
+    /// The cone's directories, relative to the repository root. Empty is a
+    /// full checkout.
+    pub sparse:     Vec<String>,
     pub repository: Option<String>,
 }
 
@@ -51,6 +60,7 @@ impl Default for Checkout {
         Self {
             enabled:    true,
             depth:      100,
+            sparse:     Vec::new(),
             repository: None,
         }
     }
@@ -62,6 +72,8 @@ pub struct Delivered {
     pub repository: PathBuf,
     pub commit:     String,
     pub depth:      i64,
+    /// The cone's directories, normalized. Empty for a full checkout.
+    pub sparse:     Vec<String>,
     pub files:      usize,
 }
 
@@ -89,6 +101,7 @@ pub async fn seed(ctx: &StepCtx, config: &Value) -> Result<Option<Delivered>, Ch
         .await;
         return Ok(None);
     }
+    let sparse = cone_directories(&checkout.sparse).map_err(CheckoutError)?;
     let Some(repository) = checkout.repository.as_deref().map(PathBuf::from) else {
         return Ok(None);
     };
@@ -106,7 +119,8 @@ pub async fn seed(ctx: &StepCtx, config: &Value) -> Result<Option<Delivered>, Ch
     let depth = checkout.depth;
     let (tarball, commit, files) = {
         let toplevel = toplevel.clone();
-        task::spawn_blocking(move || pack_clone(&toplevel, depth))
+        let sparse = sparse.clone();
+        task::spawn_blocking(move || pack_clone(&toplevel, depth, &sparse))
             .await
             .map_err(|e| CheckoutError(format!("the checkout did not complete: {e}")))?
             .map_err(CheckoutError)?
@@ -122,6 +136,7 @@ pub async fn seed(ctx: &StepCtx, config: &Value) -> Result<Option<Delivered>, Ch
         repository = %toplevel.display(),
         %commit,
         depth,
+        ?sparse,
         archive_bytes,
         files,
         "workspace checked out"
@@ -129,13 +144,18 @@ pub async fn seed(ctx: &StepCtx, config: &Value) -> Result<Option<Delivered>, Ch
     ctx.log(
         ir::LogStream::Stderr,
         format!(
-            "checkout: {} at {} ({})",
+            "checkout: {} at {} ({}{})",
             toplevel.display(),
             &commit[..commit.len().min(12)],
             if depth > 0 {
                 format!("depth {depth}")
             } else {
                 "full history".to_owned()
+            },
+            if sparse.is_empty() {
+                String::new()
+            } else {
+                format!(", sparse {}", sparse.join(", "))
             }
         ),
     )
@@ -149,6 +169,7 @@ pub async fn seed(ctx: &StepCtx, config: &Value) -> Result<Option<Delivered>, Ch
             "repository": toplevel.to_string_lossy(),
             "commit": commit,
             "depth": depth,
+            "sparse": sparse,
             "files": files,
         })))
         .await;
@@ -156,8 +177,42 @@ pub async fn seed(ctx: &StepCtx, config: &Value) -> Result<Option<Delivered>, Ch
         repository: toplevel,
         commit,
         depth,
+        sparse,
         files,
     }))
+}
+
+/// The cone's directories as Git's cone mode reads them: relative paths
+/// with no trailing `/`. An entry that is empty, absolute, has an empty,
+/// `.` or `..` component, starts with `!`, or holds a glob character names
+/// no single directory, and is refused before anything is cloned.
+fn cone_directories(entries: &[String]) -> Result<Vec<String>, String> {
+    entries
+        .iter()
+        .map(|entry| {
+            let directory = entry.trim_end_matches('/');
+            let refuse = |why: &str| Err(format!("[run.clone] sparse entry {entry:?} {why}"));
+            if directory.is_empty() {
+                return refuse("names no directory");
+            }
+            if entry.starts_with('/') {
+                return refuse("is absolute; name a directory relative to the repository root");
+            }
+            if directory.starts_with('!') {
+                return refuse("starts with `!`; cone mode takes directories, not patterns");
+            }
+            if directory.contains(['*', '?', '[', ']', '\\']) {
+                return refuse("holds a glob character; cone mode takes directories, not patterns");
+            }
+            if directory
+                .split('/')
+                .any(|component| matches!(component, "" | "." | ".."))
+            {
+                return refuse("has an empty, `.` or `..` component");
+            }
+            Ok(directory.to_owned())
+        })
+        .collect()
 }
 
 /// The work tree root of `path`, when it is inside one.
@@ -176,14 +231,19 @@ fn git_toplevel(path: &Path) -> Option<PathBuf> {
 
 /// Clone `toplevel` into a temporary directory at `depth` (0 is the full
 /// history), point `origin` at the repository's own origin when it has
-/// one, and pack the clone (its `.git` included) as one tar archive whose
-/// entries are relative to the workspace root.
-fn pack_clone(toplevel: &Path, depth: i64) -> Result<(Vec<u8>, String, usize), String> {
+/// one, check out only the `sparse` cone when it names directories, and
+/// pack the clone (its `.git` included) as one tar archive whose entries are
+/// relative to the workspace root.
+fn pack_clone(
+    toplevel: &Path,
+    depth: i64,
+    sparse: &[String],
+) -> Result<(Vec<u8>, String, usize), String> {
     let staging = env::temp_dir().join(format!("petri-checkout-{}-{}", process::id(), unique()));
     let clone = staging.join("clone");
     fs::create_dir_all(&staging)
         .map_err(|e| format!("could not create {}: {e}", staging.display()))?;
-    let result = clone_and_pack(toplevel, depth, &clone);
+    let result = clone_and_pack(toplevel, depth, sparse, &clone);
     let _ = fs::remove_dir_all(&staging);
     result
 }
@@ -191,6 +251,7 @@ fn pack_clone(toplevel: &Path, depth: i64) -> Result<(Vec<u8>, String, usize), S
 fn clone_and_pack(
     toplevel: &Path,
     depth: i64,
+    sparse: &[String],
     clone: &Path,
 ) -> Result<(Vec<u8>, String, usize), String> {
     // `file://` so `--depth` applies: Git ignores depth on a plain local path.
@@ -200,8 +261,22 @@ fn clone_and_pack(
     if depth > 0 {
         command.arg(format!("--depth={depth}"));
     }
+    if !sparse.is_empty() {
+        command.arg("--no-checkout");
+    }
     command.arg(&url).arg(clone);
     run(&mut command, "git clone")?;
+    if !sparse.is_empty() {
+        let mut command = Command::new("git");
+        command
+            .args(["sparse-checkout", "set", "--cone", "--"])
+            .args(sparse)
+            .current_dir(clone);
+        run(&mut command, "git sparse-checkout set")?;
+        let mut command = Command::new("git");
+        command.args(["checkout", "--quiet"]).current_dir(clone);
+        run(&mut command, "git checkout")?;
+    }
     if let Some(origin) = remote_url(toplevel, "origin") {
         let mut command = Command::new("git");
         command
