@@ -32,11 +32,10 @@ The base delay is computed in `Float`, which is IEEE 754 double precision
 like Rust's `f64`, with the same order of operations, so the comparison
 checks it bit for bit. Nothing about it is proved.
 
-One place the model is stricter than the engine: when `AcceptPartial`
-converts an exhausted timeout, the model keeps the timeout inside the partial
-success, as `engine-spec.md` §3.1 rule 3 asks, but the engine records
-`underlying: None`, because `TimedOut` carries no `FailureInfo`. The
-comparison sees only status tags, so it does not flag this.
+A partial success keeps the failure it was converted from, a timeout
+included, in the model and in the engine (`Status::PartialSuccess` carries an
+`UnderlyingFailure`). The comparison checks it: a partial success's tag names
+its underlying failure (`partial_success/timed_out`).
 
 A rank in `deterministic_pick` is an `f64` compared with `f64::total_cmp`.
 The model carries the rank's bit pattern and compares the same key

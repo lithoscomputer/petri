@@ -357,7 +357,10 @@ mod tests {
             panic!("promoted: {:?}", outcome.status);
         };
         assert_eq!(
-            underlying.as_ref().map(|f| f.message.as_str()),
+            underlying
+                .as_ref()
+                .and_then(|failure| failure.failure_info())
+                .map(|f| f.message.as_str()),
             Some("boom")
         );
         assert_eq!(outcome.output["outcome"], json!("succeeded"));
@@ -479,7 +482,10 @@ mod tests {
         let Status::PartialSuccess { underlying } = &outcome.status else {
             panic!("promoted: {:?}", outcome.status);
         };
-        let underlying = underlying.as_ref().expect("the failure is kept");
+        let underlying = underlying
+            .as_ref()
+            .and_then(|failure| failure.failure_info())
+            .expect("the failure is kept");
         assert_eq!(underlying.message, "flaky");
         assert_eq!(underlying.class, RETRY_REQUESTED_CLASS);
         assert_eq!(outcome.output["outcome"], json!("succeeded"));
@@ -518,7 +524,10 @@ mod tests {
             panic!("accepted: {:?}", outcome.status);
         };
         assert_eq!(
-            underlying.as_ref().map(|f| f.class.as_str()),
+            underlying
+                .as_ref()
+                .and_then(|failure| failure.failure_info())
+                .map(|f| f.class.as_str()),
             Some(RETRY_REQUESTED_CLASS)
         );
         assert_eq!(outcome.output["outcome"], json!("partially_succeeded"));

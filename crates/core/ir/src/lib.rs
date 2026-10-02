@@ -40,7 +40,7 @@ pub use expr::{
 };
 pub use flow::{
     Control, FailureClass, FailureInfo, LogStream, Metrics, NodeRecord, Outcome, RunContext,
-    RunStatus, SandboxInstance, Status, StatusKind, StepEvent, Token,
+    RunStatus, SandboxInstance, Status, StatusKind, StepEvent, Token, UnderlyingFailure,
 };
 pub use graph::{
     Backoff, Budget, Candidate, Completion, Edge, EdgeTransition, Exhaustion, ExpandTarget,

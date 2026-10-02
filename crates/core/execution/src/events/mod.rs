@@ -153,7 +153,12 @@ pub use replay::{
 /// with no scope records for one that had none to record. Within version 4,
 /// `run.started` gained the optional `forked_from` (run format 7): a forked
 /// run's stream names its source before any copied record (`FORK.md`).
-pub const EVENT_CONTRACT_VERSION: u32 = 4;
+///
+/// Version 5 changes the shape of a partial success inside a `step.finished`
+/// record: `underlying` is an `UnderlyingFailure` (`{"failure": {...}}` or
+/// `"timed_out"`) instead of a bare `FailureInfo`. The version moves with the
+/// engine log (v12) and run format (8) that carry it.
+pub const EVENT_CONTRACT_VERSION: u32 = 5;
 
 /// Which durable log an event was derived from.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]

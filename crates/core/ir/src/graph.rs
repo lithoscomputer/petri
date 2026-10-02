@@ -16,7 +16,7 @@ use smol_str::SmolStr;
 
 use crate::container::{ContainerOptions, ServiceOptions};
 use crate::expr::ExprTable;
-use crate::flow::{FailureClass, Outcome, Status, StatusKind};
+use crate::flow::{FailureClass, Outcome, Status, StatusKind, UnderlyingFailure};
 use crate::ids::{Attempt, EdgeId, ExprId, Live, NodeId, ScopeId, StepKindId};
 use crate::splice::SplicePolicy;
 
@@ -455,19 +455,20 @@ impl RetryPolicy {
 
     /// The exhaustion policy applied to `attempt`'s returned `outcome`: a
     /// retryable failure with no attempt left becomes a `PartialSuccess`
-    /// under [`Exhaustion::AcceptPartial`], the real failure kept in
-    /// `underlying` so the log never records a clean success for something
-    /// that failed; every other outcome stands. The driver applies this to
-    /// every returned attempt before a host prepares the result, so the
-    /// record is what the host saw; the engine applies it only to the failure
-    /// it makes itself when it rejects an attempt's splices.
+    /// under [`Exhaustion::AcceptPartial`], the real failure — a timeout
+    /// included — kept in `underlying` so the log never records a clean
+    /// success for something that failed; every other outcome stands. The
+    /// driver applies this to every returned attempt before a host prepares
+    /// the result, so the record is what the host saw; the engine applies
+    /// it only to the failure it makes itself when it rejects an attempt's
+    /// splices.
     #[must_use]
     pub fn finalize(&self, attempt: Attempt, outcome: Outcome) -> Outcome {
         let exhausted = self.should_retry(&outcome.status) && !self.has_attempt_after(attempt);
         if self.on_exhaustion != Exhaustion::AcceptPartial || !exhausted {
             return outcome;
         }
-        let underlying = outcome.status.failure_info().cloned();
+        let underlying = UnderlyingFailure::of(&outcome.status);
         Outcome {
             status: Status::PartialSuccess { underlying },
             ..outcome

@@ -28,8 +28,10 @@ use crate::{ExecutionId, GraphDigest, InvocationId, ParentCallKey, SandboxLeaseI
 /// inside a resource record with snake-case tags; a version 5 run is
 /// refused, never migrated. Version 7 lets the run declaration carry
 /// `forked_from`, the source and position a forked run was seeded from
-/// (`FORK.md`); a version 6 run is refused, never migrated.
-pub const COORDINATOR_FORMAT_VERSION: u32 = 7;
+/// (`FORK.md`); a version 6 run is refused, never migrated. Version 8 pins
+/// engine log version 12 (a partial success keeps its underlying failure
+/// whole, a timeout included); a version 7 run is refused, never migrated.
+pub const COORDINATOR_FORMAT_VERSION: u32 = 8;
 
 /// Name-only child secret bindings. Plaintext is not representable here.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]

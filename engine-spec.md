@@ -130,9 +130,14 @@ pub enum Completion {               // Graph.completion: how run status folds (�
 ```rust
 pub enum Status {
     Success,
-    PartialSuccess { underlying: Option<FailureInfo> },  // success-like; carries the real failure
+    PartialSuccess { underlying: Option<UnderlyingFailure> },  // success-like; carries the real failure
     Failure(FailureInfo),                                // FailureInfo.class: SmolStr (§13)
     Skipped, Cancelled, TimedOut,
+}
+
+pub enum UnderlyingFailure {       // exactly the statuses `is_failure` names
+    Failure(FailureInfo),
+    TimedOut,
 }
 ```
 
@@ -144,7 +149,9 @@ Rules (violations are review-blockers):
    (`is_success()` and `FailureInfo.retryable` were deleted for violating this;
    do not reintroduce.)
 3. **Log truth** — converting a failure to `PartialSuccess` must preserve the
-   real failure in `underlying`. All conversion paths: process `soft_fail`
+   real failure in `underlying`: the failure it was converted from, whole — a
+   `Failure` with its info, or a `TimedOut` (which has no info to keep). It is
+   not a cause; a policy made the conversion. All conversion paths: process `soft_fail`
    config; `Exhaustion::AcceptPartial` (fires whenever a retryable status hits
    exhaustion, including `max_attempts: 1`; `RetryPolicy::finalize`, applied
    by the driver to every returned attempt before a host prepares the result,
@@ -451,9 +458,10 @@ object unchanged. Commands: `StartStep(ResolvedFiring)`,
 `DeliverControl`, `ScheduleRetry`, `ExpandNode` (reserved), `AcquireScope`,
 `ReleaseScope`, `Admit`, `ResolveRouting`, `FinishExecution`.
 
-Event log version 10 is the one-vocabulary form above, with snake-case tags on
-every enum inside a record. Earlier log versions are rejected; there is no
-migration.
+Event log version 12 is the one-vocabulary form above, with snake-case tags on
+every enum inside a record, the scope records (v11), and a partial success
+that keeps its whole underlying failure (v12). Earlier log versions are
+rejected; there is no migration.
 
 Every execution start and attempt start uses `Admit` → `AdmissionDecided`. Every final
 firing outcome, including a terminal node with no groups, uses one

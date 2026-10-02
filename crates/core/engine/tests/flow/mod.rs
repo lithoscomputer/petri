@@ -33,7 +33,7 @@ use std::time::Duration;
 use engine::{Command, Event, RunError};
 use ir::{
     Arm, Backoff, Budget, EdgeId, FailureInfo, FiringId, Graph, GraphBuilder, JoinPolicy, NodeId,
-    Outcome, RetryOn, RetryPolicy, RunStatus, ScopeId, Status, Value,
+    Outcome, RetryOn, RetryPolicy, RunStatus, ScopeId, Status, UnderlyingFailure, Value,
 };
 use proptest::prelude::*;
 use serde::{Deserialize, Serialize};
@@ -144,13 +144,13 @@ impl RetrySpec {
 
     /// The status a firing records when its last attempt reports `outcome`
     /// after `attempts` attempts: an exhausted retryable failure becomes a
-    /// partial success under `AcceptPartial`, keeping its failure (§3.1 rule
-    /// 3). Restated from the spec, like [`Self::retries`].
+    /// partial success under `AcceptPartial`, keeping its failure, a timeout
+    /// included (§3.1 rule 3). Restated from the spec, like [`Self::retries`].
     pub(crate) fn recorded(&self, attempts: u32, outcome: OutcomeSpec) -> Status {
         let status = outcome.outcome().status;
         if self.accept_partial && self.retries(outcome) && attempts >= self.max_attempts {
             Status::PartialSuccess {
-                underlying: status.failure_info().cloned(),
+                underlying: UnderlyingFailure::of(&status),
             }
         } else {
             status
@@ -630,8 +630,11 @@ pub(crate) fn run(case: &FlowCase) -> Run {
             .iter()
             .rev()
             .find(|record| record.firing == firing)
-            .map_or("unrecorded", |record| record.outcome.status.tag());
-        attempts.push((key.0, key.1, attempt, status.to_owned()));
+            .map_or_else(
+                || "unrecorded".to_owned(),
+                |record| record_tag(&record.outcome.status),
+            );
+        attempts.push((key.0, key.1, attempt, status));
         steps.push(started_keys(&batch, &mut live));
         starts.extend(batch);
     }
@@ -684,6 +687,17 @@ pub(crate) fn run(case: &FlowCase) -> Run {
         },
         starts,
         harness,
+    }
+}
+
+/// A record's status tag, naming a partial success's underlying failure
+/// (`partial_success/timed_out`), as the Lean model's `Status.tag` does.
+fn record_tag(status: &Status) -> String {
+    match status {
+        Status::PartialSuccess {
+            underlying: Some(underlying),
+        } => format!("partial_success/{}", underlying.status().tag()),
+        status => status.tag().to_owned(),
     }
 }
 

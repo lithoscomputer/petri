@@ -1,9 +1,17 @@
 # The public event contract
 
 `execution::events` is the versioned event stream an embedding host projects a
-run from. This file is the contract for `EVENT_CONTRACT_VERSION` 4. The Rust
+run from. This file is the contract for `EVENT_CONTRACT_VERSION` 5. The Rust
 types in `crates/core/execution/src/events.rs` are authoritative for field
 detail; this file states the guarantees.
+
+Version 5 (2026-09-26) changes one shape inside a record: a partial
+success's `underlying` (in a `step.finished` record's `outcome.status`) is
+now the whole failure it was converted from, `{"failure": {"message": ...,
+"class": ...}}` or `"timed_out"`, where version 4 carried a bare failure
+info and lost a timeout. The engine log (v12) and the run format (8) that
+carry it move with it: a run written before them is refused, never
+migrated.
 
 Version 4 (2026-09-18) adds the scope records: `scope.acquired` and
 `scope.failed` in an execution's log, where a scope's environment ran (the

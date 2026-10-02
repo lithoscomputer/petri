@@ -43,7 +43,9 @@ use petri::execution::{
 use petri::executor::Retention;
 use petri::frontend::fabro::Fabro;
 use petri::frontend::{CompileInputs, Lowered};
-use petri::ir::{Attempt, EdgeId, Exhaustion, Graph, Outcome, RunStatus, Status, Value};
+use petri::ir::{
+    Attempt, EdgeId, Exhaustion, Graph, Outcome, RunStatus, Status, UnderlyingFailure, Value,
+};
 use petri::steps::Answer;
 use petri::{RunOptions, Runtime, driver};
 use serde_json::json;
@@ -408,16 +410,14 @@ impl ExecutionHooks for FakeHost {
             && let Status::Failure(info) = &request.outcome.status
         {
             prepared.adjustment = ResultAdjustment {
-                status: Some(Status::PartialSuccess {
-                    underlying: Some(info.clone()),
-                }),
+                status: Some(Status::partial(info.clone())),
                 reason: Some("the host accepts this failure".into()),
                 ..ResultAdjustment::default()
             };
         }
         if self.script.fail_final_of == Some(name)
             && let Status::PartialSuccess {
-                underlying: Some(info),
+                underlying: Some(UnderlyingFailure::Failure(info)),
             } = &request.outcome.status
         {
             prepared.adjustment = ResultAdjustment {
@@ -1321,7 +1321,7 @@ async fn a_prepared_result_keeps_the_original_attempt_evidence() {
         json!("exit_status:3")
     );
     assert_eq!(
-        evidence["effective"]["partial_success"]["underlying"]["class"],
+        evidence["effective"]["partial_success"]["underlying"]["failure"]["class"],
         json!("exit_status:3")
     );
     assert_eq!(evidence["reason"], json!("the host accepts this failure"));
@@ -1335,7 +1335,8 @@ async fn a_prepared_result_keeps_the_original_attempt_evidence() {
         .expect("recorded");
     assert!(matches!(
         &recorded.outcome.status,
-        Status::PartialSuccess { underlying: Some(info) } if info.class == "exit_status:3"
+        Status::PartialSuccess { underlying: Some(UnderlyingFailure::Failure(info)) }
+            if info.class == "exit_status:3"
     ));
 }
 
@@ -1442,7 +1443,7 @@ async fn an_exhausted_retry_is_prepared_as_the_final_effective_result() {
     let evidence = result_prepared_note(&outcome.events, "work");
     assert_eq!(evidence["attempt"], json!(2));
     assert_eq!(
-        evidence["original"]["partial_success"]["underlying"]["class"],
+        evidence["original"]["partial_success"]["underlying"]["failure"]["class"],
         json!("retry_requested")
     );
     assert_eq!(
@@ -1616,7 +1617,7 @@ async fn an_ordinary_failure_is_prepared_before_its_record_and_routes_on_the_eff
         json!("exit_status:3")
     );
     assert_eq!(
-        evidence["effective"]["partial_success"]["underlying"]["class"],
+        evidence["effective"]["partial_success"]["underlying"]["failure"]["class"],
         json!("exit_status:3")
     );
     let note = position_of(&outcome.events, "work", &|b| {

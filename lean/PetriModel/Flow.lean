@@ -45,8 +45,14 @@ inductive Outcome where
   | timedOut
   deriving Repr, DecidableEq
 
+/-- `Status::tag` of the status an outcome is. -/
+def Outcome.tag : Outcome → String
+  | .success => "success"
+  | .failure | .flaky => "failure"
+  | .timedOut => "timed_out"
+
 /-- A recorded status (`Status`). A partial success keeps the outcome it was
-converted from (§3.1 rule 3). -/
+converted from (§3.1 rule 3), a timeout included. -/
 inductive Status where
   | success
   | partialSuccess (underlying : Outcome)
@@ -64,10 +70,11 @@ def Status.isFailure : Status → Bool
   | .failure | .timedOut => true
   | .success | .partialSuccess _ => false
 
-/-- `Status::tag`. -/
+/-- `Status::tag`, naming a partial success's underlying failure
+(`partial_success/timed_out`) so the comparison checks it too. -/
 def Status.tag : Status → String
   | .success => "success"
-  | .partialSuccess _ => "partial_success"
+  | .partialSuccess underlying => "partial_success/" ++ underlying.tag
   | .failure => "failure"
   | .timedOut => "timed_out"
 

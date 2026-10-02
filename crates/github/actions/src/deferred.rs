@@ -296,9 +296,7 @@ impl Step for DeferredActionPublishStep {
                 )
             },
             |status| match status {
-                Status::Failure(underlying) if config.soft_fail => Status::PartialSuccess {
-                    underlying: Some(underlying),
-                },
+                Status::Failure(underlying) if config.soft_fail => Status::partial(underlying),
                 other => other,
             },
         );

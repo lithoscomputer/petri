@@ -11,7 +11,7 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use engine::{EngineState, Event, RunError};
 use flow::{FlowCase, JoinSpec, Start};
-use ir::{EdgeId, FiringId, Graph, NodeId, Status, ValidationError, validate};
+use ir::{EdgeId, FiringId, Graph, NodeId, Status, UnderlyingFailure, ValidationError, validate};
 use proptest::prelude::*;
 use proptest::test_runner::TestCaseError;
 
@@ -220,10 +220,9 @@ fn check_flow(case: &FlowCase) -> Result<(), TestCaseError> {
     // Retries: a firing retries only an outcome its policy retries, never a
     // success, and never past its attempt limit; it stops at the first outcome
     // it does not retry; and its record is the last attempt after the
-    // exhaustion policy. An accepted partial success keeps the failure behind
-    // it (§3.1 rule 3), as far as the status carries one: a timeout carries no
-    // `FailureInfo`. The rules are restated in `RetrySpec`, not read from the
-    // core's `RetryPolicy`.
+    // exhaustion policy. An accepted partial success keeps the failure it came
+    // from, a timeout included (§3.1 rule 3). The rules are restated in
+    // `RetrySpec`, not read from the core's `RetryPolicy`.
     for (firing, tries) in &attempts {
         let retry = &case.nodes[tries[0].node.index()].retry;
         prop_assert!(
@@ -256,8 +255,8 @@ fn check_flow(case: &FlowCase) -> Result<(), TestCaseError> {
         prop_assert_eq!(record, &expected, "{}'s record", firing);
         if let Status::PartialSuccess { underlying } = record {
             prop_assert_eq!(
-                underlying.as_ref(),
-                raw.status.failure_info(),
+                underlying,
+                &UnderlyingFailure::of(&raw.status),
                 "{}'s partial success lost its failure",
                 firing
             );
