@@ -18,15 +18,25 @@ Nothing here translates Rust into Lean.
 | `PetriModel/Pick.lean` | `deterministic_pick` in `crates/core/engine/src/apply.rs` | `engine-spec.md` §2, §6 |
 | `PetriModel/Flow.lean` | a whole run of the flows the Rust generator makes, loops and budgets included, as routing sees it | `crates/core/engine/tests/flow/mod.rs`, `engine-spec.md` §4 |
 | `PetriModel/Retry.lean` | `RetryPolicy` (`should_retry`, `finalize`, `base_delay`) and the retry path of `on_step_finished` | `crates/core/ir/src/graph.rs`, `engine-spec.md` §3.1, §4 |
+| `PetriModel/Control.lean` | a whole run with stops: `stop_scope`, the cancel admission and quiet budget refusal in `try_fire`, the kill checks in `on_token` and `on_step_finished`, and a host that can run a single attempt | `crates/core/engine/tests/flow/mod.rs`, `engine-spec.md` §4, §5 |
 
 In the flow model, a back arm starts the next generation, joins match per
 `(node, generation)`, and a node fires at most its budget; a key the budget
 refuses is marked fired and routes nothing (`engine-spec.md` §4, "Budget
 refusal"). Routing sees only the status each firing records; the retry
 layer turns a generated case, with its retry policies and scripted attempts,
-into that view, and adds the attempt counts and each retry's base delay. The
-model leaves out cancellation, expansions, preconditions and splices. The
-Rust generator does not produce them either.
+into that view, and adds the attempt counts and each retry's base delay.
+
+The control model runs the same cases with the host's stops: a cancel or
+kill of the root or of a declared group, `run_on_cancel`, the `cancelled()`
+guard, a host that honors or ignores a stop signal, and a firing left waiting
+on its retry backoff. It follows the engine's order exactly. The core hands
+the host an admission for each firing it starts and a routing for each
+outcome it records, and the harness answers them depth first. A firing's
+number among its node's started firings, which picks its script, is fixed
+when its admission is answered. Firing ids order the signals and the
+settles. All models leave out expansions, preconditions and splices. The Rust
+generator does not produce them either.
 
 The base delay is computed in `Float`, which is IEEE 754 double precision
 like Rust's `f64`, with the same order of operations, so the comparison
@@ -81,6 +91,30 @@ For whole runs, loops included (`PetriModel/Thm/Flow.lean`):
   budgets allow (their sum, plus one), so `run` never reports `unsettled`
   (`run_not_unsettled`).
 
+For stops (`PetriModel/Thm/Control.lean`). The control model's run keeps a
+log of its stops, starts, retries and routings, and each entry carries the
+proof of its rule against the entries before it, so no run of the model can
+break one. These theorems read the rules back out of any run:
+
+- `unmarked_never_starts_after_cancel`: after a stop reached a node, or on a
+  token from a firing that recorded `cancelled`, the node starts only when it
+  is `run_on_cancel`.
+- `nothing_starts_after_kill`: nothing starts after a kill reached it.
+- `cancelled_not_retried`: a firing is never retried once a stop reached its
+  node.
+- `killed_routes_nothing`: nothing routes out of a killed closure.
+- `stop_status`: a settled run ends `cancelled` exactly when its log holds a
+  stop of the root.
+- `run_settles`: every run ends with nothing live within the steps of its
+  schedule plus one per firing its budgets allow, so it never reports
+  `unsettled` (`run_not_unsettled`). A completion without running counts
+  against the budget, and each host step after the schedule finishes a
+  firing.
+
+Not proved yet: that the control model, with a host that only finishes
+firings, runs as `Spec.run` does, which would carry the flow and retry
+theorems over to it. The comparison checks it on every such case.
+
 For retries (`PetriModel/Thm/Retry.lean`):
 
 - `attempts_le_limit`: a firing never takes more attempts than its limit.
@@ -118,14 +152,15 @@ real core's:
 - `flow_runs_match_the_lean_model`: which `(node, generation)` firings start
   after each host step, the order they finish in, the tokens left waiting at
   the end, the budget refusals, the run status, each firing's attempts and
-  recorded status, and each retry's base delay.
+  recorded status, each retry's base delay, the stop signals, and the keys
+  that completed without running. It runs `Control.run`, stops included.
 - `deterministic_pick_matches_the_lean_model`: the picked edge, or the
   reason for a refusal. A new refusal message in Rust fails the test until
   the model has it too.
 
 `crates/core/engine/tests/flow_properties.rs` checks the join, generation,
-budget and retry rules on the same generator without Lean, so it runs in
-every `mise run test`.
+budget, retry, cancel and kill rules on the same generator without Lean, so
+it runs in every `mise run test`.
 
 ## Commands
 

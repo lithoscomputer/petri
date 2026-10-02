@@ -521,8 +521,9 @@ fn a_cancelled_expansion_never_splices() {
 }
 
 /// §5 test 4: an `Always`-guarded back edge through a cancelled region
-/// terminates by budget, exactly as the `Skipped` cascade does — same envelope,
-/// no new machinery. The test finishing is the termination proof.
+/// terminates by budget, as the `Skipped` cascade does — same envelope, no new
+/// machinery. The test finishing is the termination proof. The refusal is
+/// quiet: nothing would have run, so it is no engine error.
 #[test]
 fn a_back_edge_through_a_cancelled_region_stops_at_its_budget() {
     let mut b = GraphBuilder::new();
@@ -560,11 +561,63 @@ fn a_back_edge_through_a_cancelled_region_stops_at_its_budget() {
         spins, 4,
         "one synthesized Cancelled per generation, then the cap"
     );
-    assert!(matches!(
-        h.state.errors().first(),
-        Some(engine::RunError::BudgetExceeded { max_firings: 4, .. })
-    ));
+    assert_eq!(h.state.errors(), [], "a cancelled loop stops quietly");
     assert_eq!(h.status, Some(RunStatus::Cancelled));
+    h.verify_replay();
+}
+
+/// The same loop in a cancel group: a group cancel stops it quietly at its
+/// budget, and the rest of the run keeps its own status. A `BudgetExceeded`
+/// here would fail the run although nothing failed.
+#[test]
+fn a_group_cancelled_loop_stops_quietly_at_its_budget() {
+    let mut b = GraphBuilder::new();
+    let scope = ir::ScopeId::new(0);
+    let start = b.add_step("start", scope, NOOP);
+    let spin = b.add_step("spin", scope, NOOP);
+    let sibling = b.add_step("sibling", scope, NOOP);
+    let never = b.add_step("never", scope, NOOP);
+    b.fan_out(start, &[spin, sibling]);
+    b.node_mut(spin).cancel_group = Some(spin);
+    b.set_join(spin, JoinPolicy::Any);
+    b.set_budget(spin, ir::Budget::looped(4));
+    let always_loop = b.exprs().lit(true);
+    b.select(spin, vec![
+        ir::Arm::when(spin, always_loop).with_back(),
+        ir::Arm::always(never),
+    ]);
+    let graph = b.build();
+    validate(&graph).expect("valid");
+
+    let mut h = Harness::new(graph);
+    h.feed(Event::ExecutionStarted {
+        start: engine::EngineStart::default(),
+    });
+    let start = h.take_starts()[0].0;
+    h.finish(start, Outcome::success(Value::Null));
+    let running = h.take_starts();
+    h.feed(Event::cancel_group(spin));
+    for (firing, name) in running {
+        h.finish(
+            firing,
+            if name == "spin" {
+                Outcome::cancelled()
+            } else {
+                Outcome::success(Value::Null)
+            },
+        );
+    }
+
+    let spins: Vec<(String, String)> = h
+        .statuses()
+        .into_iter()
+        .filter(|(name, _)| name == "spin")
+        .collect();
+    assert_eq!(spins.len(), 4, "the cancelled run, then three completions");
+    assert!(spins.iter().all(|(_, status)| status == "cancelled"));
+    assert_eq!(h.status_of("sibling").as_deref(), Some("success"));
+    assert_eq!(h.state.errors(), [], "a cancelled loop stops quietly");
+    assert_eq!(h.status, Some(RunStatus::Success));
     h.verify_replay();
 }
 

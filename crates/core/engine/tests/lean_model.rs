@@ -109,12 +109,15 @@ fn ask(query: &Value) -> Option<Value> {
 // ── Flows ─────────────────────────────────────────────────────────────────
 
 proptest! {
-    #![proptest_config(ProptestConfig::with_cases(512))]
+    // As many cases as `flow_properties.rs`, for the stop paths that take
+    // several steps in a row.
+    #![proptest_config(ProptestConfig::with_cases(2048))]
 
     /// Which (node, generation) firings start after each host step, the order
     /// they finish in, the tokens left waiting, the budget refusals, the run
-    /// status, each firing's attempts and recorded status, and each retry's
-    /// base delay, bit for bit, all match the model.
+    /// status, each firing's attempts and recorded status, each retry's base
+    /// delay, bit for bit, the stop signals and the keys that completed
+    /// without running all match the model, stops included.
     #[test]
     fn flow_runs_match_the_lean_model(case in flow::flow_case()) {
         let Some(answer) = ask(&json!({ "flow": &case })) else {

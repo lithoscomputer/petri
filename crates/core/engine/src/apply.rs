@@ -367,13 +367,17 @@ fn try_fire(
     }
 
     // The budget bounds synthesized outcomes too: an `Always`-guarded back edge
-    // cycling through a cancelled region terminates here, exactly as a `Skipped`
-    // cascade does.
+    // cycling through a cancelled region terminates here, as a `Skipped` cascade
+    // does. Only a key that would run is an error. One that would only complete
+    // `Cancelled` stops quietly: nothing would have run, so a cancelled group's
+    // loop ends without failing the rest of the run (§4, "Budget refusal").
     if state.firing_count(node_id) >= node.budget.max_firings {
-        state.push_error(RunError::BudgetExceeded {
-            node:        node_id,
-            max_firings: node.budget.max_firings,
-        });
+        if admitted {
+            state.push_error(RunError::BudgetExceeded {
+                node:        node_id,
+                max_firings: node.budget.max_firings,
+            });
+        }
         state.take_tokens(key);
         state.mark_fired(key);
         return;

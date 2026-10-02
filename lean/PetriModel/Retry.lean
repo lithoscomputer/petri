@@ -47,6 +47,12 @@ structure SpecNode where
   firing's list repeats, and within a list the last attempt repeats. -/
   outcomes : List (List Outcome)
   groups : List (List Arm)
+  /-- The anchor of the node's cancellation group; an anchor names itself. -/
+  group : Option Nat := none
+  runOnCancel : Bool := false
+  /-- Whether the host honors a stop signal and reports `cancelled`, rather
+  than the scripted outcome. -/
+  honor : Bool := true
   deriving Repr
 
 /-- A generated case: `FlowCase` in the Rust test. -/
@@ -58,10 +64,11 @@ structure Spec where
 /-- `RetryPolicy::attempts` reads 0 as 1. -/
 def Retry.limit (r : Retry) : Nat := max r.maxAttempts 1
 
-/-- `RetryPolicy::should_retry`: never a success; the default retries a
-failure or a timeout, `flaky` a failure of that class only. -/
+/-- `RetryPolicy::should_retry`: never a success or a cancellation; the
+default retries a failure or a timeout, `flaky` a failure of that class
+only. -/
 def Retry.retries (r : Retry) : Outcome → Bool
-  | .success => false
+  | .success | .cancelled => false
   | .flaky => true
   | .failure | .timedOut => r.retryOn == .default
 
@@ -87,6 +94,7 @@ def Outcome.status : Outcome → Status
   | .success => .success
   | .failure | .flaky => .failure
   | .timedOut => .timedOut
+  | .cancelled => .cancelled
 
 /-- `RetryPolicy::finalize`: the last attempt's status, or a partial success
 keeping it when `AcceptPartial` meets an exhausted retryable failure. -/

@@ -180,6 +180,11 @@ downstream of it waits. Routing nothing is what makes the budget a
 termination guarantee: a routed outcome could take a back edge, be refused
 again in the next generation, and route again, forever. (A mutation that
 routes a failure instead overflows the stack in the flow property test.)
+Only a key that would run is an error. A key that would only complete
+`Cancelled` without running (§5) stops quietly: it takes its tokens and is
+marked fired, but records no error. Nothing would have run, so a cancelled
+loop whose back arm is `always` ends at its budget without failing the run;
+after a group cancel, the rest of the run keeps its own status.
 
 **Retries.** Each firing starts at `Attempt(1)`; counters reset per firing (a
 later generation retries fresh). On a matching non-final failure the core emits
@@ -275,6 +280,8 @@ the request by node name and is available as a driver-provided step capability.
      completes `Cancelled` unless it is marked. This is what keeps a
      `fail_fast` splice's un-marked collector — outside the cancelled scope —
      from starting, while a marked one fires and gathers partial results.
+   - A completion without running counts against the budget, and the budget
+     refuses it quietly (§4, "Budget refusal").
 3. A firing **awaiting a retry backoff** has no work in flight and no driver
    task to deliver to, so the core settles it at once instead of waiting out
    the backoff: it records a `Cancelled` outcome and routes it (under Kill:

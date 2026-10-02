@@ -16,8 +16,9 @@ A `Case` is what routing sees: the graph, and the status each firing
 records. Retries never reach it; `PetriModel/Retry.lean` builds a `Case` from
 the full generated case, retry policies and scripted attempts included.
 
-This is the model the Rust check runs against the real core. It leaves out
-everything the generator does not produce: cancellation, expansions and
+This is the model the Rust check runs against the real core for a host that
+only finishes firings. `PetriModel/Control.lean` runs the same cases with
+stops. Both leave out what the generator does not produce: expansions and
 preconditions.
 -/
 
@@ -27,6 +28,7 @@ inductive Guard where
   | always
   | success
   | failure
+  | cancelled
   deriving Repr, DecidableEq
 
 structure Arm where
@@ -43,6 +45,8 @@ inductive Outcome where
   /-- A failure of class `flaky`. -/
   | flaky
   | timedOut
+  /-- What the host reports when it honors a stop signal. Never scripted. -/
+  | cancelled
   deriving Repr, DecidableEq
 
 /-- `Status::tag` of the status an outcome is. -/
@@ -50,6 +54,7 @@ def Outcome.tag : Outcome → String
   | .success => "success"
   | .failure | .flaky => "failure"
   | .timedOut => "timed_out"
+  | .cancelled => "cancelled"
 
 /-- A recorded status (`Status`). A partial success keeps the outcome it was
 converted from (§3.1 rule 3), a timeout included. -/
@@ -58,17 +63,18 @@ inductive Status where
   | partialSuccess (underlying : Outcome)
   | failure
   | timedOut
+  | cancelled
   deriving Repr, DecidableEq
 
 /-- `Status::is_success_like`. -/
 def Status.isSuccessLike : Status → Bool
   | .success | .partialSuccess _ => true
-  | .failure | .timedOut => false
+  | .failure | .timedOut | .cancelled => false
 
 /-- `Status::is_failure`: a failure or a timeout. -/
 def Status.isFailure : Status → Bool
   | .failure | .timedOut => true
-  | .success | .partialSuccess _ => false
+  | .success | .partialSuccess _ | .cancelled => false
 
 /-- `Status::tag`, naming a partial success's underlying failure
 (`partial_success/timed_out`) so the comparison checks it too. -/
@@ -77,6 +83,7 @@ def Status.tag : Status → String
   | .partialSuccess underlying => "partial_success/" ++ underlying.tag
   | .failure => "failure"
   | .timedOut => "timed_out"
+  | .cancelled => "cancelled"
 
 /-- A node as routing sees it. -/
 structure Node where
@@ -107,6 +114,10 @@ structure Observed where
   /-- `(node, generation, next attempt, base delay in nanoseconds)` per
   scheduled retry. -/
   retries : List (Nat × Nat × Nat × Nat)
+  /-- `(node, generation, cancel | kill)` per stop signal sent to a firing. -/
+  controls : List (Nat × Nat × String) := []
+  /-- Keys that completed `Cancelled` without running, in order. -/
+  completed : List Key := []
   deriving Repr
 
 /-- What routing and the run context see: everything but the attempt counts
@@ -116,13 +127,15 @@ def Observed.routing (o : Observed) : Observed :=
     attempts := o.attempts.map fun (node, generation, _, tag) => (node, generation, 1, tag)
     retries := [] }
 
-/-- `always()`, `success()` and `failure()` over the node's recorded status,
-as the expression builtins define them: `success()` is success-like, and
-`failure()` is the `failure` status only, so a timeout passes neither. -/
+/-- `always()`, `success()`, `failure()` and `cancelled()` over the node's
+recorded status, as the expression builtins define them: `success()` is
+success-like, and `failure()` is the `failure` status only, so a timeout
+passes neither. -/
 def Guard.passes : Guard → Status → Bool
   | .always, _ => true
   | .success, status => status.isSuccessLike
   | .failure, status => status == .failure
+  | .cancelled, status => status == .cancelled
 
 /-- A group emits on its first arm whose guard passes, or not at all. -/
 def emit (status : Status) (group : List Arm) : Option Arm :=

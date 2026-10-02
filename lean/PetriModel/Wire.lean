@@ -1,7 +1,7 @@
 import Lean.Data.Json.Parser
 import Lean.Data.Json.Printer
 import Lean.Data.Json.FromToJson.Basic
-import PetriModel.Retry
+import PetriModel.Control
 import PetriModel.Pick
 
 /-!
@@ -10,7 +10,8 @@ import PetriModel.Pick
 The line protocol `crates/core/engine/tests/lean_model.rs` speaks: one JSON
 query per line in, one JSON answer per line out.
 
-* `{"flow": <FlowCase>}` answers the `Observed` of `Flow.run`.
+* `{"flow": <FlowCase>}` answers the `Observed` of `Control.run`: the flow,
+  with the host's stops.
 * `{"pick": {"proposal": …, "draw": …}}` answers `{"ok": <edge or null>}` or
   `{"refused": "<reason>"}`. A rank travels as its `f64` bit pattern, since
   JSON cannot carry NaN or the infinities.
@@ -47,6 +48,7 @@ def guard (j : Json) : Except String Flow.Guard := do
   | "always" => pure .always
   | "success" => pure .success
   | "failure" => pure .failure
+  | "cancelled" => pure .cancelled
   | other => throw s!"unknown guard `{other}`"
 
 def arm (j : Json) : Except String Flow.Arm := do
@@ -62,6 +64,7 @@ def outcome (j : Json) : Except String Flow.Outcome := do
   | "failure" => pure .failure
   | "flaky" => pure .flaky
   | "timed_out" => pure .timedOut
+  | "cancelled" => pure .cancelled
   | other => throw s!"unknown outcome `{other}`"
 
 def retry (j : Json) : Except String Flow.Retry := do
@@ -83,12 +86,32 @@ def node (j : Json) : Except String Flow.SpecNode := do
     maxFirings := ← (← field j "max_firings").getNat?
     retry := ← retry (← field j "retry")
     outcomes := ← list (← field j "outcomes") (list · outcome)
-    groups := ← list (← field j "groups") (list · arm) }
+    groups := ← list (← field j "groups") (list · arm)
+    group := ← optional j "group" (·.getNat?)
+    runOnCancel := ← (j.getObjValD "run_on_cancel").getBool? <|> pure false
+    honor := (← (j.getObjValD "on_stop").getStr? <|> pure "honor") == "honor" }
 
-def flowCase (j : Json) : Except String Flow.Spec := do
+def target (j : Json) : Except String Control.Target :=
+  match j.getStr? with
+  | .ok "root" => pure .root
+  | _ => return .group (← (← field j "group").getNat?)
+
+/-- A host step: a bare number finishes a firing, as every step did before
+the host could do anything else. -/
+def action (j : Json) : Except String Control.Action :=
+  match j.getNat? with
+  | .ok choice => pure (.finish choice)
+  | .error _ =>
+    match j.getObjValD "attempt", j.getObjValD "cancel", j.getObjValD "kill" with
+    | .null, .null, .null => throw s!"unknown host step `{j.compress}`"
+    | .null, .null, t => return .stop .kill (← target t)
+    | .null, t, _ => return .stop .cancel (← target t)
+    | n, _, _ => return .attempt (← n.getNat?)
+
+def flowCase (j : Json) : Except String Control.Case := do
   return {
     nodes := ← list (← field j "nodes") node
-    schedule := ← list (← field j "schedule") (·.getNat?) }
+    schedule := ← list (← field j "schedule") action }
 
 def nats (ns : List Nat) : Json :=
   .arr (ns.map toJson).toArray
@@ -103,7 +126,10 @@ def observed (o : Flow.Observed) : Json :=
     ("status", .str o.status),
     ("attempts", .arr (o.attempts.map fun (n, g, k, tag) =>
       .arr #[toJson n, toJson g, toJson k, .str tag]).toArray),
-    ("retries", .arr (o.retries.map fun (n, g, k, d) => nats [n, g, k, d]).toArray)]
+    ("retries", .arr (o.retries.map fun (n, g, k, d) => nats [n, g, k, d]).toArray),
+    ("controls", .arr (o.controls.map fun (n, g, tier) =>
+      .arr #[toJson n, toJson g, .str tier]).toArray),
+    ("completed", .arr (o.completed.map key).toArray)]
 
 /-! ## Picks -/
 
@@ -156,7 +182,7 @@ def answer (line : String) : Except String Json := do
   match query.getObjValD "flow", query.getObjValD "pick" with
   | .null, .null => throw "expected a `flow` or `pick` query"
   | .null, q => return picked (Pick.pick (← proposal (← field q "proposal")) (← optional q "draw" draw))
-  | q, _ => return observed (Flow.Spec.run (← flowCase q))
+  | q, _ => return observed (Control.run (← flowCase q))
 
 def respond (line : String) : String :=
   match answer line with

@@ -98,7 +98,7 @@ crates/core/engine/tests/partial_success.rs  handoff §4 soft failure, is_succes
 crates/core/engine/tests/seeding.rs          seed edges for entry nodes and clone entries
 crates/core/engine/tests/resolved_firing.rs  the executor boundary: no unresolved ExprId crosses it
 crates/core/engine/tests/event_log.rs        §5 logging, determinism, serde round-trip, §8 seams
-crates/core/engine/tests/flow_properties.rs  §3/§4 over random acyclic flows: joins sound and complete, one firing per key, replay
+crates/core/engine/tests/flow_properties.rs  §3–§5 over random flows: joins, generations, budgets, retries, cancel and kill, replay
 crates/core/engine/tests/lean_model.rs       the core against the Lean model in `lean/`: flows and `deterministic_pick` (`mise run test:lean`)
 crates/core/ir/tests/validation.rs           §7, invariant by invariant
 crates/core/ir/tests/expressions.rs          the expression language
