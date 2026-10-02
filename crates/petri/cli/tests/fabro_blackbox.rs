@@ -22,6 +22,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::{Duration, Instant};
 
+use petri::execution::RECEIPT_VERSION;
 use petri::execution::events::{ViewEvent, replay_run_dir};
 use serde_json::{Value, json};
 use support::fabro::interview;
@@ -1005,7 +1006,7 @@ async fn milestone_a_smoke_run_without_fabro_on_path() {
         json!("APPENDED: notes.txt now ends with reviewed.")
     );
     let receipt = &document["interviews"];
-    assert_eq!(receipt["version"], json!(1), "{receipt}");
+    assert_eq!(receipt["version"], json!(RECEIPT_VERSION), "{receipt}");
     assert_eq!(receipt["errors"], json!([]), "{receipt}");
     assert_eq!(receipt["questions"][0]["node"], json!("gate"));
     assert_eq!(receipt["questions"][0]["reply"]["choice"], json!("N"));

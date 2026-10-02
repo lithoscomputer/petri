@@ -698,6 +698,10 @@ pub struct Driver {
     run_guards:       Vec<Box<dyn RunGuard>>,
     guard_teardown:   Option<JoinHandle<()>>,
     releases:         Vec<JoinHandle<(ReleaseReport, Vec<Note>)>>,
+    /// Scopes an earlier lifetime of this execution acquired, whose release
+    /// point this lifetime has not run. Their notes died with that lifetime,
+    /// so the run's end runs `scope_released` for each again.
+    replayed_scopes:  BTreeSet<ScopeId>,
     /// Opened once the run-end hook has run: a release spawned at the run's
     /// end waits for it, so `run_finished` precedes `scope_released`.
     end_gate:         watch::Sender<bool>,
@@ -866,6 +870,13 @@ impl Driver {
             loaded:       log.len(),
         };
         let mut driver = Self::with_state(point.state, executor, runners, secrets, config);
+        driver.replayed_scopes = log
+            .events()
+            .filter_map(|event| match event {
+                Event::ScopeAcquired { scope, .. } => Some(*scope),
+                _ => None,
+            })
+            .collect();
         if !log.is_empty() {
             driver.resume = Some(PendingResume {
                 commands:    point.pending,
@@ -917,6 +928,7 @@ impl Driver {
             run_guards: Vec::new(),
             guard_teardown: None,
             releases: Vec::new(),
+            replayed_scopes: BTreeSet::new(),
             end_gate: watch::channel(false).0,
             cleanup_timer: None,
             next_timer_id: 0,
@@ -1122,6 +1134,7 @@ impl Driver {
         // the releases held for it proceed.
         let mut run_notes = self.report_run_finished().await;
         let _ = self.end_gate.send_replace(true);
+        run_notes.extend(self.report_replayed_releases().await);
 
         // Release is best effort and never fails the run, but the run should not
         // report back before the environments are actually gone.
@@ -2301,6 +2314,7 @@ impl Driver {
     }
 
     fn release_handle(&mut self, scope: ScopeId, handle: EnvHandle) {
+        self.replayed_scopes.remove(&scope);
         let outcome = if self.scope_failed.contains(&scope) {
             ScopeOutcome::Failed
         } else {
@@ -2363,6 +2377,47 @@ impl Driver {
             .host
             .run_finished(&hooks.context, RunFinished { status, failure })
             .await
+    }
+
+    /// Run the host's `scope_released` point again for each scope an
+    /// earlier lifetime acquired and this one never released. That
+    /// lifetime's notes died with it: the driver hands them over only at
+    /// its end. Notes are at least once, so a crash after they were recorded
+    /// repeats them. The resumed driver holds no environment for such a
+    /// scope. The scope failed when one of its firings' final outcomes is a
+    /// failure, or when it failed in this lifetime.
+    async fn report_replayed_releases(&mut self) -> Vec<Note> {
+        let scopes = mem::take(&mut self.replayed_scopes);
+        let Some(hooks) = &self.hooks else {
+            return Vec::new();
+        };
+        if matches!(self.config.scope_leases, ScopeLeases::Shared(_)) {
+            return Vec::new();
+        }
+        let graph = self.engine.graph();
+        let mut failed: BTreeSet<ScopeId> = self
+            .engine
+            .history()
+            .iter()
+            .filter(|record| record.outcome.status.is_failure())
+            .filter_map(|record| graph.node(record.node).map(|node| node.scope))
+            .collect();
+        failed.extend(self.scope_failed.iter().copied());
+        let mut notes = Vec::new();
+        for scope in scopes {
+            let outcome = if failed.contains(&scope) {
+                ScopeOutcome::Failed
+            } else {
+                ScopeOutcome::Succeeded
+            };
+            notes.extend(
+                hooks
+                    .host
+                    .scope_released(&hooks.context, ScopeReleased { scope, outcome })
+                    .await,
+            );
+        }
+        notes
     }
 
     /// Stop unfinished acquires, then collect any successful result that raced

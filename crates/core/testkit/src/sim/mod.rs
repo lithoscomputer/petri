@@ -18,6 +18,7 @@
 //! a run is a function of its seed.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::future::pending;
 use std::io;
 use std::path::Path;
 use std::str::FromStr;
@@ -37,7 +38,7 @@ use executor::{
 use ir::{Control, LogStream, Outcome, SandboxInstance, ScopeId, StepKindId, Value};
 use serde::Deserialize;
 use smol_str::SmolStr;
-use steps::{Answer, Question, Registry, Step, StepCtx};
+use steps::{Answer, Question, QuestionExpired, Registry, Step, StepCtx};
 use tokio::sync::{Notify, mpsc};
 use tokio::time;
 
@@ -733,6 +734,11 @@ pub struct SandboxedConfig {
     /// Ask the host a question before the work, and wait for its answer.
     #[serde(default)]
     asks:       bool,
+    /// How long the step waits for its answer, in milliseconds; past it, the
+    /// step reports the question expired and goes on. It waits for ever
+    /// when unset.
+    #[serde(default)]
+    ask_ms:     Option<u64>,
 }
 
 fn yes() -> bool {
@@ -777,9 +783,35 @@ impl Step for SandboxedStep {
         }
         if config.asks {
             let id = format!("q{}.{}", ctx.firing.raw(), ctx.attempt.raw());
-            let _ = ctx.logs.send(Question::new(&id, "Go on?").to_event()).await;
+            let mut question = Question::new(&id, "Go on?");
+            question.timeout_ms = config.ask_ms;
+            let _ = ctx.logs.send(question.to_event()).await;
+            let deadline = config
+                .ask_ms
+                .map(|ms| time::Instant::now() + Duration::from_millis(ms));
             loop {
-                match ctx.control.recv().await {
+                let expiry = async {
+                    match deadline {
+                        Some(at) => time::sleep_until(at).await,
+                        None => pending().await,
+                    }
+                };
+                // The answer first: one that lands as the deadline passes is
+                // in time.
+                let control = tokio::select! {
+                    biased;
+                    control = ctx.control.recv() => control,
+                    () = expiry => {
+                        let expired = QuestionExpired {
+                            question:  id.clone(),
+                            waited_ms: config.ask_ms.unwrap_or_default(),
+                            default:   None,
+                        };
+                        let _ = ctx.logs.send(expired.to_event()).await;
+                        break;
+                    }
+                };
+                match control {
                     Some(Control::Deliver(value)) => {
                         if Answer::from_value(&value)
                             .and_then(|answer| answer.question)

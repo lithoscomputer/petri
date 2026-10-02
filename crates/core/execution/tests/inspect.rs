@@ -640,6 +640,7 @@ async fn the_document_serializes_with_its_version_first_class() {
 async fn the_interview_receipt_is_read_back_as_written() {
     let dir = finished_run("inspect-receipt").await;
     let receipt = InterviewReceipt {
+        lifetime:  0,
         version:   RECEIPT_VERSION,
         questions: Vec::new(),
         errors:    vec!["scripted entry `never-asked` answered 0 of 1".to_owned()],

@@ -4,6 +4,7 @@
 //! its sibling, and keys an external effect on an identity that survives a
 //! crash.
 
+use std::cell::Cell;
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
@@ -391,6 +392,80 @@ async fn the_run_level_points_carry_the_owning_executions_context() {
     assert_eq!(
         child.parent.as_ref().map(|parent| parent.execution),
         Some(root.execution)
+    );
+}
+
+#[tokio::test]
+async fn a_resumed_execution_runs_the_release_point_a_crash_cut_off() {
+    let directory = RunDir::new("hook-context-cut-off-release");
+    let host = Arc::new(RecordingHost::default());
+    let run = runtime(&directory, &host).prepare_run(directory.path());
+    let key = run.run_key().clone();
+    let mut coordinator = Coordinator::create(run, Vec::new(), CoordinatorOptions::default())
+        .await
+        .expect("the coordinator starts");
+
+    let mut graph = GraphBuilder::new();
+    let second_scope = graph.add_scope(ir::Scope::new(ScopeId::new(0)));
+    let first = graph.add_step("first", ScopeId::new(0), "noop");
+    let second = graph.add_step("second", second_scope, "noop");
+    graph.link(first, second);
+    let graph = coordinator
+        .register_graph(&graph.build())
+        .await
+        .expect("the graph registers");
+    let result = coordinator
+        .run_root(graph, BTreeMap::new())
+        .await
+        .expect("the run finishes");
+    assert_eq!(result.status, RunStatus::Success);
+    let root = result.final_execution;
+    drop(coordinator);
+    assert_eq!(host.released().len(), 2, "one release point per scope");
+
+    // Model a crash while the second step ran: the first scope's point had
+    // run, but the driver hands its notes over only at its end, so they
+    // died with it. The resumed driver never holds the first scope.
+    truncate_coordinator_log(&directory, |body, _| {
+        matches!(body, CoordinatorEvent::ExecutionDeclared { .. })
+    })
+    .await;
+    let started = Cell::new(0);
+    truncate_engine_log(&directory, root, |body| {
+        if matches!(body, Event::StepStarted { .. }) {
+            started.set(started.get() + 1);
+        }
+        started.get() == 2
+    });
+
+    host.clear_calls();
+    let mut coordinator = Coordinator::resume(
+        runtime(&directory, &host).prepare_run(directory.path()),
+        Vec::new(),
+        CoordinatorOptions::default(),
+    )
+    .await
+    .expect("the coordinator resumes");
+    let result = coordinator
+        .run_root(graph, BTreeMap::new())
+        .await
+        .expect("the resumed run finishes");
+    assert_eq!(result.status, RunStatus::Success);
+    coordinator.finish().await;
+
+    let context = HookContext::new(key, InvocationId::ROOT, root);
+    let released: BTreeSet<ScopeId> = host
+        .released()
+        .into_iter()
+        .map(|(released, scope)| {
+            assert_eq!(released, context);
+            scope
+        })
+        .collect();
+    assert_eq!(
+        released,
+        BTreeSet::from([ScopeId::new(0), second_scope]),
+        "the resumed driver ran the first scope's point again, and the second's as it released it"
     );
 }
 

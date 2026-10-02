@@ -115,12 +115,14 @@ use tokio::time::timeout;
 use tokio_util::sync::CancellationToken;
 
 use crate::{
-    CoordinatorEvent, CoordinatorHandle, CoordinatorRecord, ExecutionId, ExecutionObserver,
-    InvocationId,
+    CoordinatorEvent, CoordinatorHandle, CoordinatorRecord, CoordinatorState, ExecutionId,
+    ExecutionObserver, InvocationId, ParentCallKey,
 };
 
 /// The receipt format this module writes. Bump when a field changes meaning.
-pub const RECEIPT_VERSION: u32 = 1;
+/// Version 2 continues a receipt across host processes: each record says
+/// which process asked it (`lifetime`).
+pub const RECEIPT_VERSION: u32 = 2;
 
 /// The receipt's file name under a standalone run dir.
 pub const RECEIPT_FILE: &str = "interviews.json";
@@ -311,13 +313,23 @@ pub struct InterviewRecord {
     pub timeout_ms:      Option<u64>,
     pub reply:           ReplyRecord,
     pub delivery:        Delivery,
+    /// The host process that asked it, counting from 0 among the processes
+    /// that wrote the receipt ([`InterviewReceipt::lifetime`]).
+    #[serde(default)]
+    pub lifetime:        u32,
 }
 
 /// The machine-readable record of a run's interviews. The standalone host
-/// writes it as JSON to `<run_dir>/interviews.json` ([`RECEIPT_FILE`]).
+/// writes it as JSON to `<run_dir>/interviews.json` ([`RECEIPT_FILE`]) each
+/// time a question's outcome is recorded, and a resumed host continues the
+/// receipt it finds ([`InterviewDispatcher::continuing`]), so a crash loses
+/// only the questions still waiting, which the resumed run asks again.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct InterviewReceipt {
     pub version:   u32,
+    /// The last host process to write it, counting from 0.
+    #[serde(default)]
+    pub lifetime:  u32,
     /// Every question the run asked, in the receipt order: by invocation
     /// path, then invocation, execution, firing, occurrence, and ask
     /// ([`Self::sort_questions`]).
@@ -348,8 +360,11 @@ impl InterviewReceipt {
     }
 }
 
-/// The receipt order's key for one record (see the module docs).
-fn receipt_key(record: &InterviewRecord) -> (&str, InvocationId, ExecutionId, FiringId, u32, u32) {
+/// The receipt order's key for one record (see the module docs); a question
+/// asked again in a later process follows the earlier one.
+fn receipt_key(
+    record: &InterviewRecord,
+) -> (&str, InvocationId, ExecutionId, FiringId, u32, u32, u32) {
     (
         record.invocation_path.as_str(),
         record.invocation,
@@ -357,8 +372,12 @@ fn receipt_key(record: &InterviewRecord) -> (&str, InvocationId, ExecutionId, Fi
         record.firing,
         record.occurrence,
         record.ask,
+        record.lifetime,
     )
 }
+
+/// Receives the receipt as it grows ([`InterviewDispatcher::publish_to`]).
+pub type ReceiptSink = Arc<dyn Fn(&InterviewReceipt) + Send + Sync>;
 
 struct Wiring {
     handle:  CoordinatorHandle,
@@ -397,6 +416,10 @@ struct Inner {
     wiring:      OnceLock<Wiring>,
     shutdown:    CancellationToken,
     state:       Mutex<State>,
+    /// This host process, counting from 0 among those that wrote the
+    /// receipt.
+    lifetime:    u32,
+    sink:        OnceLock<ReceiptSink>,
 }
 
 /// The host side of the interview boundary. Construct before the run,
@@ -410,16 +433,40 @@ pub struct InterviewDispatcher {
 
 impl InterviewDispatcher {
     pub fn new(interviewer: Arc<dyn Interviewer>) -> Self {
+        Self::continuing(interviewer, None)
+    }
+
+    /// A dispatcher for a resumed host: the receipt an earlier process wrote
+    /// keeps its questions and errors, and this process's records follow
+    /// them as the next lifetime.
+    pub fn continuing(
+        interviewer: Arc<dyn Interviewer>,
+        earlier: Option<InterviewReceipt>,
+    ) -> Self {
         let mut state = State::default();
         state.paths.insert(InvocationId::ROOT, "/".to_owned());
+        let lifetime = earlier.as_ref().map_or(0, |earlier| earlier.lifetime + 1);
+        if let Some(earlier) = earlier {
+            state.records = earlier.questions;
+            state.errors = earlier.errors;
+        }
         Self {
             inner: Arc::new(Inner {
                 interviewer,
                 wiring: OnceLock::new(),
                 shutdown: CancellationToken::new(),
                 state: Mutex::new(state),
+                lifetime,
+                sink: OnceLock::new(),
             }),
         }
+    }
+
+    /// Hand `sink` the receipt, whole, each time a question's outcome or an
+    /// interview error is recorded: a host that writes it to disk loses no
+    /// more than the questions still waiting when it crashes.
+    pub fn publish_to(&self, sink: ReceiptSink) {
+        let _ = self.inner.sink.set(sink);
     }
 
     /// Connect to the running coordinator. `run_configured` hands both over
@@ -464,6 +511,7 @@ impl InterviewDispatcher {
             let mut state = inner.state();
             InterviewReceipt {
                 version: RECEIPT_VERSION,
+                lifetime: inner.lifetime,
                 questions: mem::take(&mut state.records),
                 errors: mem::take(&mut state.errors),
                 script,
@@ -480,6 +528,38 @@ impl Inner {
         self.state.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
+    /// Record a question's outcome, and publish the receipt.
+    fn keep(&self, mut record: InterviewRecord) {
+        record.lifetime = self.lifetime;
+        self.state().records.push(record);
+        self.publish();
+    }
+
+    /// Record an interview error, and publish the receipt.
+    fn fail(&self, error: String) {
+        self.state().errors.push(error);
+        self.publish();
+    }
+
+    /// Hand the receipt so far to the sink, when there is one.
+    fn publish(&self) {
+        let Some(sink) = self.sink.get() else {
+            return;
+        };
+        let mut receipt = {
+            let state = self.state();
+            InterviewReceipt {
+                version:   RECEIPT_VERSION,
+                lifetime:  self.lifetime,
+                questions: state.records.clone(),
+                errors:    state.errors.clone(),
+                script:    None,
+            }
+        };
+        receipt.sort_questions();
+        sink(&receipt);
+    }
+
     /// Correlate a question and start its reply task. Never blocks.
     fn ask(
         self: &Arc<Self>,
@@ -489,7 +569,7 @@ impl Inner {
         engine: &EngineState,
     ) {
         let Some(wiring) = self.wiring.get() else {
-            self.state().errors.push(format!(
+            self.fail(format!(
                 "question `{}` arrived before the dispatcher was wired",
                 question.id
             ));
@@ -618,9 +698,13 @@ impl Inner {
             timeout_ms:      request.question.timeout_ms,
             reply:           ReplyRecord::Cancelled,
             delivery:        Delivery::Shutdown,
+            lifetime:        self.lifetime,
         };
         let question = request.question.clone();
+        // A reply ready in the same poll as the close wins, and is recorded
+        // below as late: the same way on every run.
         let reply = tokio::select! {
+            biased;
             reply = self.interviewer.reply(request, cancel.clone()) => Some(reply),
             () = cancel.cancelled() => None,
         };
@@ -643,12 +727,12 @@ impl Inner {
                 reply,
                 Some(InterviewReply::Answered(_) | InterviewReply::Failed(_))
             ) {
-                self.state().errors.push(format!(
+                self.fail(format!(
                     "a reply to `{}` arrived after the question expired",
                     key.1
                 ));
             }
-            self.state().records.push(record);
+            self.keep(record);
             return;
         }
         let closed = self.shutdown.is_cancelled();
@@ -668,18 +752,18 @@ impl Inner {
                 // delivered, and worth a line in the receipt's errors.
                 Some(reply) => {
                     record.reply = describe(&reply);
-                    self.state().errors.push(format!(
+                    self.fail(format!(
                         "a reply to `{}` arrived after its firing finished",
                         key.1
                     ));
                 }
             }
-            self.state().records.push(record);
+            self.keep(record);
             return;
         }
         let Some(reply) = reply else {
             record.delivery = Delivery::Late;
-            self.state().records.push(record);
+            self.keep(record);
             return;
         };
         let control = match reply {
@@ -694,7 +778,7 @@ impl Inner {
                     // Registered first, then referenced: the log sees the
                     // name only. A registration failure withholds the value.
                     if let Err(error) = secrets.register(&name, &text) {
-                        self.state().errors.push(format!(
+                        self.fail(format!(
                             "could not register the answer to `{}` as a secret: {error}",
                             question.id
                         ));
@@ -705,7 +789,7 @@ impl Inner {
                         };
                         record.delivery = Delivery::Withheld;
                         let _ = handle.deliver(key.0, firing, cancelled(&question.id)).await;
-                        self.state().records.push(record);
+                        self.keep(record);
                         return;
                     }
                     answer.text = Some(json!({ "$secret": name }));
@@ -723,7 +807,7 @@ impl Inner {
             }
             InterviewReply::Failed(error) => {
                 let rendered = chain(&error);
-                self.state().errors.push(format!(
+                self.fail(format!(
                     "the interviewer failed on `{}`: {rendered}",
                     question.id
                 ));
@@ -736,7 +820,7 @@ impl Inner {
             driver::DeliverDisposition::Delivered => Delivery::Delivered,
             driver::DeliverDisposition::NotLive => Delivery::NotLive,
         };
-        self.state().records.push(record);
+        self.keep(record);
     }
 }
 
@@ -825,20 +909,48 @@ impl ExecutionObserver for InterviewDispatcher {
                 call: Some(call),
                 ..
             } => {
-                let parent = state
-                    .executions
-                    .get(&call.parent)
-                    .and_then(|parent| state.paths.get(parent))
-                    .cloned()
-                    .unwrap_or_else(|| "/".to_owned());
-                let path = if parent == "/" {
-                    format!("/{}", call.slot)
-                } else {
-                    format!("{parent}/{}", call.slot)
-                };
+                let path = state.path_of(call);
                 state.paths.insert(*invocation, path);
             }
             _ => {}
+        }
+    }
+
+    /// Start from the run as the log left it: every declared execution's
+    /// invocation and every invocation's path, so a question a nested
+    /// invocation asks again after a resume is filed where it belongs.
+    fn on_resumed(&self, coordinator: &CoordinatorState) {
+        let mut state = self.inner.state();
+        for (execution, declared) in &coordinator.executions {
+            state
+                .executions
+                .insert(*execution, declared.declaration.invocation);
+        }
+        // A caller is declared before what it calls: in id order, every
+        // parent's path is known before its children's.
+        for (invocation, declared) in &coordinator.invocations {
+            if let Some(call) = &declared.declaration.call {
+                let path = state.path_of(call);
+                state.paths.insert(*invocation, path);
+            }
+        }
+    }
+}
+
+impl State {
+    /// The logical path of the invocation called from `call`: its caller's
+    /// path, then the call's slot.
+    fn path_of(&self, call: &ParentCallKey) -> String {
+        let parent = self
+            .executions
+            .get(&call.parent)
+            .and_then(|parent| self.paths.get(parent))
+            .cloned()
+            .unwrap_or_else(|| "/".to_owned());
+        if parent == "/" {
+            format!("/{}", call.slot)
+        } else {
+            format!("{parent}/{}", call.slot)
         }
     }
 }
@@ -883,6 +995,7 @@ mod tests {
             timeout_ms: None,
             reply: ReplyRecord::Cancelled,
             delivery: Delivery::Delivered,
+            lifetime: 0,
         }
     }
 
@@ -907,6 +1020,7 @@ mod tests {
     #[test]
     fn the_receipt_orders_questions_as_the_run_asked_them() {
         let mut receipt = InterviewReceipt {
+            lifetime:  0,
             version:   RECEIPT_VERSION,
             questions: vec![
                 // The re-ask of a gate, answered before the original ask.
@@ -942,6 +1056,7 @@ mod tests {
     #[test]
     fn parallel_branches_follow_their_paths_not_their_ids() {
         let mut receipt = InterviewReceipt {
+            lifetime:  0,
             version:   RECEIPT_VERSION,
             questions: vec![
                 record_at("/branch:fan@2:1:b", 1, 1, 1, 1, 1),
@@ -965,6 +1080,7 @@ mod tests {
     fn an_ordered_receipt_stays_as_it_is() {
         let questions = vec![record(0, 0, 2, 1, 1), record(0, 0, 2, 1, 2)];
         let mut receipt = InterviewReceipt {
+            lifetime:  0,
             version:   RECEIPT_VERSION,
             questions: questions.clone(),
             errors:    Vec::new(),
@@ -972,5 +1088,125 @@ mod tests {
         };
         receipt.sort_questions();
         assert_eq!(receipt.questions, questions);
+    }
+
+    /// An interviewer that never answers: these tests read the dispatcher's
+    /// bookkeeping only.
+    struct Silent;
+
+    #[async_trait::async_trait]
+    impl Interviewer for Silent {
+        async fn reply(
+            &self,
+            _request: InterviewRequest,
+            cancel: CancellationToken,
+        ) -> InterviewReply {
+            cancel.cancelled().await;
+            InterviewReply::Cancelled
+        }
+    }
+
+    /// The lifecycle records of a root that calls a child from execution 0,
+    /// which calls a grandchild from execution 1.
+    fn nested_run() -> Vec<CoordinatorRecord> {
+        let digest = "0".repeat(64);
+        let start = serde_json::json!({
+            "entry": "graph_entries", "context": {}, "prior_firings": {},
+            "execution_index": 0, "max_executions": 32
+        });
+        let call = |parent: u64, slot: &str| serde_json::json!({"parent": parent, "firing": 1, "attempt": 1, "slot": slot});
+        let bodies = [
+            serde_json::json!({"event": "run.started", "format_version": crate::COORDINATOR_FORMAT_VERSION,
+                "key": "run", "root": 0, "middleware_chain": []}),
+            serde_json::json!({"event": "graph.registered", "digest": digest}),
+            serde_json::json!({"event": "invocation.declared", "invocation": 0, "call": null,
+                "graph": digest, "context": {}, "secret_bindings": "none", "sandbox": "isolated"}),
+            serde_json::json!({"event": "execution.declared", "execution": 0, "invocation": 0,
+                "predecessor": null, "start": start, "middleware_state": {}}),
+            serde_json::json!({"event": "invocation.declared", "invocation": 1, "call": call(0, "c0"),
+                "graph": digest, "context": {}, "secret_bindings": "none", "sandbox": "isolated"}),
+            serde_json::json!({"event": "execution.declared", "execution": 1, "invocation": 1,
+                "predecessor": null, "start": start, "middleware_state": {}}),
+            serde_json::json!({"event": "invocation.declared", "invocation": 2, "call": call(1, "c1"),
+                "graph": digest, "context": {}, "secret_bindings": "none", "sandbox": "isolated"}),
+            serde_json::json!({"event": "execution.declared", "execution": 2, "invocation": 2,
+                "predecessor": null, "start": start, "middleware_state": {}}),
+        ];
+        bodies
+            .into_iter()
+            .enumerate()
+            .map(|(seq, body)| CoordinatorRecord {
+                seq:         seq as u64,
+                origin:      engine::EventOrigin::External,
+                recorded_at: 0,
+                body:        serde_json::from_value(body).expect("a lifecycle record"),
+            })
+            .collect()
+    }
+
+    fn mapping(
+        dispatcher: &InterviewDispatcher,
+    ) -> (
+        BTreeMap<ExecutionId, InvocationId>,
+        BTreeMap<InvocationId, String>,
+    ) {
+        let state = dispatcher.inner.state();
+        (state.executions.clone(), state.paths.clone())
+    }
+
+    /// A resumed dispatcher knows every declared execution and every
+    /// invocation's path, as one that saw the records live does, so a
+    /// question a nested invocation asks after a resume is filed under it.
+    #[test]
+    fn a_resumed_dispatcher_maps_nested_invocations_as_a_live_one_does() {
+        let records = nested_run();
+        let live = InterviewDispatcher::new(Arc::new(Silent));
+        for record in &records {
+            live.on_lifecycle(record);
+        }
+        let resumed = InterviewDispatcher::new(Arc::new(Silent));
+        resumed.on_resumed(&CoordinatorState::replay(&records).expect("the records replay"));
+        assert_eq!(mapping(&resumed), mapping(&live));
+        assert_eq!(mapping(&resumed).1[&InvocationId::new(2)], "/c0/c1");
+    }
+
+    /// A resumed host's dispatcher continues the receipt it found: the
+    /// earlier questions and errors stay, its own records carry the next
+    /// lifetime, and the sink sees the whole receipt at each outcome.
+    #[tokio::test]
+    async fn a_continued_receipt_keeps_the_earlier_questions_and_counts_lifetimes() {
+        let earlier = InterviewReceipt {
+            version:   RECEIPT_VERSION,
+            lifetime:  0,
+            questions: vec![record(0, 0, 1, 1, 1)],
+            errors:    vec!["an earlier error".to_owned()],
+            script:    None,
+        };
+        let dispatcher = InterviewDispatcher::continuing(Arc::new(Silent), Some(earlier));
+        let published = Arc::new(Mutex::new(Vec::new()));
+        let seen = Arc::clone(&published);
+        dispatcher.publish_to(Arc::new(move |receipt: &InterviewReceipt| {
+            seen.lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .push(receipt.clone());
+        }));
+        dispatcher.inner.keep(record(0, 0, 1, 1, 2));
+        let published = published
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone();
+        assert_eq!(published.len(), 1);
+        let receipt = &published[0];
+        assert_eq!(receipt.lifetime, 1);
+        assert_eq!(receipt.errors, ["an earlier error"]);
+        let lifetimes: Vec<(u32, u32)> = receipt
+            .questions
+            .iter()
+            .map(|question| (question.ask, question.lifetime))
+            .collect();
+        assert_eq!(lifetimes, [(1, 0), (2, 1)]);
+        let finished = dispatcher.shutdown().await;
+        assert_eq!(finished.lifetime, 1);
+        assert_eq!(finished.questions.len(), 2);
     }
 }

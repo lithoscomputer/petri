@@ -1215,7 +1215,11 @@ edge taken by anything but a transient failure. See `crates/attractor/FORMAT.md`
 "Watchdog and circuit breaker".
 
 **The receipt.** Every run with an interviewer writes
-`<run-dir>/interviews.json` (`execution::InterviewReceipt`, version 1): one
+`<run-dir>/interviews.json` (`execution::InterviewReceipt`, version 2) each
+time a question's outcome is recorded, so a crash loses only the questions
+still waiting, which the resumed run asks again. A resumed run continues the
+receipt it finds: the receipt's `lifetime` counts the processes that wrote
+it, and each record carries the `lifetime` that asked it. One
 record per question with its invocation, execution, firing, attempt, node,
 occurrence, ask, question id, kind, text, offered option keys, the review
 `reference` and `timeout_ms` when the question had them, the reply
@@ -1229,7 +1233,9 @@ and how it left (`delivered`, `not_live`, `late`, `shutdown`, `withheld`,
 invocation path, then invocation, execution, firing, occurrence, and ask
 (the root's questions first, then each nested invocation's in path order;
 within an invocation, the order the run asked them), whatever order the
-answers arrived in, so a re-asked question follows its original ask. A sensitive answer appears only as its
+answers arrived in, so a re-asked question follows its original ask, and a
+question asked again after a resume follows the earlier process's. A
+sensitive answer appears only as its
 `{"$secret": "answer:<id>"}` reference. A non-empty `errors` list is exit
 code 4, whatever the engine status; the persisted run is not rewritten.
 

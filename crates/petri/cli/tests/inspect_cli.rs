@@ -12,7 +12,7 @@ use std::{env, fs, io, thread};
 
 use petri::RunOptions;
 use petri::execution::host::{self, ForkOptions, ForkPosition};
-use petri::execution::{Access, open_run_dir};
+use petri::execution::{Access, RECEIPT_VERSION, open_run_dir};
 use petri::ir::{ExecutionId, FiringId};
 use serde_json::Value;
 use testkit::RunDir;
@@ -523,7 +523,11 @@ fn inspect_shows_a_sensitive_answer_as_a_secret_reference_only() {
     // The interview receipt rides the same document, with the answer as its
     // reference only.
     let receipt = &document["interviews"];
-    assert_eq!(receipt["version"], Value::from(1), "{receipt:#}");
+    assert_eq!(
+        receipt["version"],
+        Value::from(RECEIPT_VERSION),
+        "{receipt:#}"
+    );
     assert_eq!(receipt["errors"], Value::Array(Vec::new()), "{receipt:#}");
     let question = &receipt["questions"][0];
     assert_eq!(question["node"], Value::from("gate"));

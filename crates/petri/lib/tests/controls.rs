@@ -431,6 +431,51 @@ async fn an_idle_run_is_cancelled_by_the_watchdog() {
     );
 }
 
+/// A pause parks the watchdog: a run paused far longer than its stall
+/// budget, with nothing running, is not a stall, and it finishes once
+/// unpaused.
+#[tokio::test]
+async fn a_pause_parks_the_watchdog() {
+    const IDLE_WHEN_PAUSED: &str = r#"digraph G {
+        graph [stall_timeout="400ms"]
+        start [shape=Mdiamond]
+        exit [shape=Msquare]
+        a [shape=parallelogram, script="echo a"]
+        start -> a -> exit
+    }"#;
+    let dir = RunDir::new("watchdog-paused");
+    let controls = ControlService::new();
+    let rt = runtime(&dir).hooks(controls.hooks(None));
+    let graph = lower(&rt, &dir, IDLE_WHEN_PAUSED).graph.expect("lowers");
+    let watchdog = StallWatchdog::new(graph.policy.stall_timeout.expect("a budget"));
+    let host_run = HostRun::new(graph)
+        .observe(Arc::new(controls.clone()))
+        .observe(Arc::new(watchdog.clone()));
+    controls.pause();
+    let paused = controls.clone();
+    let mut task = None;
+    let report = host::run_configured(&rt, host_run, |handle, _| {
+        paused.wire(handle.clone());
+        task = Some(watchdog.start(handle));
+        let paused = paused.clone();
+        tokio::spawn(async move {
+            // Three budgets paused, with nothing running.
+            sleep(Duration::from_millis(1200)).await;
+            paused.unpause().await;
+        });
+    })
+    .await
+    .expect("the run completes");
+    task.expect("started").stop().await;
+    assert!(watchdog.tripped().is_none(), "a paused run is not stalled");
+    assert_eq!(
+        report.status,
+        RunStatus::Success,
+        "{:?}",
+        report.state.errors()
+    );
+}
+
 /// A pending question parks the watchdog: a gate that waits far longer than
 /// the stall budget is not a stall, and the run continues once answered.
 #[tokio::test]

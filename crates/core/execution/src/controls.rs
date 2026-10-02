@@ -54,6 +54,7 @@
 //! refused.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
 use driver::lifecycle::{
@@ -65,7 +66,7 @@ use engine::{EngineState, Event, EventRecord};
 use ir::FiringId;
 use smol_str::SmolStr;
 use steps::{Interrupt, Steer};
-use tokio::sync::watch;
+use tokio::sync::{Notify, watch};
 
 use crate::{
     CancelReason, CoordinatorEvent, CoordinatorHandle, CoordinatorRecord, CoordinatorState,
@@ -77,7 +78,19 @@ use crate::{
 /// Install it with [`Runtime::hooks`](runtime::Runtime::hooks).
 pub struct PauseHooks {
     paused: watch::Receiver<bool>,
+    gate:   Arc<Gate>,
     inner:  Option<Arc<dyn ExecutionHooks>>,
+}
+
+/// What held attempts wait on. One notifier wakes them in the order they
+/// began to wait, so a run released from a pause admits its held attempts
+/// the same way every time; a `watch` channel wakes its waiters in an order
+/// it picks at random.
+#[derive(Default)]
+struct Gate {
+    released: Notify,
+    /// The service is gone: nothing will ever release the gate.
+    closed:   AtomicBool,
 }
 
 #[async_trait::async_trait]
@@ -95,12 +108,16 @@ impl ExecutionHooks for PauseHooks {
                 node = request.view.node_name(),
                 "admission held: the run is paused"
             );
-            // A closed sender means the service is gone; admit rather than
-            // hold the run hostage to a dropped controller.
-            while *paused.borrow_and_update() {
-                if paused.changed().await.is_err() {
+            // A dropped service releases every held attempt rather than hold
+            // the run hostage to a controller that is gone.
+            loop {
+                let released = self.gate.released.notified();
+                tokio::pin!(released);
+                released.as_mut().enable();
+                if !*paused.borrow_and_update() || self.gate.closed.load(Ordering::Acquire) {
                     break;
                 }
+                released.await;
             }
             tracing::info!(
                 firing = request.view.firing.raw(),
@@ -249,9 +266,17 @@ impl Drop for LiveTurn {
 
 struct Inner {
     paused: watch::Sender<bool>,
+    gate:   Arc<Gate>,
     handle: Mutex<Option<CoordinatorHandle>>,
     live:   Mutex<Live>,
     turns:  LiveTurns,
+}
+
+impl Drop for Inner {
+    fn drop(&mut self) {
+        self.gate.closed.store(true, Ordering::Release);
+        self.gate.released.notify_waiters();
+    }
 }
 
 impl Inner {
@@ -281,6 +306,7 @@ impl ControlService {
         Self {
             inner: Arc::new(Inner {
                 paused,
+                gate: Arc::new(Gate::default()),
                 handle: Mutex::new(None),
                 live: Mutex::new(Live::default()),
                 turns: LiveTurns::new(),
@@ -301,6 +327,7 @@ impl ControlService {
     pub fn hooks(&self, inner: Option<Arc<dyn ExecutionHooks>>) -> Arc<dyn ExecutionHooks> {
         Arc::new(PauseHooks {
             paused: self.inner.paused.subscribe(),
+            gate: Arc::clone(&self.inner.gate),
             inner,
         })
     }
@@ -365,6 +392,7 @@ impl ControlService {
         if self.inner.paused.send_replace(false) {
             tracing::info!("run resumed");
         }
+        self.inner.gate.released.notify_waiters();
     }
 
     /// The live firing of a node instance, by name.

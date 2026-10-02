@@ -19,7 +19,7 @@ use execution::host::{HostError, HostRun};
 use execution::watchdog::StallWatchdog;
 use execution::{
     Access, CoordinatorHandle, InterviewDispatcher, InterviewReceipt, Interviewer, LeaseState,
-    RECEIPT_FILE, ResourceStore, host, open_run_dir,
+    RECEIPT_FILE, RECEIPT_VERSION, ResourceStore, host, open_run_dir,
 };
 use runtime::driver::ExecutionReport;
 use runtime::executor::Retention;
@@ -196,7 +196,22 @@ pub(crate) async fn drive(
     if let Some(watchdog) = &watchdog {
         observers.push(Arc::new(watchdog.clone()));
     }
-    let dispatcher = interviewer.map(InterviewDispatcher::new);
+    // A resumed run continues the receipt an earlier process wrote, and the
+    // receipt is written as each question's outcome is recorded, so a crash
+    // loses only the questions still waiting, which the resumed run asks
+    // again.
+    let earlier = match &start {
+        Start::Resume { .. } => read_receipt(run_dir),
+        Start::Fresh { .. } => None,
+    };
+    let dispatcher = interviewer.map(|interviewer| {
+        let dispatcher = InterviewDispatcher::continuing(interviewer, earlier);
+        let dir = run_dir.to_path_buf();
+        dispatcher.publish_to(Arc::new(move |receipt| {
+            save_receipt(&dir, receipt);
+        }));
+        dispatcher
+    });
     if let Some(dispatcher) = &dispatcher {
         observers.push(Arc::new(dispatcher.clone()));
     }
@@ -306,23 +321,48 @@ pub(crate) async fn drive(
     }
 }
 
-/// Persist the interview receipt beside the run.
+/// Persist the interview receipt beside the run, and say where it is.
 #[expect(
     clippy::print_stderr,
-    reason = "the CLI reports where the receipt went, and a failure to write it, on stderr"
+    reason = "the CLI reports where the receipt went on stderr"
 )]
 fn write_receipt(run_dir: &Path, receipt: &InterviewReceipt) {
-    let path = run_dir.join(RECEIPT_FILE);
-    match serde_json::to_vec_pretty(receipt) {
-        Ok(bytes) => {
-            if let Err(error) = fs::write(&path, bytes) {
-                eprintln!("warning: could not write {}: {error}", path.display());
-            } else if !receipt.questions.is_empty() || !receipt.errors.is_empty() {
-                eprintln!("interviews: {}", path.display());
-            }
-        }
-        Err(error) => eprintln!("warning: could not encode the interview receipt: {error}"),
+    if save_receipt(run_dir, receipt)
+        && (!receipt.questions.is_empty() || !receipt.errors.is_empty())
+    {
+        eprintln!("interviews: {}", run_dir.join(RECEIPT_FILE).display());
     }
+}
+
+/// Write the receipt whole, through a temporary file renamed over the old
+/// one, so a crash mid-write leaves the last receipt intact. Whether it was
+/// written.
+#[expect(
+    clippy::print_stderr,
+    reason = "the CLI reports a failure to write the receipt on stderr"
+)]
+fn save_receipt(run_dir: &Path, receipt: &InterviewReceipt) -> bool {
+    let path = run_dir.join(RECEIPT_FILE);
+    let staged = path.with_extension("json.tmp");
+    let written = serde_json::to_vec_pretty(receipt)
+        .map_err(|error| format!("could not encode the interview receipt: {error}"))
+        .and_then(|bytes| {
+            fs::write(&staged, bytes)
+                .and_then(|()| fs::rename(&staged, &path))
+                .map_err(|error| format!("could not write {}: {error}", path.display()))
+        });
+    if let Err(error) = &written {
+        eprintln!("warning: {error}");
+    }
+    written.is_ok()
+}
+
+/// The receipt an earlier process of this run wrote, when it is one this
+/// build continues.
+fn read_receipt(run_dir: &Path) -> Option<InterviewReceipt> {
+    let bytes = fs::read(run_dir.join(RECEIPT_FILE)).ok()?;
+    let receipt: InterviewReceipt = serde_json::from_slice(&bytes).ok()?;
+    (receipt.version == RECEIPT_VERSION).then_some(receipt)
 }
 
 /// Say where the retained workspaces are, or how to reach them. A host

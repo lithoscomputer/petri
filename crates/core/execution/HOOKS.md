@@ -75,7 +75,7 @@ the local service itself. Both are exercised: the first by
 | `ScopeReady` | the first step to run in a scope's environment (`attractor/stage` at the root workflow's `start`), through the `HookServiceHandle`, once per run, after the checkout seeded the workspace; the view is the step's, the payload `ScopeReadyPayload { scope, workspace }` | `Block` |
 | `RunStarted` | the same step, right after `ScopeReady`, once per run; the view is the step's, no payload | `Block` |
 | `RunFinished` | `HookAdapter::run_finished`, from the driver that owns the run (a bare driver, or the coordinator's root invocation) at a terminal exit, before any environment is released; no firing view, payload `RunFinishedPayload { status, failure }`; the report comes back as a note the coordinator records at run level | none |
-| `ScopeReleased` | `HookAdapter::scope_released`, from the driver just before a scope's own environment is released (an inherited sandbox's release reports nothing); a release that is part of the run's end waits for `RunFinished`; no firing view, payload `ScopeReleasedPayload { scope, outcome }`; the report comes back as a note the coordinator records at run level | none |
+| `ScopeReleased` | `HookAdapter::scope_released`, from the driver just before a scope's own environment is released (an inherited sandbox's release reports nothing); a release that is part of the run's end waits for `RunFinished`; a resumed driver also runs it at its end for each scope an earlier lifetime acquired and it never holds, with no environment (see below); no firing view, payload `ScopeReleasedPayload { scope, outcome }`; the report comes back as a note the coordinator records at run level | none |
 | `BeforeToolUse`, `AfterToolUse`, `AfterToolFailure` | the agent backend's tool middleware (native) or permission handler (ACP), through the `HookServiceHandle`, at the actual tool boundary | `Block` at `BeforeToolUse` |
 
 A decision a point does not consume is ignored; the report is still recorded.
@@ -125,6 +125,20 @@ execution named, and
 coordinator format version 2: a log without it replays as before. A
 `sandbox_cleanup` report of an environment released after the run's finish
 (a prune after a crash) has no driver and is not recorded.
+
+Run notes are recorded at least once. The driver hands them over only at its
+end, so a crash before the coordinator appends them loses them, and the
+resumed run asks for them again:
+
+- A resumed driver whose exit is terminal runs `run_finished` again.
+- After `run_finished`, a resumed driver runs `scope_released` for each scope
+  an earlier lifetime acquired and it never releases itself. It holds no
+  environment for such a scope, so a hook placed in the sandbox reports that
+  it cannot run. The outcome is `failed` when one of the scope's firings
+  ended in a failure.
+
+A crash after the notes were appended repeats them. A reader that needs each
+point once deduplicates on the execution and the payload.
 
 `ExecutionHooks` wrappers (the control service's pause hooks are one) must
 forward `run_finished` and `scope_released` as they forward the other points

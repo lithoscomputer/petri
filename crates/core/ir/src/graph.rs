@@ -1036,7 +1036,8 @@ impl<S> GraphBody<S> {
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RunPolicy {
     /// Cancel the run after this long with no execution event at all. A
-    /// pending human question parks the clock. `None` disables the watchdog.
+    /// pending human question parks the clock, and so does a pause until its
+    /// unpause. `None` disables the watchdog.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub stall_timeout:                Option<Duration>,
     /// How many times one node may fail with the same deterministic or

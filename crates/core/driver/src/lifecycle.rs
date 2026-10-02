@@ -549,7 +549,11 @@ pub trait ExecutionHooks: Send + Sync {
     }
 
     /// A scope's environment is about to be released. Awaited: the release
-    /// waits for it. Notes travel as for [`Self::run_finished`].
+    /// waits for it. Notes travel as for [`Self::run_finished`]. A resumed
+    /// driver also calls it at its end, after `run_finished`, for each scope
+    /// an earlier lifetime acquired and it never holds: that lifetime's notes
+    /// died with it. There is no environment then, and a crash after the
+    /// notes were recorded repeats them.
     async fn scope_released(&self, context: &HookContext, released: ScopeReleased) -> Vec<Note> {
         let _ = (context, released);
         Vec::new()

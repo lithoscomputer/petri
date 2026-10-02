@@ -1453,7 +1453,8 @@ standalone host installs `execution::watchdog::StallWatchdog` as an observer.
 Any engine or lifecycle record of any execution is activity. A question
 pending with the host parks the clock: a run waiting on a person is blocked,
 not stalled. When the last pending question is answered the run gets a full
-stall budget again. A run idle for the whole budget is cancelled through the
+stall budget again. A pause parks it too, until the unpause, which restarts
+the full budget; a run resumed paused starts parked. A run idle for the whole budget is cancelled through the
 coordinator, and the terminal prints `stall watchdog: no execution activity
 for N s`. This is separate from each attempt's active-work timer.
 
