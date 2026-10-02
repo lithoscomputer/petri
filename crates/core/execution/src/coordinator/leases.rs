@@ -86,13 +86,20 @@ impl ScopeLeaseAllocator for InvocationLeaseAllocator {
         let error = |error: &dyn fmt::Display| {
             executor::EnvError::backend("coordinator", "reserve lease", error.to_string())
         };
+        // A write the store failed is the run's failure, not the scope's.
+        let store_failed = |error: &dyn fmt::Display| executor::EnvError::Store {
+            message: error.to_string(),
+        };
         let introduced_by =
             matches!(identity, engine::ScopeIdentity::Spliced(_)).then_some(self.execution);
         // The scope's introducing outcome must be durable before its lease.
         // This queues a marker behind all records already observed by the
         // driver.
         if introduced_by.is_some() {
-            self.writer.flush().await.map_err(|source| error(&source))?;
+            self.writer
+                .flush()
+                .await
+                .map_err(|source| store_failed(&source))?;
         }
         let provider = self
             .router
@@ -115,7 +122,10 @@ impl ScopeLeaseAllocator for InvocationLeaseAllocator {
             let record = resources
                 .reserve_scope(allocation, &provider, runtime, introduced_by)
                 .await
-                .map_err(|source| error(&source))?;
+                .map_err(|source| match source {
+                    ResourceError::Store(_) => store_failed(&source),
+                    other => error(&other),
+                })?;
             if record.state == crate::LeaseState::Deleted {
                 return Err(error(&ResourceError::DeletedLease(record.lease)));
             }

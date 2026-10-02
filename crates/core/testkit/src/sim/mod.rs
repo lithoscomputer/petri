@@ -113,6 +113,8 @@ pub struct Ran {
     pub lifetime:   u32,
     pub firing:     u64,
     pub attempt:    u32,
+    /// A zombie started it after its successor took the run.
+    pub zombie:     bool,
     state:          Arc<ProcessState>,
 }
 
@@ -157,37 +159,48 @@ impl ProcessState {
 
 #[derive(Debug)]
 struct WorldState {
-    dice:          Dice,
-    faults:        Faults,
-    lifetime:      u32,
-    generations:   BTreeMap<SmolStr, u32>,
-    acquisitions:  Vec<Acquired>,
-    processes:     Vec<Ran>,
+    dice:           Dice,
+    faults:         Faults,
+    lifetime:       u32,
+    generations:    BTreeMap<SmolStr, u32>,
+    acquisitions:   Vec<Acquired>,
+    processes:      Vec<Ran>,
     /// `(execution, firing, attempt)` whose finish was in the logs the
     /// current lifetime resumed from.
-    finished:      BTreeSet<(SmolStr, u64, u32)>,
+    finished:       BTreeSet<(SmolStr, u64, u32)>,
     /// `(execution, firing)` a stop had reached, still stopping, in those
     /// logs.
-    stopping:      BTreeSet<(SmolStr, u64)>,
+    stopping:       BTreeSet<(SmolStr, u64)>,
     /// A sibling execution holds the attempt slot the driver shares with it.
-    sibling:       bool,
+    sibling:        bool,
     /// How often the sibling took the slot.
-    sibling_turns: usize,
+    sibling_turns:  usize,
     /// `(firing, attempt)` whose result preparation the host failed, fatally.
-    fatal:         BTreeSet<(u64, u32)>,
+    fatal:          BTreeSet<(u64, u32)>,
     /// Processes a fence ended.
-    fenced:        usize,
-    violations:    Vec<String>,
+    fenced:         usize,
+    violations:     Vec<String>,
     /// The provider's sandboxes, every one ever created, in creation order.
-    sandboxes:     Vec<WorldSandbox>,
+    sandboxes:      Vec<WorldSandbox>,
     /// Every provider call that changed a sandbox.
-    calls:         Vec<CallRecord>,
+    calls:          Vec<CallRecord>,
     /// Calls of each kind this lifetime, for the crash plan.
-    counts:        BTreeMap<Call, usize>,
+    counts:         BTreeMap<Call, usize>,
     /// Crash the lifetime at the `nth` call of a kind.
-    crash_at:      Option<(CallCrash, Arc<Notify>)>,
+    crash_at:       Option<(CallCrash, Arc<Notify>)>,
     /// Where provider calls read the run's lease records.
-    records:       Option<Arc<dyn LeaseRecords>>,
+    records:        Option<Arc<dyn LeaseRecords>>,
+    /// Earlier lifetimes still running after their successor took the run:
+    /// their calls go through. What a zombie does after the takeover is the
+    /// documented hazard of releasing a live owner's lease: counted, not a
+    /// violation.
+    zombies:        BTreeSet<u32>,
+    /// Provider calls and process starts a zombie made after the takeover.
+    zombie_calls:   usize,
+    zombie_starts:  usize,
+    /// Sandboxes a zombie changed after the takeover: what the successor
+    /// finds in them is the zombie's doing.
+    zombie_touched: BTreeSet<String>,
 }
 
 /// The world a simulated run's drivers share.
@@ -218,6 +231,10 @@ impl World {
                 counts: BTreeMap::new(),
                 crash_at: None,
                 records: None,
+                zombies: BTreeSet::new(),
+                zombie_calls: 0,
+                zombie_starts: 0,
+                zombie_touched: BTreeSet::new(),
             }),
         })
     }
@@ -290,6 +307,24 @@ impl World {
     /// The current driver lifetime: 0 until the first crash.
     pub fn lifetime(&self) -> u32 {
         self.lock().lifetime
+    }
+
+    /// `lifetime` keeps running after its successor took the run, as a
+    /// process that lost its lease but not its life does: its calls go
+    /// through, and are counted.
+    pub fn haunt(&self, lifetime: u32) {
+        self.lock().zombies.insert(lifetime);
+    }
+
+    /// `lifetime` is finally gone: its calls never return from here on.
+    pub fn lay(&self, lifetime: u32) {
+        self.lock().zombies.remove(&lifetime);
+    }
+
+    /// The provider calls and process starts zombies made.
+    pub fn zombie_actions(&self) -> (usize, usize) {
+        let state = self.lock();
+        (state.zombie_calls, state.zombie_starts)
     }
 }
 
@@ -511,6 +546,8 @@ struct Place {
     /// The sandbox is the one its holder should run in: not fenced by a
     /// later acquisition. A process in a fenced sandbox is dead on arrival.
     current:    bool,
+    /// The lifetime that starts it, when it may not be the current one.
+    lifetime:   Option<u32>,
 }
 
 /// A started process: its state, whose attempt it is, and the lines it
@@ -539,13 +576,23 @@ impl World {
             generation,
             execution,
             current,
+            lifetime,
         } = place;
         let mut state = self.lock();
-        let lifetime = state.lifetime;
+        let lifetime = lifetime.unwrap_or(state.lifetime);
+        let superseded = lifetime < state.lifetime;
         let now = time::Instant::now();
-        if current
+        // A zombie's start is counted; the rules below are the current
+        // lifetime's, and a process a zombie started after its takeover is
+        // no dead driver's leftover.
+        if superseded {
+            state.zombie_starts += 1;
+        } else if current
             && state.processes.iter().any(|earlier| {
-                earlier.key == key && earlier.lifetime < lifetime && earlier.running(now)
+                earlier.key == key
+                    && earlier.lifetime < lifetime
+                    && !earlier.zombie
+                    && earlier.running(now)
             })
         {
             state.violations.push(format!(
@@ -553,7 +600,7 @@ impl World {
                  an unfenced process a dead driver left"
             ));
         }
-        if state.sibling {
+        if state.sibling && !superseded {
             state.violations.push(format!(
                 "firing {firing} attempt {attempt} ran while a sibling execution held the slot"
             ));
@@ -563,12 +610,13 @@ impl World {
         } else {
             format!(" of {execution}")
         };
-        if lifetime > 0 && state.stopping.contains(&(execution.clone(), firing)) {
+        if !superseded && lifetime > 0 && state.stopping.contains(&(execution.clone(), firing)) {
             state.violations.push(format!(
                 "firing {firing}{at} was stopping at the crash and ran again (attempt {attempt})"
             ));
         }
-        if lifetime > 0
+        if !superseded
+            && lifetime > 0
             && state
                 .finished
                 .contains(&(execution.clone(), firing, attempt))
@@ -605,6 +653,7 @@ impl World {
             lifetime,
             firing,
             attempt,
+            zombie: superseded,
             state: Arc::clone(&process),
         });
         Started {
@@ -631,6 +680,7 @@ impl ExecEnv for WorldEnv {
                 generation: self.generation,
                 execution: self.execution.clone(),
                 current,
+                lifetime: None,
             },
             |key| spec.env.get(key).map(ToString::to_string),
         );

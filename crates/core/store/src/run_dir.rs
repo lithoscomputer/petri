@@ -20,6 +20,13 @@
 //! synced to disk per append, as their records are few and decide the run;
 //! an engine log is synced when the handle closes, since its records are
 //! many and replay regenerates what a power loss takes from its tail.
+//!
+//! A failed append ends the handle's writing: part of a line, or a whole
+//! line whose sync failed, may be in the file past what the writer counted,
+//! and a later append would join or repeat it. Every later write through
+//! the handle is refused with the first failure, so the process ends, and
+//! the next writer recovers from the files: it truncates a partial line and
+//! counts a line that landed, so a retry of that record is stored once.
 
 use std::collections::BTreeMap;
 use std::fs::{self, File, OpenOptions};
@@ -254,8 +261,10 @@ struct LogHead {
 
 /// What the file operations need: the root, and each opened log's head.
 struct WriterState {
-    root:  PathBuf,
-    heads: Mutex<BTreeMap<LogId, Arc<Mutex<LogHead>>>>,
+    root:   PathBuf,
+    heads:  Mutex<BTreeMap<LogId, Arc<Mutex<LogHead>>>>,
+    /// The first append that failed: this handle writes nothing more.
+    failed: Mutex<Option<String>>,
 }
 
 impl WriterState {
@@ -263,6 +272,19 @@ impl WriterState {
         Self {
             root,
             heads: Mutex::new(BTreeMap::new()),
+            failed: Mutex::new(None),
+        }
+    }
+
+    /// Refuse a write once an append has failed through this handle.
+    fn refuse_after_failure(&self, action: &'static str) -> Result<(), StoreError> {
+        match lock(&self.failed).as_ref() {
+            Some(first) => Err(StoreError::backend(
+                self.locator(),
+                action,
+                format!("an earlier append failed, and this handle writes nothing more: {first}"),
+            )),
+            None => Ok(()),
         }
     }
 
@@ -329,7 +351,20 @@ impl WriterState {
         Ok(head)
     }
 
+    /// Append, or refuse after an earlier failure. A conflict writes
+    /// nothing, so it is not a failure of the handle.
     fn append(&self, log: &LogId, records: &[Record]) -> Result<(), StoreError> {
+        self.refuse_after_failure("append")?;
+        let appended = self.append_records(log, records);
+        if let Err(error) = &appended
+            && !matches!(error, StoreError::Conflict { .. })
+        {
+            lock(&self.failed).get_or_insert_with(|| error.to_string());
+        }
+        appended
+    }
+
+    fn append_records(&self, log: &LogId, records: &[Record]) -> Result<(), StoreError> {
         let head = self.head(log)?;
         let mut head = lock(&head);
         let stored = |seq: u64| self.read_log(log).ok()?.into_iter().find(|r| r.seq == seq);
@@ -380,6 +415,7 @@ impl WriterState {
     }
 
     fn put_blob(&self, bytes: &[u8]) -> Result<Digest, StoreError> {
+        self.refuse_after_failure("put blob")?;
         let digest = Digest::of(bytes);
         let path = self.blob_path(digest);
         if path.exists() {
@@ -519,5 +555,120 @@ impl RunLogs for RunDirLogs {
     async fn get_blob(&self, digest: Digest) -> Result<Option<Vec<u8>>, StoreError> {
         let state = self.state.clone();
         self.joined(spawn_blocking(move || state.get_blob(digest)).await)?
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::fs::{self, File, OpenOptions};
+    use std::io::Write as _;
+
+    use serde_json::json;
+    use testkit::RunDir;
+
+    use super::{WriterState, lock};
+    use crate::{LogId, Record};
+
+    fn record(seq: u64) -> Record {
+        Record::from_value(json!({
+            "seq": seq,
+            "origin": "external",
+            "recorded_at": 1_000 + seq,
+            "body": { "event": "event" },
+        }))
+        .expect("a test record has seq and recorded_at")
+    }
+
+    /// Write `bytes` past what the writer counted, as a write that failed
+    /// partway, or whose sync failed, leaves them.
+    fn leave_bytes(state: &WriterState, log: &LogId, bytes: &[u8]) {
+        OpenOptions::new()
+            .append(true)
+            .open(state.log_path(log))
+            .and_then(|mut file| file.write_all(bytes))
+            .expect("writes past the writer's count");
+    }
+
+    /// Make the log's next write fail, as a full disk or a failed sync
+    /// does: its cached handle turns read-only.
+    fn fail_writes(state: &WriterState, log: &LogId) {
+        let head = state.head(log).expect("the log is open");
+        lock(&head).file = File::open(state.log_path(log)).expect("reopens read-only");
+    }
+
+    #[test]
+    fn a_failed_append_refuses_every_later_write_and_the_next_writer_recovers() {
+        let dir = RunDir::new("store-failed-append");
+        let state = WriterState::new(dir.path().to_path_buf());
+        state
+            .append(&LogId::Coordinator, &[record(0)])
+            .expect("appends");
+        leave_bytes(&state, &LogId::Coordinator, b"{\"seq\":1,\"origin\":\"ext");
+        fail_writes(&state, &LogId::Coordinator);
+
+        state
+            .append(&LogId::Coordinator, &[record(1)])
+            .expect_err("the write fails");
+        for refused in [
+            state.append(&LogId::Coordinator, &[record(1)]).map(drop),
+            state.append(&LogId::Resources, &[record(0)]).map(drop),
+            state.put_blob(b"graph").map(drop),
+        ] {
+            let error = refused.expect_err("the handle writes nothing more");
+            assert!(
+                error.to_string().contains("an earlier append failed"),
+                "{error}"
+            );
+        }
+        assert!(
+            !state.log_path(&LogId::Resources).exists(),
+            "the refused append touched no file"
+        );
+
+        // The next process: the partial line is truncated, the log reads
+        // whole, and the record the failure cut off is appended once.
+        let next = WriterState::new(dir.path().to_path_buf());
+        next.append(&LogId::Coordinator, &[record(1)])
+            .expect("appends after the partial line");
+        assert_eq!(next.read_log(&LogId::Coordinator).expect("reads"), vec![
+            record(0),
+            record(1)
+        ]);
+    }
+
+    #[test]
+    fn a_record_that_landed_before_a_failed_sync_is_stored_once() {
+        let dir = RunDir::new("store-failed-sync");
+        let state = WriterState::new(dir.path().to_path_buf());
+        state
+            .append(&LogId::Coordinator, &[record(0)])
+            .expect("appends");
+        let mut line = serde_json::to_vec(&record(1).record).expect("encodes");
+        line.push(b'\n');
+        leave_bytes(&state, &LogId::Coordinator, &line);
+        fail_writes(&state, &LogId::Coordinator);
+        state
+            .append(&LogId::Coordinator, &[record(1)])
+            .expect_err("the sync fails");
+        state
+            .append(&LogId::Coordinator, &[record(1)])
+            .expect_err("the retry is refused in this process");
+
+        // The next process counts the line that landed: the retry of the
+        // same record is accepted without a second copy.
+        let next = WriterState::new(dir.path().to_path_buf());
+        next.append(&LogId::Coordinator, &[record(1)])
+            .expect("the retry is accepted");
+        assert_eq!(next.read_log(&LogId::Coordinator).expect("reads"), vec![
+            record(0),
+            record(1)
+        ]);
+        assert_eq!(
+            fs::read_to_string(next.log_path(&LogId::Coordinator))
+                .expect("the log")
+                .lines()
+                .count(),
+            2
+        );
     }
 }

@@ -3,6 +3,7 @@ use std::fs;
 use std::sync::Arc;
 use std::time::Duration;
 
+use driver::lifecycle::{ExecutionHooks, HookContext, Note, RunFinished};
 use execution::{
     Access, CallSite, Coordinator, CoordinatorEvent, CoordinatorInvocationClient,
     CoordinatorOptions, CoordinatorStore, ExecutionId, FoldEvent, GraphDigest,
@@ -1112,6 +1113,139 @@ async fn assert_terminal_parent_recovers_child(cancel_recorded: bool) {
         "the parent call was not reissued"
     );
     coordinator.finish().await;
+}
+
+/// Notes the run's end, so a record can land between a cancel and its
+/// cascade.
+struct NotingHooks;
+
+#[async_trait::async_trait]
+impl ExecutionHooks for NotingHooks {
+    async fn run_finished(&self, _context: &HookContext, _finished: RunFinished) -> Vec<Note> {
+        vec![Note::new("test.run", serde_json::json!({}))]
+    }
+}
+
+/// A crash can cut a cancel's cascade short: the root's cancel is
+/// recorded, its child's is not. The resumed coordinator records the
+/// child's cancel before anything else, so the root cannot reach its end,
+/// and run its end hooks, while its child is still uncancelled.
+#[tokio::test]
+async fn a_resumed_run_finishes_a_cancel_a_crash_cut_short() {
+    let directory = RunDir::new("coordinator-cut-cancel");
+    let started = Arc::new(Notify::new());
+    let mut options = RunOptions::new(directory.path());
+    options.retention = Retention::Always;
+    let runtime = Runtime::standard()
+        .step(InvokeStep)
+        .step(WaitForCancelStep)
+        .capability(TestStarted(started.clone()))
+        .hooks(Arc::new(NotingHooks))
+        .options(options);
+    let mut coordinator = Coordinator::create(
+        runtime.prepare_run(directory.path()),
+        Vec::new(),
+        CoordinatorOptions::default(),
+    )
+    .await
+    .expect("the coordinator starts");
+    let mut child = GraphBuilder::new();
+    child.add_step("wait", ScopeId::new(0), WaitForCancelStep::NAME);
+    let child = coordinator
+        .register_graph(&child.build())
+        .await
+        .expect("child registers");
+    let mut parent = GraphBuilder::new();
+    parent.add_node(
+        "invoke",
+        ScopeId::new(0),
+        StepRef::new(InvokeStep::NAME, serde_json::json!({ "graph": child })),
+    );
+    let parent = coordinator
+        .register_graph(&parent.build())
+        .await
+        .expect("parent registers");
+    let control = coordinator.handle();
+    let mut running = Box::pin(coordinator.run_root(parent, BTreeMap::new()));
+    tokio::select! {
+        () = started.notified() => control.cancel_root(),
+        result = &mut running => panic!("the run finished before cancellation: {result:?}"),
+    }
+    let result = timeout(Duration::from_secs(5), running)
+        .await
+        .expect("the cancelled tree settles")
+        .expect("the run ends");
+    assert_eq!(result.status, RunStatus::Cancelled);
+    coordinator.finish().await;
+
+    // Model a crash between the root's cancel and its child's: the
+    // coordinator log ends with the root's cancel, and neither engine log
+    // holds the cancel yet.
+    let lifecycle = read_coordinator_log(&*testkit::read_run_dir(directory.path()).await)
+        .await
+        .expect("coordinator log decodes");
+    let mut prefix = Vec::new();
+    let mut kept = 0;
+    for record in lifecycle {
+        serde_json::to_writer(&mut prefix, &record).expect("record encodes");
+        prefix.push(b'\n');
+        kept += 1;
+        if matches!(
+            record.body,
+            CoordinatorEvent::InvocationCancelRequested { invocation, .. }
+                if invocation == InvocationId::ROOT
+        ) {
+            break;
+        }
+    }
+    fs::write(directory.path().join("coordinator.jsonl"), prefix).expect("coordinator prefix");
+    for execution in ["0000000000000000", "0000000000000001"] {
+        let path = directory
+            .path()
+            .join(format!("executions/{execution}/events.jsonl"));
+        let events = fs::read_to_string(&path).expect("engine log");
+        let mut lines = events.lines();
+        let mut prefix = format!("{}\n", lines.next().expect("engine header"));
+        for line in lines {
+            let record: StoredEngineRecord = serde_json::from_str(line).expect("engine record");
+            if matches!(record.body, Event::CancelRequested { .. }) {
+                break;
+            }
+            prefix.push_str(line);
+            prefix.push('\n');
+        }
+        fs::write(&path, prefix).expect("engine prefix");
+    }
+
+    let mut coordinator = Coordinator::resume(
+        runtime.prepare_run(directory.path()),
+        Vec::new(),
+        CoordinatorOptions::default(),
+    )
+    .await
+    .expect("the coordinator resumes");
+    let result = timeout(
+        Duration::from_secs(5),
+        coordinator.run_root(parent, BTreeMap::new()),
+    )
+    .await
+    .expect("the resumed tree settles")
+    .expect("the resumed run ends");
+    assert_eq!(result.status, RunStatus::Cancelled);
+    coordinator.finish().await;
+
+    let records = read_coordinator_log(&*testkit::read_run_dir(directory.path()).await)
+        .await
+        .expect("coordinator log decodes");
+    let first = records.get(kept).map(|record| &record.body);
+    assert!(
+        matches!(
+            first,
+            Some(CoordinatorEvent::InvocationCancelRequested { invocation, .. })
+                if *invocation == InvocationId::new(1)
+        ),
+        "the cut cascade is the resumed lifetime's first record: {first:?}"
+    );
 }
 
 #[tokio::test]

@@ -27,6 +27,7 @@ use smol_str::SmolStr;
 use store::{LogId, Record, RunLogs};
 use tokio::sync::Mutex;
 
+use crate::observe::StoreFailure;
 use crate::{ExecutionId, SandboxAllocationKey, SandboxLeaseId};
 
 /// The provider kind a host-process scope's lease records: its workspace
@@ -118,6 +119,11 @@ pub struct ResourceStore {
     next_seq:      u64,
     /// What each record's `recorded_at` reads.
     clock:         RecordingClock,
+    /// The run's store failure, shared with its other writers. Once any
+    /// write has failed, every write here is refused: memory may no longer
+    /// match the log (a write that landed but reported a failure), and the
+    /// lifetime is ending.
+    failure:       Arc<StoreFailure>,
 }
 
 impl ResourceStore {
@@ -151,7 +157,21 @@ impl ResourceStore {
             next_lease,
             next_seq: stored.len() as u64,
             clock: RecordingClock::default(),
+            failure: Arc::new(StoreFailure::default()),
         })
+    }
+
+    /// The run's first failed write, once there is one: memory may no
+    /// longer match the log.
+    pub(crate) fn failed(&self) -> Option<&str> {
+        self.failure.get()
+    }
+
+    /// Share the run's store failure with its other writers.
+    #[must_use]
+    pub(crate) fn with_failure(mut self, failure: Arc<StoreFailure>) -> Self {
+        self.failure = failure;
+        self
     }
 
     /// Stamp every record appended from now on with `clock`.
@@ -284,6 +304,14 @@ impl ResourceStore {
                 ResourceError::Encode(serde_json::Error::custom(shape))
             }
         })?;
+        if let Some(first) = self.failure.get() {
+            return Err(store::StoreError::backend(
+                self.locator.clone(),
+                "append",
+                format!("an earlier write to the run's store failed: {first}"),
+            )
+            .into());
+        }
         let logs = self.logs.upgrade().ok_or_else(|| {
             store::StoreError::backend(
                 self.locator.clone(),
@@ -291,7 +319,11 @@ impl ResourceStore {
                 "the run's store handle is gone",
             )
         })?;
-        logs.append(&LogId::Resources, &[stored]).await?;
+        if let Err(error) = logs.append(&LogId::Resources, &[stored]).await {
+            self.failure
+                .trip(format!("could not append to the resources log: {error}"));
+            return Err(error.into());
+        }
         self.next_seq += 1;
         Ok(())
     }
@@ -325,8 +357,17 @@ impl ResourceLedger {
 
 #[async_trait::async_trait]
 impl LeaseLedger for ResourceLedger {
+    /// Refused once a write to the run's store failed: a record that
+    /// landed but reported a failure is not in memory, so no provider call
+    /// may act on what memory says (the sweep of unrecorded sandboxes would
+    /// delete the one the log names).
     async fn lookup(&self, lease: SandboxLeaseId) -> Result<Option<LeaseRecord>, LedgerError> {
         let store = self.0.lock().await;
+        if let Some(first) = store.failed() {
+            return Err(LedgerError(format!(
+                "an earlier write to the run's store failed: {first}"
+            )));
+        }
         let Ok(record) = store.resolve(lease) else {
             return Ok(None);
         };

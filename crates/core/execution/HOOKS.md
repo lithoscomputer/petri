@@ -132,7 +132,9 @@ resumed run asks for them again:
 
 - A resumed driver whose exit is terminal runs `run_finished` again.
 - After `run_finished`, a resumed driver runs `scope_released` for each scope
-  an earlier lifetime acquired and it never releases itself. It holds no
+  an earlier lifetime acquired and it never releases itself. It finds every
+  such scope: no attempt starts in a scope before the run log holds its
+  `scope.acquired`. It holds no
   environment for such a scope, so a hook placed in the sandbox reports that
   it cannot run. The outcome is `failed` when one of the scope's firings
   ended in a failure.

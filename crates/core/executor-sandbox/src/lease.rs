@@ -308,8 +308,12 @@ impl SandboxLeaseManager {
         )
     }
 
+    /// A lease record the ledger could not write: the run's store failed,
+    /// not the provider.
     fn ledger_failed(error: &LedgerError) -> EnvError {
-        EnvError::backend(BACKEND, "lease", error.to_string())
+        EnvError::Store {
+            message: error.to_string(),
+        }
     }
 
     /// The sandbox for `request.lease`, allocating, attaching, or reusing
@@ -757,7 +761,13 @@ impl SandboxLeaseManager {
                 Err(error) => return report.problem(error.to_string()),
             },
             None => match self.find_allocated(&*provider, lease).await {
-                Ok(Some(id)) => id,
+                // The create reached the provider but never its record: name
+                // the sandbox first, as reconciliation adopts one, so a kept
+                // lease names what it keeps.
+                Ok(Some(id)) => match self.ledger.live(lease, id.as_str()).await {
+                    Ok(()) => id,
+                    Err(error) => return report.problem(error.to_string()),
+                },
                 Ok(None) => {
                     return match self.ledger.deleted(lease).await {
                         Ok(()) => report,

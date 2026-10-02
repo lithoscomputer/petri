@@ -34,6 +34,11 @@
 //!   the backend's own liveness signal says the owner is gone (the file lock
 //!   ends with the process), or when an operator releases it. It never ends by
 //!   timeout.
+//! - Releasing a live owner's lease does not stop the owner. Its writes are
+//!   refused from then on, but until its next write fails it may still start
+//!   processes, run hooks, and finish provider calls it began, beside the new
+//!   owner. A host releases a lease, or lets its liveness signal end one, only
+//!   when the owner is known to be gone.
 //! - `append` returns once the records are durable: past the point where a
 //!   process crash can lose them. Appends to one log are ordered; a backend
 //!   never reorders within a log. `(log, seq)` is unique: the same record again

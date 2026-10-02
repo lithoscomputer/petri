@@ -592,6 +592,22 @@ pinned by the run format version, checked on the run declaration. The
 layout is the standalone petri host's own and is documented with it, not
 here.
 
+**A failed write ends the lifetime.** When a write to the run's store fails,
+in any of its logs, the coordinator's lifetime ends at once, and the next
+lifetime resumes from what the store holds. A write can land and still
+report a failure, so memory may no longer match the log: every writer of the
+run refuses from then on, the lease layer answers no lookup and so calls no
+provider, and the driver stops without recording anything more
+(`ExecutionReport::store_failure`). No firing fails for the store, and no
+hook runs after the failure; the coordinator returns
+`CoordinatorError::StoreFailed`. A run-directory handle refuses every write
+after its first failed append, and the next writer truncates a partial line
+and counts one that landed. Before any attempt starts in a scope, and before
+a scope is released, the driver waits for the run log to hold the scope's
+`scope.acquired`, so the `scope_released` point of a scope an earlier
+lifetime acquired is always found again on resume
+(`Driver::observe_run_log`).
+
 **Resume.** `engine::resume(graph, &log)` rebuilds a crashed run by replay and
 reconciles what is still owed. The loaded log must be a **byte-prefix** of the
 regenerated one — not equal: a crash can land between an External append and

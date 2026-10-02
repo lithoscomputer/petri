@@ -240,7 +240,21 @@ struct Side {
 
 impl Side {
     fn dead(&self) -> bool {
-        self.world.lock().lifetime > self.lifetime
+        let state = self.world.lock();
+        state.lifetime > self.lifetime && !state.zombies.contains(&self.lifetime)
+    }
+
+    /// Whether this lifetime's successor took the run. A zombie's call is
+    /// counted, the sandbox it changes remembered, and the rules that
+    /// assume a live owner skip it.
+    fn superseded(&self, sandbox: &str) -> bool {
+        let mut state = self.world.lock();
+        let superseded = state.lifetime > self.lifetime;
+        if superseded {
+            state.zombie_calls += 1;
+            state.zombie_touched.insert(sandbox.to_owned());
+        }
+        superseded
     }
 
     /// A dead lifetime's call never returns.
@@ -375,9 +389,11 @@ impl SandboxProvider for WorldProvider {
             .name
             .clone()
             .ok_or_else(|| Error::invalid_spec("name", "the world names every sandbox"))?;
+        let superseded = side.superseded(&id);
         if let Some(Some(view)) = side
             .view(spec.labels.get(LEASE_LABEL).map(String::as_str))
             .await
+            && !superseded
             && (view.state != LeaseState::Allocating || !view.fingerprint || view.pending.is_some())
         {
             self.world.violation(format!(
@@ -539,6 +555,7 @@ impl WorldSandboxHandle {
         let Some(index) = self.index() else {
             return Err(self.gone());
         };
+        let superseded = self.side.superseded(self.id.as_str());
         let lease = self.side.world.lock().sandboxes[index]
             .lease()
             .map(ToOwned::to_owned);
@@ -557,7 +574,7 @@ impl WorldSandboxHandle {
                 }
                 Call::Start | Call::Create => true,
             };
-            if !allowed {
+            if !allowed && !superseded {
                 self.side.world.violation(format!(
                     "{call:?} of {} before its lease recorded the intent ({view:?})",
                     self.id.as_str()
@@ -714,17 +731,26 @@ impl Exec for WorldExec {
         controls: ExecControls,
     ) -> sandbox_driver::Result<ExecStreamingResult> {
         self.side.alive().await;
+        // A zombie's start, or a start in a sandbox a zombie changed, is
+        // the zombie's doing: counted, not a violation.
+        let excused = {
+            let state = self.side.world.lock();
+            state.lifetime > self.side.lifetime || state.zombie_touched.contains(&self.id)
+        };
         if !self.running() {
-            self.side.world.violation(format!(
-                "a process started in {}, which is not running",
-                self.id
-            ));
+            if !excused {
+                self.side.world.violation(format!(
+                    "a process started in {}, which is not running",
+                    self.id
+                ));
+            }
             return Err(Error::Provider(ProviderError::new(
                 self.side.kind.clone(),
                 format!("{} is not running", self.id),
             )));
         }
         if let Some(Some(view)) = self.side.view(self.lease().as_deref()).await
+            && !excused
             && (view.state != LeaseState::Live
                 || view.resource_id.as_deref() != Some(self.id.as_str()))
         {
@@ -740,6 +766,7 @@ impl Exec for WorldExec {
                 generation: self.incarnation,
                 execution,
                 current: true,
+                lifetime: Some(self.side.lifetime),
             },
             |key| spec.env.get(key).cloned(),
         );

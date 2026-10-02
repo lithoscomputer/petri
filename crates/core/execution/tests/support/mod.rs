@@ -13,7 +13,7 @@
 use std::collections::BTreeMap;
 use std::future::Future;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex, PoisonError};
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::Duration;
 use std::{fmt, fs};
 
@@ -340,10 +340,12 @@ pub(crate) type HookCall = (&'static str, u64, Option<u64>);
 
 /// The host's run-level hooks: `run_finished` and `scope_released` each
 /// return one note naming its execution (and scope), and every call is
-/// counted, across lifetimes.
+/// counted, across lifetimes. A call from a lifetime whose successor took
+/// the run is a zombie's, kept apart: its note can never be recorded.
 #[derive(Default)]
 pub(crate) struct SimHooks {
-    calls: Mutex<Vec<HookCall>>,
+    calls:   Mutex<Vec<HookCall>>,
+    zombies: Mutex<Vec<HookCall>>,
 }
 
 impl SimHooks {
@@ -354,8 +356,30 @@ impl SimHooks {
             .clone()
     }
 
-    fn note(&self, call: HookCall) -> Vec<Note> {
-        self.calls
+    /// The calls zombies made after their successor took the run.
+    pub(crate) fn zombie_calls(&self) -> Vec<HookCall> {
+        self.zombies
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone()
+    }
+
+    /// The hooks one lifetime's runtime installs.
+    pub(crate) fn for_lifetime(
+        self: &Arc<Self>,
+        world: Arc<World>,
+        lifetime: u32,
+    ) -> Arc<dyn ExecutionHooks> {
+        Arc::new(LifetimeHooks {
+            hooks: Arc::clone(self),
+            world,
+            lifetime,
+        })
+    }
+
+    fn note(&self, call: HookCall, zombie: bool) -> Vec<Note> {
+        let calls = if zombie { &self.zombies } else { &self.calls };
+        calls
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .push(call);
@@ -367,8 +391,23 @@ impl SimHooks {
     }
 }
 
+/// One lifetime's view of the hooks: it knows when its successor took the
+/// run.
+struct LifetimeHooks {
+    hooks:    Arc<SimHooks>,
+    world:    Arc<World>,
+    lifetime: u32,
+}
+
+impl LifetimeHooks {
+    fn note(&self, call: HookCall) -> Vec<Note> {
+        let zombie = self.world.lifetime() > self.lifetime;
+        self.hooks.note(call, zombie)
+    }
+}
+
 #[async_trait::async_trait]
-impl ExecutionHooks for SimHooks {
+impl ExecutionHooks for LifetimeHooks {
     async fn run_finished(&self, context: &HookContext, _finished: RunFinished) -> Vec<Note> {
         self.note(("sim.run", context.execution.raw(), None))
     }
@@ -433,31 +472,136 @@ struct Armed {
     crash: Arc<Notify>,
 }
 
+/// The log kind a store fault lands on.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum FaultLog {
+    /// A coordinator record after the run's creation (`run.started` and
+    /// `graph.registered` are not counted).
+    Coordinator,
+    Resources,
+    /// Any execution's engine log.
+    Execution,
+}
+
+/// A store fault for one lifetime: the `nth` append to a log of `log`'s
+/// kind, counting from 0, fails before its records are stored or, for a
+/// lost reply, after. A store that goes `down` fails every later write of
+/// the lifetime too.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct StoreFault {
+    pub log:        FaultLog,
+    pub nth:        usize,
+    pub lost_reply: bool,
+    pub down:       bool,
+}
+
+/// What one lifetime's store handles watch for.
+#[derive(Default)]
+struct Plan {
+    crash: Option<Armed>,
+    fault: Option<StoreFault>,
+    seen:  usize,
+    fired: bool,
+}
+
+/// Where a fault lands on one append.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Landing {
+    Before,
+    After,
+}
+
+impl Plan {
+    /// Count an append for the fault, and say where the fault lands on it.
+    fn landing(&mut self, log: &LogId, records: &[Record]) -> Option<Landing> {
+        let fault = self.fault?;
+        if self.fired {
+            return fault.down.then_some(Landing::Before);
+        }
+        let counted = match (fault.log, log) {
+            (FaultLog::Coordinator, LogId::Coordinator) => records.iter().any(|record| {
+                !matches!(
+                    record.record["body"]["event"].as_str(),
+                    Some("run.started" | "graph.registered")
+                )
+            }),
+            (FaultLog::Resources, LogId::Resources)
+            | (FaultLog::Execution, LogId::Execution(_)) => true,
+            _ => false,
+        };
+        if !counted {
+            return None;
+        }
+        self.seen += 1;
+        if self.seen - 1 != fault.nth {
+            return None;
+        }
+        self.fired = true;
+        Some(if fault.lost_reply {
+            Landing::After
+        } else {
+            Landing::Before
+        })
+    }
+}
+
 /// The in-memory store as the runs open it, watched: a lifetime can crash
-/// right after a resource record of a chosen kind is durable.
+/// right after a resource record of a chosen kind is durable, and a planned
+/// store fault can fail one of its appends. Each handle keeps the plan of
+/// the lifetime that opened it, so a lifetime still running after its
+/// successor took the run does not share the successor's.
 pub(crate) struct WatchedStore {
-    inner: Arc<MemoryRunStore>,
-    armed: Arc<Mutex<Option<Armed>>>,
+    inner:   Arc<MemoryRunStore>,
+    plan:    Mutex<Arc<Mutex<Plan>>>,
+    /// Each append waits up to this long, from these draws.
+    latency: Arc<Mutex<Option<(Dice, u64)>>>,
 }
 
 impl WatchedStore {
     fn new(inner: Arc<MemoryRunStore>) -> Self {
         Self {
             inner,
-            armed: Arc::new(Mutex::new(None)),
+            plan: Mutex::new(Arc::new(Mutex::new(Plan::default()))),
+            latency: Arc::new(Mutex::new(None)),
         }
     }
 
-    /// Crash the next lifetime right after the `nth` record of `kind`, by
-    /// notifying `crash`; or never, for `None`.
-    pub(crate) fn arm(&self, trigger: Option<(&'static str, usize)>, crash: Arc<Notify>) {
-        *self.armed.lock().unwrap_or_else(PoisonError::into_inner) =
-            trigger.map(|(kind, nth)| Armed {
+    /// Make every append wait up to `most` milliseconds, as a store under
+    /// load does.
+    pub(crate) fn slow(&self, seed: u64, most: u64) {
+        *self.latency.lock().unwrap_or_else(PoisonError::into_inner) =
+            Some((Dice(seed ^ 0x5_10E5), most));
+    }
+
+    /// The next lifetime's plan: crash it right after the `nth` record of a
+    /// kind, by notifying `crash`, or never, for `None`; and fail one of its
+    /// appends as `fault` says.
+    pub(crate) fn arm(
+        &self,
+        trigger: Option<(&'static str, usize)>,
+        crash: Arc<Notify>,
+        fault: Option<StoreFault>,
+    ) {
+        *self.plan.lock().unwrap_or_else(PoisonError::into_inner) = Arc::new(Mutex::new(Plan {
+            crash: trigger.map(|(kind, nth)| Armed {
                 kind,
                 nth,
                 seen: 0,
                 crash,
-            });
+            }),
+            fault,
+            ..Plan::default()
+        }));
+    }
+
+    /// Whether the current lifetime's store fault has landed.
+    pub(crate) fn fault_fired(&self) -> bool {
+        self.plan
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .fired
     }
 }
 
@@ -465,16 +609,29 @@ impl WatchedStore {
 impl store::RunStore for WatchedStore {
     async fn open(&self, key: &RunKey, access: Access) -> Result<Arc<dyn RunLogs>, StoreError> {
         let inner = self.inner.open(key, access).await?;
+        let plan = Arc::clone(&self.plan.lock().unwrap_or_else(PoisonError::into_inner));
         Ok(Arc::new(WatchedLogs {
             inner,
-            armed: Arc::clone(&self.armed),
+            plan,
+            latency: Arc::clone(&self.latency),
         }))
     }
 }
 
 struct WatchedLogs {
-    inner: Arc<dyn RunLogs>,
-    armed: Arc<Mutex<Option<Armed>>>,
+    inner:   Arc<dyn RunLogs>,
+    plan:    Arc<Mutex<Plan>>,
+    latency: Arc<Mutex<Option<(Dice, u64)>>>,
+}
+
+impl WatchedLogs {
+    fn plan(&self) -> MutexGuard<'_, Plan> {
+        self.plan.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    fn failure(&self, action: &'static str) -> StoreError {
+        StoreError::backend(self.inner.locator(), action, "simulated store failure")
+    }
 }
 
 #[async_trait::async_trait]
@@ -484,10 +641,23 @@ impl RunLogs for WatchedLogs {
     }
 
     async fn append(&self, log: &LogId, records: &[Record]) -> Result<(), StoreError> {
+        let delay = self
+            .latency
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .as_mut()
+            .map(|(dice, most)| dice.roll(*most + 1));
+        if let Some(delay) = delay {
+            time::sleep(Duration::from_millis(delay)).await;
+        }
+        let landing = self.plan().landing(log, records);
+        if landing == Some(Landing::Before) {
+            return Err(self.failure("append"));
+        }
         self.inner.append(log, records).await?;
         if *log == LogId::Resources {
-            let mut armed = self.armed.lock().unwrap_or_else(PoisonError::into_inner);
-            if let Some(armed) = armed.as_mut() {
+            let mut plan = self.plan();
+            if let Some(armed) = plan.crash.as_mut() {
                 for record in records {
                     let Ok(line) = record.decode::<ResourceLogRecord>() else {
                         continue;
@@ -502,6 +672,9 @@ impl RunLogs for WatchedLogs {
                 }
             }
         }
+        if landing == Some(Landing::After) {
+            return Err(self.failure("append"));
+        }
         Ok(())
     }
 
@@ -514,6 +687,13 @@ impl RunLogs for WatchedLogs {
     }
 
     async fn put_blob(&self, bytes: &[u8]) -> Result<Digest, StoreError> {
+        let down = {
+            let plan = self.plan();
+            plan.fired && plan.fault.is_some_and(|fault| fault.down)
+        };
+        if down {
+            return Err(self.failure("put blob"));
+        }
         self.inner.put_blob(bytes).await
     }
 

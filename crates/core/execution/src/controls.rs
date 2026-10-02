@@ -334,16 +334,17 @@ impl ControlService {
 
     /// Hand the service the run's handle. A pause taken before this point is
     /// recorded now; a redundant record (the run resumed paused) is skipped
-    /// by the coordinator.
+    /// by the coordinator. The request is queued before this returns, so an
+    /// unpause asked for next is recorded after it.
     pub fn wire(&self, handle: CoordinatorHandle) {
+        if self.is_paused() {
+            handle.request_paused(true);
+        }
         *self
             .inner
             .handle
             .lock()
-            .unwrap_or_else(PoisonError::into_inner) = Some(handle.clone());
-        if self.is_paused() {
-            tokio::spawn(async move { handle.set_paused(true).await });
-        }
+            .unwrap_or_else(PoisonError::into_inner) = Some(handle);
     }
 
     fn handle(&self) -> Result<CoordinatorHandle, ControlError> {
@@ -374,7 +375,7 @@ impl ControlService {
         }
         tracing::info!("run paused: new attempts are held at admission");
         if let Ok(handle) = self.handle() {
-            tokio::spawn(async move { handle.set_paused(true).await });
+            handle.request_paused(true);
         }
     }
 

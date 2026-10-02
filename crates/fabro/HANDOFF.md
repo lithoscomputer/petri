@@ -337,11 +337,20 @@ against.
    in `RunOptions::run_key`, or the run directory) and reacquires held
    sandboxes, reconciling every lease with the provider by label before any
    create; Fabro restores what it owns (a Git-backed workspace, pending
-   questions in its UI) from the identities above, then resumes. Known limits: a retained
+   questions in its UI) from the identities above, then resumes. A run whose
+   creation a crash cut short (stored, with no root invocation declared) is
+   refused as `HostError::NotStarted`; start it again with
+   `host::run_configured` under the same key, which finishes the creation.
+   Fabro's liveness signal must end a run's store lease only when the
+   worker that holds it is gone: a live worker whose lease was released
+   keeps acting (processes, hooks, provider calls it began) until its next
+   write fails, beside the new owner.
+   Known limits: a retained
    thread is not durable across resume (the node starts a fresh session with
-   Fabro's discarded-session rule), a pause does not survive resume (a
-   resumed run starts unpaused), a model request in flight at the crash may
-   be sent again, and an external effect is at least once.
+   Fabro's discarded-session rule), a model request in flight at the crash
+   may be sent again, and an external effect is at least once. A pause
+   survives resume: a run whose last recorded control was a pause resumes
+   held at admission until an unpause.
 5. **Choose compatible runners.** Pin the Petri runner per run; check
    `EVENT_CONTRACT_VERSION`, `INSPECT_FORMAT_VERSION` and the store versions
    before resuming; keep an old runner for old runs as long as Fabro's

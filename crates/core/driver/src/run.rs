@@ -306,6 +306,11 @@ pub struct ExecutionReport {
     /// What each failing observer's `finish` reported. Never changes `status`:
     /// a host with fatal-sink semantics watches its own observer and cancels.
     pub observer_errors: Vec<ObserveError>,
+    /// The run's store failed a write, and the driver stopped there
+    /// without recording anything more: no firing failed for it and no
+    /// hook ran after it. The exit and state are not an end; the host
+    /// resumes the run from what the store holds.
+    pub store_failure:   Option<String>,
 }
 
 /// Why a step was told to stop. The distinction cannot be made by the step —
@@ -441,6 +446,12 @@ enum Signal {
         acquisition: Acquisition,
         result:      Result<AcquiredScope, AcquireFailure>,
     },
+    /// A scope's `scope.acquired` record is in the run log, or the run log
+    /// failed to store it.
+    ScopeStored {
+        scope:  ScopeId,
+        result: Result<(), ObserveError>,
+    },
     /// The host's `before_attempt` answered; the resolver runs next when it
     /// admitted.
     HookAdmitted {
@@ -483,13 +494,16 @@ struct Acquisition {
 struct AcquireFailure {
     message: String,
     causes:  Vec<String>,
+    /// The run's store failed, not the environment ([`EnvError::Store`]).
+    store:   bool,
 }
 
 impl AcquireFailure {
-    fn of(error: &dyn Error) -> Self {
+    fn of(error: &EnvError) -> Self {
         Self {
             message: error.to_string(),
             causes:  chain_causes(error),
+            store:   matches!(error, EnvError::Store { .. }),
         }
     }
 
@@ -690,6 +704,17 @@ pub struct Driver {
     pending_forwards: BTreeMap<FiringId, Vec<Forward>>,
     pending_failures: BTreeMap<FiringId, (Attempt, String)>,
     scope_failed:     BTreeSet<ScopeId>,
+    /// The observer that stores the run's own record, when a host names it.
+    run_log:          Option<Arc<dyn EventObserver>>,
+    /// Scopes whose `scope.acquired` the run log does not yet hold, with
+    /// its seq: no attempt starts in one until it does.
+    storing:          BTreeMap<ScopeId, u64>,
+    /// Scopes released while storing: the release, and its
+    /// `scope_released` point, wait until the run log holds the
+    /// acquisition.
+    release_on_store: BTreeSet<ScopeId>,
+    /// The run's store failed: the driver stopped recording at that point.
+    store_failure:    Option<String>,
     tasks:            BTreeMap<FiringId, Task>,
     caps:             Capabilities,
     observers:        Vec<Arc<dyn EventObserver>>,
@@ -922,6 +947,10 @@ impl Driver {
             pending_forwards: BTreeMap::new(),
             pending_failures: BTreeMap::new(),
             scope_failed: BTreeSet::new(),
+            run_log: None,
+            storing: BTreeMap::new(),
+            release_on_store: BTreeSet::new(),
+            store_failure: None,
             tasks: BTreeMap::new(),
             caps: Capabilities::default(),
             observers: Vec::new(),
@@ -949,6 +978,19 @@ impl Driver {
     /// the post-apply state, and its `finish` is awaited before the report.
     #[must_use]
     pub fn observe(mut self, observer: Arc<dyn EventObserver>) -> Self {
+        self.observers.push(observer);
+        self
+    }
+
+    /// Register the observer that stores the run's own record, the log a
+    /// resume reads: an observer like any other, and also the one no
+    /// attempt in a scope starts ahead of, and no release of the scope. It
+    /// must hold the scope's `scope.acquired` first, so a `scope_released`
+    /// point is always found again on resume. A failed store ends the run
+    /// with [`ExecutionReport::store_failure`].
+    #[must_use]
+    pub fn observe_run_log(mut self, observer: Arc<dyn EventObserver>) -> Self {
+        self.run_log = Some(Arc::clone(&observer));
         self.observers.push(observer);
         self
     }
@@ -1089,7 +1131,7 @@ impl Driver {
             }
         }
 
-        while !self.engine.is_finished() {
+        while !self.engine.is_finished() && self.store_failure.is_none() {
             // In a fixed order, so a run replays under a simulated clock: the
             // two bounded sources first, which cannot starve the signals, then
             // the signals.
@@ -1135,6 +1177,7 @@ impl Driver {
         let mut run_notes = self.report_run_finished().await;
         let _ = self.end_gate.send_replace(true);
         run_notes.extend(self.report_replayed_releases().await);
+        self.release_stored_scopes().await;
 
         // Release is best effort and never fails the run, but the run should not
         // report back before the environments are actually gone.
@@ -1217,6 +1260,7 @@ impl Driver {
             releases,
             run_notes,
             observer_errors,
+            store_failure: self.store_failure.take(),
         }
     }
 
@@ -1337,6 +1381,22 @@ impl Driver {
             } => {
                 self.on_acquire_finished(scope, id, acquisition, result);
             }
+            Signal::ScopeStored { scope, result } => match result {
+                Ok(()) => {
+                    if self.storing.remove(&scope).is_some() {
+                        if self.release_on_store.remove(&scope) {
+                            if let Some(handle) = self.envs.remove(&scope) {
+                                self.release_handle(scope, handle);
+                            }
+                        } else {
+                            for resolved in self.pending_starts.remove(&scope).unwrap_or_default() {
+                                self.dispatch_start(&resolved);
+                            }
+                        }
+                    }
+                }
+                Err(error) => self.stop_for_store(error.to_string()),
+            },
             Signal::HookAdmitted {
                 decision_id,
                 decision,
@@ -1917,7 +1977,7 @@ impl Driver {
             Command::ReleaseScope { scope } => self.release(scope),
             Command::StartStep(resolved) => {
                 let scope = resolved.scope();
-                if self.acquires.contains_key(&scope) {
+                if self.acquires.contains_key(&scope) || self.storing.contains_key(&scope) {
                     self.pending_starts.entry(scope).or_default().push(resolved);
                     return;
                 }
@@ -2275,6 +2335,8 @@ impl Driver {
         match result {
             Ok(acquired) => {
                 let handle = acquired.into_handle();
+                // The External record `feed` appends takes the next seq.
+                let seq = self.engine.log.len() as u64;
                 self.feed(Event::ScopeAcquired {
                     scope,
                     lease,
@@ -2283,6 +2345,18 @@ impl Driver {
                     duration_ms,
                 });
                 self.envs.insert(scope, handle);
+                // No attempt starts in the scope before the run log holds its
+                // acquisition: a `scope_released` point that runs later then
+                // always finds it when the run resumes.
+                if let Some(run_log) = self.run_log.clone() {
+                    self.storing.insert(scope, seq);
+                    self.await_stored(run_log, scope, seq);
+                    return;
+                }
+            }
+            Err(failure) if failure.store => {
+                self.stop_for_store(failure.rendered());
+                return;
             }
             Err(failure) => {
                 // Not a run abort: every firing in this scope fails, routably.
@@ -2304,12 +2378,61 @@ impl Driver {
         }
     }
 
+    /// Answer [`Signal::ScopeStored`] once the run log holds the record at
+    /// `seq`. The wait runs off the driver task, as an acknowledged progress
+    /// send's does.
+    fn await_stored(&mut self, run_log: Arc<dyn EventObserver>, scope: ScopeId, seq: u64) {
+        let tx = self.tx.clone();
+        self.background.spawn(async move {
+            let result = run_log.durable(seq).await;
+            let _ = tx.send(Signal::ScopeStored { scope, result }).await;
+        });
+    }
+
+    /// The run's store failed: stop here, recording nothing more. No firing
+    /// fails for it and no hook runs after it; the report carries the
+    /// failure, and the host resumes the run from what the store holds.
+    fn stop_for_store(&mut self, message: String) {
+        tracing::warn!(message, "the run's store failed; the driver stops");
+        self.hooks = None;
+        self.store_failure.get_or_insert(message);
+    }
+
     fn release(&mut self, scope: ScopeId) {
         if let Some(acquire) = self.acquires.remove(&scope) {
             acquire.join.abort();
         }
+        // Released before the run log holds its acquisition: the release,
+        // and its `scope_released` point, wait for the store, so the point
+        // runs only for a scope a resume can find.
+        if self.storing.contains_key(&scope) {
+            self.release_on_store.insert(scope);
+            return;
+        }
         if let Some(handle) = self.envs.remove(&scope) {
             self.release_handle(scope, handle);
+        }
+    }
+
+    /// At the run's end, the scopes released while storing: each is
+    /// released, its point first, once the run log answers; a run log that
+    /// failed stops the driver, and no point runs.
+    async fn release_stored_scopes(&mut self) {
+        let Some(run_log) = self.run_log.clone() else {
+            return;
+        };
+        for (scope, seq) in mem::take(&mut self.storing) {
+            if !self.release_on_store.remove(&scope) {
+                continue;
+            }
+            match run_log.durable(seq).await {
+                Ok(()) => {
+                    if let Some(handle) = self.envs.remove(&scope) {
+                        self.release_handle(scope, handle);
+                    }
+                }
+                Err(error) => self.stop_for_store(error.to_string()),
+            }
         }
     }
 

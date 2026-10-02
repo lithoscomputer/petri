@@ -116,9 +116,11 @@ layer. Each seed builds a root graph and child graphs with invoke steps
 (single calls and forks, their own sandbox or the caller's, some through a
 fork gate) and restart arms, sometimes turns on the circuit breaker or a low
 invocation limit, plans host cancels and up to three crashes (at a time,
-right after a chosen coordinator or resource record, or at a sandbox
-provider call), and runs the coordinator through the host wrappers over one
-in-memory store, resuming after each crash. The runtime's own lease router
+right after a chosen coordinator or resource record, at a sandbox provider
+call, or at a store fault: a failed append, a lost reply, a store that stays
+down), and runs the coordinator through the host wrappers over one
+in-memory store, resuming after each crash. Some crashes leave a zombie
+that runs on beside its successor after the store released its lease. The runtime's own lease router
 reaches the world as a Docker-kind provider (`testkit::sim::WorldFactory`),
 so lease records, reconcile, fencing, retention and release all run, and the
 world checks each provider call against the lease's recorded intent. The host

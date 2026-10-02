@@ -866,6 +866,60 @@ struct ResumeObservation {
     paused:   bool,
 }
 
+/// Every pause and unpause the coordinator records, in order.
+#[derive(Default)]
+struct PauseRecords(Mutex<Vec<bool>>);
+
+impl ExecutionObserver for PauseRecords {
+    fn on_engine_record(&self, _: ExecutionId, _: &EventRecord, _: u64, _: &EngineState) {}
+
+    fn on_lifecycle(&self, record: &CoordinatorRecord) {
+        let paused = match record.body {
+            CoordinatorEvent::RunPaused => true,
+            CoordinatorEvent::RunUnpaused => false,
+            _ => return,
+        };
+        self.0.lock().expect("not poisoned").push(paused);
+    }
+}
+
+/// A pause and an unpause asked for back to back are recorded in that
+/// order, so the run's record ends unpaused, as its gate does.
+#[tokio::test]
+async fn a_pause_and_an_immediate_unpause_are_recorded_in_order() {
+    const SLOW: &str = r#"digraph G {
+        start [shape=Mdiamond]
+        exit [shape=Msquare]
+        a [shape=parallelogram, script="sleep 0.5"]
+        start -> a -> exit
+    }"#;
+    let dir = RunDir::new("controls-pause-order");
+    let controls = ControlService::new();
+    let rt = runtime(&dir).hooks(controls.hooks(None));
+    let records = Arc::new(PauseRecords::default());
+    let host_run = HostRun::new(lower(&rt, &dir, SLOW).graph.expect("lowers"))
+        .observe(Arc::new(controls.clone()))
+        .observe(records.clone());
+    let service = controls.clone();
+    let report = host::run_configured(&rt, host_run, |handle, _| {
+        service.wire(handle);
+        let service = service.clone();
+        tokio::spawn(async move {
+            service.pause();
+            service.unpause().await;
+        });
+    })
+    .await
+    .expect("the run completes");
+    assert_eq!(report.status, RunStatus::Success);
+    assert!(!controls.is_paused());
+    assert_eq!(
+        *records.0.lock().expect("not poisoned"),
+        [true, false],
+        "the pause, then the unpause"
+    );
+}
+
 /// A pause survives the crash: the resumed run admits nothing until an
 /// unpause arrives through the new control service, then finishes.
 #[tokio::test]

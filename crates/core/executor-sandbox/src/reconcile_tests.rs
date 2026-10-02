@@ -582,6 +582,48 @@ async fn a_kept_release_of_a_lost_sandbox_tombstones_its_lease() {
     assert!(again.is_clean(), "a tombstone needs no release: {again:?}");
 }
 
+/// A sandbox whose create never reached its record: the release finds it by
+/// its label, and a lease that keeps it names it, so prune and the next
+/// release find it by the record.
+#[tokio::test]
+async fn a_kept_release_names_a_sandbox_its_create_never_recorded() {
+    let dir = RunDir::new("reconcile-unnamed-kept");
+    let provider = ScriptedProvider::new();
+    let created: Arc<MemoryLedger> = Arc::new(MemoryLedger::default());
+    let manager = build_manager(&dir, &provider, created.clone());
+    let id = acquire(&manager).await.expect("creates");
+    manager.release_holder(LEASE).await;
+    drop(manager);
+    let allocated = created
+        .lookup(LEASE)
+        .await
+        .expect("the ledger reads")
+        .expect("the lease is recorded");
+
+    // The resumed run's ledger: the allocation, and no sandbox named.
+    let ledger: Arc<MemoryLedger> = Arc::new(MemoryLedger::default());
+    ledger
+        .allocating(
+            LEASE,
+            allocated.provider.as_deref().expect("a provider"),
+            allocated.fingerprint.as_deref().expect("a fingerprint"),
+        )
+        .await
+        .expect("records the allocation");
+    let manager = build_manager(&dir, &provider, ledger.clone());
+    let report = manager
+        .release_lease(LEASE, Retention::Always, ScopeOutcome::Failed)
+        .await;
+    assert!(report.is_clean(), "{report:?}");
+    let record = ledger
+        .lookup(LEASE)
+        .await
+        .expect("the ledger reads")
+        .expect("the lease is recorded");
+    assert_eq!(record.state, LeaseState::Stopped);
+    assert_eq!(record.resource_id.as_deref(), Some(id.as_str()));
+}
+
 /// A recorded sandbox that is gone from the provider fails the acquire by
 /// default; under `LostSandbox::Replace` a fresh one is created under the
 /// lease and recorded live in its place.

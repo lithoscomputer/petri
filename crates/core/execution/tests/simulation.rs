@@ -8,8 +8,19 @@
 //! retention says, and refuses or replaces a sandbox lost from outside. It
 //! plans the host's cancels (the root, a second root cancel that kills, a
 //! child invocation) and up to three crashes: at a virtual time, right
-//! after a chosen coordinator record or resource record, or at a provider
-//! call, before its effect or after it. Then it runs the real coordinator
+//! after a chosen coordinator record or resource record, at a provider
+//! call, before its effect or after it, or at a store fault: one append to
+//! the coordinator, resource or an engine log fails, before its records are
+//! stored or after (a lost reply), and sometimes the store stays down for
+//! the rest of the lifetime. A store fault ends the lifetime with the run's
+//! error, and the host resumes; a run whose creation it cut short is started
+//! again under its key. Some crashes leave a zombie: the store releases the
+//! lifetime's lease, as an operator or a liveness check would, the next
+//! lifetime takes the run, and the zombie runs on for a while beside it. Its
+//! writes are refused; what it does without a write (processes, hooks,
+//! provider calls it began) is the documented hazard of releasing a live
+//! owner's lease, counted rather than flagged. Then it runs the real
+//! coordinator
 //! through the host wrappers on a single-threaded runtime whose clock
 //! starts paused, with the runtime's own lease router in front of the
 //! world's sandbox provider. A crash drops the host future: the
@@ -20,7 +31,8 @@
 //! its router reconciles, fences and releases what the last one left. The
 //! oracles:
 //!
-//! - the run ends, well within a bound, with a result, not an error;
+//! - the run ends, well within a bound, with a result, not an error (a store
+//!   fault's error ends only its lifetime);
 //! - the coordinator log replays, and `run.finished` appears once, with the
 //!   root result's status;
 //! - every declared execution finishes, its engine log replays byte for byte,
@@ -44,7 +56,10 @@
 //! - the world's rules hold: no process outlives the run, none runs beside an
 //!   unfenced one a dead lifetime left, and no attempt runs twice in a
 //!   lifetime, again after it finished, or while it was stopping;
-//! - observers see each lifetime's coordinator records in order, without gaps.
+//! - observers see each lifetime's coordinator records in order, without gaps;
+//! - the store keeps its contract: every log reads back gapless, and no
+//!   coordinator record comes from two lifetimes (a zombie's writes are
+//!   refused).
 //!
 //! `PETRI_DST_SEEDS` sets how many seeds run (64 by default), and a tenth as
 //! many, at least 128, run twice to compare their logs; `PETRI_DST_SEED`
@@ -70,9 +85,9 @@ use execution::controls::ControlService;
 use execution::host::{self, HostError, HostRun};
 use execution::watchdog::{StallWatchdog, WatchdogTask};
 use execution::{
-    CoordinatorEvent, CoordinatorHandle, CoordinatorRecord, CoordinatorState, ExecutionId,
-    ExecutionObserver, GraphDigest, InterviewDispatcher, InterviewReceipt, InvocationId,
-    LeaseState, LogId, ResourceLogRecord, RunStore as _, SandboxResourceRecord,
+    CoordinatorEvent, CoordinatorHandle, CoordinatorRecord, CoordinatorState, Delivery,
+    ExecutionId, ExecutionObserver, GraphDigest, InterviewDispatcher, InterviewReceipt,
+    InvocationId, LeaseState, LogId, ResourceLogRecord, RunStore as _, SandboxResourceRecord,
     read_coordinator_log, read_execution_log,
 };
 use executor::Retention;
@@ -86,8 +101,8 @@ use smol_str::SmolStr;
 use steps::{Answer, Question, QuestionExpired};
 use store::Access;
 use support::{
-    Call, INVOKE, Leases, SIMULATED_EPOCH_MS, SimHost, SimInterviewer, digest_of, received,
-    run_key, run_paused,
+    Call, FaultLog, INVOKE, Leases, SIMULATED_EPOCH_MS, SimHost, SimInterviewer, StoreFault,
+    digest_of, received, run_key, run_paused,
 };
 use testkit::sim::{self, CallCrash, Dice, Faults, Moment, SANDBOXED, SandboxState, WorldSandbox};
 use tokio::sync::Notify;
@@ -417,6 +432,9 @@ enum Crash {
     /// Right after the `nth` resource record of this kind the lifetime
     /// appends.
     Resource { kind: &'static str, nth: usize },
+    /// A store fault: one append fails, and the host resumes when the run
+    /// ends with the error.
+    Store(StoreFault),
 }
 
 fn pick<T: Copy>(dice: &mut Dice, choices: &[T]) -> T {
@@ -428,7 +446,7 @@ fn crashes(dice: &mut Dice) -> Vec<Crash> {
     (0..count)
         .map(|_| {
             let nth = usize::try_from(dice.roll(3)).expect("small");
-            match dice.roll(10) {
+            match dice.roll(12) {
                 0..=2 => Crash::At(Duration::from_millis(dice.roll(200))),
                 3..=5 => Crash::After {
                     kind: pick(dice, &RECORD_KINDS),
@@ -443,13 +461,29 @@ fn crashes(dice: &mut Dice) -> Vec<Crash> {
                         Moment::After
                     },
                 }),
-                _ => Crash::Resource {
+                8 | 9 => Crash::Resource {
                     kind: pick(dice, &RESOURCE_KINDS),
                     nth,
                 },
+                _ => Crash::Store(store_fault(dice)),
             }
         })
         .collect()
+}
+
+/// A store fault: one append of a log's kind fails, before its records are
+/// stored or after (a lost reply), and sometimes the store stays down.
+fn store_fault(dice: &mut Dice) -> StoreFault {
+    StoreFault {
+        log:        pick(dice, &[
+            FaultLog::Coordinator,
+            FaultLog::Resources,
+            FaultLog::Execution,
+        ]),
+        nth:        usize::try_from(dice.roll(4)).expect("small"),
+        lost_reply: dice.chance(50),
+        down:       dice.chance(30),
+    }
 }
 
 /// How the seed's run keeps its sandboxes, and how often someone outside
@@ -731,6 +765,49 @@ struct Outcome {
 
 type HostRunFuture<'a> = Pin<Box<dyn Future<Output = Result<ExecutionReport, HostError>> + 'a>>;
 
+/// A lifetime its successor took the run from, still running: its run, when
+/// it is finally gone, and its watchdog.
+struct Zombie<'a> {
+    run:      HostRunFuture<'a>,
+    until:    Instant,
+    lifetime: u32,
+    watchdog: Option<WatchdogTask>,
+}
+
+/// Resolve when the zombie's run ends by itself or its time is up; never
+/// without one.
+async fn lingering(zombie: &mut Option<Zombie<'_>>) {
+    match zombie {
+        Some(zombie) => {
+            tokio::select! {
+                biased;
+                _ = &mut zombie.run => {}
+                () = time::sleep_until(zombie.until) => {}
+            }
+        }
+        None => future::pending().await,
+    }
+}
+
+/// The zombie is finally gone: its calls never return from here on.
+fn lay_to_rest(sim: &SimHost, zombie: Zombie<'_>, stats: &mut BTreeMap<&'static str, u64>) {
+    let Zombie {
+        run,
+        until,
+        lifetime,
+        watchdog,
+    } = zombie;
+    sim.world.lay(lifetime);
+    if Instant::now() < until {
+        *stats
+            .entry("zombies that stopped by themselves")
+            .or_default() += 1;
+    }
+    trace(|| format!("lifetime {lifetime} laid to rest"));
+    drop(watchdog);
+    drop(run);
+}
+
 /// What the store holds at a crash, for the next lifetime.
 #[derive(Default)]
 struct Progress {
@@ -752,6 +829,10 @@ async fn stored_progress(sim: &SimHost, workload: &Workload) -> Option<Progress>
     let records = read_coordinator_log(&*logs)
         .await
         .expect("the coordinator log decodes");
+    // A crash before `run.started` was stored leaves nothing to resume from.
+    if records.is_empty() {
+        return None;
+    }
     let state = CoordinatorState::replay(&records).expect("the stored log replays");
     let mut finished = BTreeSet::new();
     let mut stopping = BTreeSet::new();
@@ -802,11 +883,27 @@ fn simulate_world(seed: u64) -> Outcome {
             nth:  0,
         });
     }
+    // A store fault is worth planning first: the first lifetime reaches it.
+    if dice.chance(25) {
+        crashes.insert(0, Crash::Store(store_fault(&mut dice)));
+    }
+    // Some stores are slow: each append waits up to this long, so records
+    // queue behind the writer.
+    let slow = dice.chance(30).then(|| 1 + dice.roll(20));
+    // Some crashes leave a zombie: the lifetime runs on for a while after
+    // its successor took the run.
+    let lingers: Vec<Option<Duration>> = crashes
+        .iter()
+        .map(|crash| {
+            (!matches!(crash, Crash::Store(_)) && dice.chance(30))
+                .then(|| Duration::from_millis(5 + dice.roll(96)))
+        })
+        .collect();
     let (leases, lose) = leases(&mut dice);
     trace(|| {
         format!(
             "seed {seed}: {} graphs, breaker {:?}, limit {:?}, stops {stops:?}, crashes \
-             {crashes:?}, leases {leases:?}, lose {lose}%",
+             {crashes:?}, lingers {lingers:?}, slow {slow:?}, leases {leases:?}, lose {lose}%",
             workload.graphs.len(),
             workload.breaker,
             workload.max_calls
@@ -815,6 +912,9 @@ fn simulate_world(seed: u64) -> Outcome {
     run_paused(async move {
         let mut sim = SimHost::new("execution-simulation", seed, FAULTS);
         sim.leases = leases;
+        if let Some(most) = slow {
+            sim.watched.slow(seed, most);
+        }
         let epoch = sim.epoch;
         let current = Arc::new(Mutex::new(None));
         let controls_now = Arc::new(Mutex::new(None));
@@ -827,8 +927,12 @@ fn simulate_world(seed: u64) -> Outcome {
         let seen = Arc::new(Mutex::new(Vec::new()));
         let shared = Arc::new(Mutex::new(Shared::default()));
         let mut stats: BTreeMap<&'static str, u64> = BTreeMap::new();
+        if slow.is_some() {
+            *stats.entry("slow stores").or_default() += 1;
+        }
         let mut violations = Vec::new();
-        let mut plan = crashes.iter().copied();
+        let mut plan = crashes.iter().copied().zip(lingers.iter().copied());
+        let mut zombie: Option<Zombie<'_>> = None;
         let mut lifetime = 0_u32;
         let mut stored_at_start = BTreeMap::new();
         let mut started_at = BTreeMap::new();
@@ -836,7 +940,9 @@ fn simulate_world(seed: u64) -> Outcome {
         // outcome, continued by the next lifetime.
         let receipt: Arc<Mutex<Option<InterviewReceipt>>> = Arc::new(Mutex::new(None));
         let result = loop {
-            let crash = plan.next();
+            let planned = plan.next();
+            let crash = planned.map(|(crash, _)| crash);
+            let linger = planned.and_then(|(_, linger)| linger);
             let notify = Arc::new(Notify::new());
             let watch = Arc::new(Watch {
                 lifetime,
@@ -859,6 +965,10 @@ fn simulate_world(seed: u64) -> Outcome {
                     _ => None,
                 },
                 Arc::clone(&notify),
+                match crash {
+                    Some(Crash::Store(fault)) => Some(fault),
+                    _ => None,
+                },
             );
             // The host services a CLI process installs, one set per
             // lifetime.
@@ -884,9 +994,9 @@ fn simulate_world(seed: u64) -> Outcome {
                     }
                 }));
             }
-            let runtime = sim
-                .runtime()
-                .hooks(controls.hooks(Some(Arc::clone(&sim.hooks) as _)));
+            let runtime = sim.runtime().hooks(controls.hooks(Some(
+                sim.hooks.for_lifetime(Arc::clone(&sim.world), lifetime),
+            )));
             let mut observers: Vec<Arc<dyn ExecutionObserver>> = vec![
                 watch,
                 Arc::new(controls.clone()),
@@ -924,20 +1034,36 @@ fn simulate_world(seed: u64) -> Outcome {
             // A crash before the run was stored leaves nothing to resume: the
             // host starts it again.
             let created = lifetime > 0 && sim.store.open(&run_key(), Access::Read).await.is_ok();
-            let mut run: HostRunFuture<'_> = if created {
-                Box::pin(host::resume_configured(
-                    &runtime,
-                    Vec::new(),
-                    observers,
-                    hand,
-                ))
-            } else {
-                let mut run =
-                    HostRun::new(workload.root.clone()).with_children(workload.children.clone());
-                for observer in observers {
-                    run = run.observe(observer);
-                }
-                Box::pin(host::run_configured(&runtime, run, hand))
+            // The run owns its runtime, so a zombie outlives this pass of
+            // the loop. A run whose creation was cut short is refused as
+            // never started: the host starts it again under the same key.
+            let mut run: HostRunFuture<'_> = {
+                let workload = &workload;
+                Box::pin(async move {
+                    let start = |observers: Vec<Arc<dyn ExecutionObserver>>, hand| {
+                        let mut run = HostRun::new(workload.root.clone())
+                            .with_children(workload.children.clone());
+                        for observer in observers {
+                            run = run.observe(observer);
+                        }
+                        host::run_configured(&runtime, run, hand)
+                    };
+                    if created {
+                        let resumed = host::resume_configured(
+                            &runtime,
+                            Vec::new(),
+                            observers.clone(),
+                            hand.clone(),
+                        )
+                        .await;
+                        match resumed {
+                            Err(HostError::NotStarted) => start(observers, hand).await,
+                            resumed => resumed,
+                        }
+                    } else {
+                        start(observers, hand).await
+                    }
+                })
             };
             let crash_now = async {
                 match crash {
@@ -945,22 +1071,45 @@ fn simulate_world(seed: u64) -> Outcome {
                     Some(Crash::After { .. } | Crash::Call(_) | Crash::Resource { .. }) => {
                         notify.notified().await;
                     }
-                    None => future::pending().await,
+                    Some(Crash::Store(_)) | None => future::pending().await,
                 }
             };
-            let ended: Option<Result<RunStatus, String>> = tokio::select! {
-                biased;
-                () = crash_now => None,
-                result = &mut run => Some(
-                    result
-                        .map(|report| report.status)
-                        .map_err(|error| error.to_string()),
-                ),
-                () = time::sleep_until(epoch + DEADLINE) => {
-                    Some(Err(format!("the run did not end within {DEADLINE:?}")))
+            tokio::pin!(crash_now);
+            let ended: Option<Result<RunStatus, String>> = loop {
+                tokio::select! {
+                    biased;
+                    () = &mut crash_now => break None,
+                    result = &mut run => break Some(
+                        result
+                            .map(|report| report.status)
+                            .map_err(|error| error.to_string()),
+                    ),
+                    () = lingering(&mut zombie) => {
+                        if let Some(ended) = zombie.take() {
+                            lay_to_rest(&sim, ended, &mut stats);
+                        }
+                    }
+                    () = time::sleep_until(epoch + DEADLINE) => {
+                        break Some(Err(format!("the run did not end within {DEADLINE:?}")));
+                    }
                 }
             };
-            if let Some(result) = ended {
+            // A store fault ends a lifetime with the run's error: the host
+            // process exits, and the next one resumes the run.
+            let faulted = sim.watched.fault_fired();
+            if faulted {
+                *stats.entry("store faults").or_default() += 1;
+                if let Some(Crash::Store(fault)) = crash {
+                    if fault.lost_reply {
+                        *stats.entry("lost replies").or_default() += 1;
+                    }
+                    if fault.down {
+                        *stats.entry("stores down").or_default() += 1;
+                    }
+                }
+            }
+            let fault_ended = faulted && matches!(ended, Some(Err(_)));
+            if let Some(result) = ended.clone().filter(|_| !fault_ended) {
                 let task = watchdog_task
                     .lock()
                     .unwrap_or_else(PoisonError::into_inner)
@@ -973,18 +1122,26 @@ fn simulate_world(seed: u64) -> Outcome {
                 }
                 let finished = dispatcher.shutdown().await;
                 *receipt.lock().unwrap_or_else(PoisonError::into_inner) = Some(finished);
+                if let Some(ended) = zombie.take() {
+                    lay_to_rest(&sim, ended, &mut stats);
+                }
                 break result;
             }
-            // The crash: the lifetime is dead before its drivers drop, so no
-            // release of theirs reaches the world.
-            *stats.entry("crashes").or_default() += 1;
+            // The crash, or the fault's end: the lifetime is dead before its
+            // drivers drop, so no release of theirs reaches the world.
+            if fault_ended {
+                *stats.entry("lifetimes a store fault ended").or_default() += 1;
+                trace(|| format!("store fault ended the lifetime: {ended:?}"));
+            } else {
+                *stats.entry("crashes").or_default() += 1;
+            }
             match crash {
                 Some(Crash::After { kind, .. }) => *stats.entry(kind).or_default() += 1,
                 Some(Crash::Call(_)) => *stats.entry("crashes at provider calls").or_default() += 1,
                 Some(Crash::Resource { .. }) => {
                     *stats.entry("crashes after resource records").or_default() += 1;
                 }
-                _ => {}
+                Some(Crash::Store(_) | Crash::At(_)) | None => {}
             }
             let progress = stored_progress(&sim, &workload).await.unwrap_or_default();
             if progress.root_done {
@@ -996,17 +1153,36 @@ fn simulate_world(seed: u64) -> Outcome {
             let run_status = progress.run_status;
             sim.world
                 .begin_lifetime(progress.finished, progress.stopping);
+            // The process is gone, and its lease with it, as a file lock ends
+            // with its process: a write it still had in flight is refused.
+            sim.store.release(&run_key());
             *current.lock().unwrap_or_else(PoisonError::into_inner) = None;
             *controls_now.lock().unwrap_or_else(PoisonError::into_inner) = None;
             alive.store(false, Ordering::Release);
-            // The process died: its watchdog with it.
-            drop(
-                watchdog_task
-                    .lock()
-                    .unwrap_or_else(PoisonError::into_inner)
-                    .take(),
-            );
-            drop(run);
+            let task = watchdog_task
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .take();
+            // The process lost its lease but not its life: the next lifetime
+            // takes the run, as an operator's release or a liveness check
+            // lets it, and this one runs on for a while. Otherwise the process
+            // died, its watchdog with it.
+            if let Some(linger) = linger.filter(|_| !fault_ended) {
+                if let Some(earlier) = zombie.take() {
+                    lay_to_rest(&sim, earlier, &mut stats);
+                }
+                sim.world.haunt(lifetime);
+                *stats.entry("zombie lifetimes").or_default() += 1;
+                zombie = Some(Zombie {
+                    run,
+                    until: Instant::now() + linger,
+                    lifetime,
+                    watchdog: task,
+                });
+            } else {
+                drop(task);
+                drop(run);
+            }
             if lose > 0 {
                 *stats.entry("lost sandboxes").or_default() +=
                     sim.world.lose_sandboxes(lose) as u64;
@@ -1020,7 +1196,13 @@ fn simulate_world(seed: u64) -> Outcome {
             }
             lifetime += 1;
         };
+        if let Some(ended) = zombie.take() {
+            lay_to_rest(&sim, ended, &mut stats);
+        }
         host.abort();
+        let (zombie_calls, zombie_starts) = sim.world.zombie_actions();
+        *stats.entry("zombie provider calls").or_default() += zombie_calls as u64;
+        *stats.entry("zombie process starts").or_default() += zombie_starts as u64;
         let ended = epoch.elapsed();
         trace(|| format!("ended at {ended:?}: {:?}", result.as_ref()));
         if let Err(error) = &result {
@@ -1436,6 +1618,47 @@ async fn check(
         }
     }
 
+    // The store's contract: every log reads back gapless, each record's seq
+    // its position, and no coordinator seq was observed from two lifetimes,
+    // as a write a zombie landed after its takeover would be.
+    {
+        let seen = seen.lock().unwrap_or_else(PoisonError::into_inner);
+        let mut writers: BTreeMap<u64, u32> = BTreeMap::new();
+        for (lifetime, seq, _) in seen.iter() {
+            if let Some(earlier) = writers.insert(*seq, *lifetime)
+                && earlier != *lifetime
+            {
+                violations.push(format!(
+                    "coordinator seq {seq} was observed from lifetimes {earlier} and {lifetime}"
+                ));
+            }
+        }
+    }
+    let mut stored_logs = vec![LogId::Coordinator, LogId::Resources];
+    stored_logs.extend(
+        state
+            .executions
+            .keys()
+            .map(|execution| LogId::Execution(*execution)),
+    );
+    for log in stored_logs {
+        match logs.read(&log).await {
+            Ok(stored) => {
+                if let Some((at, record)) = stored
+                    .iter()
+                    .enumerate()
+                    .find(|(at, record)| record.seq != *at as u64)
+                {
+                    violations.push(format!(
+                        "the {log} log holds seq {} at position {at}",
+                        record.seq
+                    ));
+                }
+            }
+            Err(error) => violations.push(format!("the {log} log does not read: {error}")),
+        }
+    }
+
     // Pause: no attempt is admitted while the run is durably paused, from a
     // `run.paused` to its `run.unpaused`, or to the end. The hold comes
     // before the record, so an admission in the pause's own millisecond is
@@ -1460,13 +1683,47 @@ async fn check(
     activity.extend(started_at.values().copied());
     // Questions: each answer names a question its firing asked, reaches the
     // log no later than the firing's end (the same instant is a race the
-    // driver refuses), no question is answered more often than it was
-    // asked, and the times a question waited on the host park the watchdog.
+    // driver refuses; a later one is an answer the dispatcher sent while the
+    // firing lived, which a slow store held up, and the receipt says it was
+    // not live), no question is answered more often than it was asked, and
+    // the times a question waited on the host park the watchdog.
+    let not_live: BTreeSet<(ExecutionId, String)> = receipt
+        .map(|receipt| {
+            receipt
+                .questions
+                .iter()
+                .filter(|question| question.delivery == Delivery::NotLive)
+                .map(|question| (question.execution, question.question.clone()))
+                .collect()
+        })
+        .unwrap_or_default();
     let mut waiting: Vec<(u64, u64)> = Vec::new();
     for execution in state.executions.keys() {
         let Ok(decoded) = read_execution_log(&*logs, *execution).await else {
             continue;
         };
+        // No firing fails for the store: a failed write ends the lifetime
+        // instead.
+        for record in decoded.log.records() {
+            let message = match &record.event {
+                Event::ScopeFailed { error, causes, .. } => {
+                    Some(format!("{error}: {}", causes.join(": ")))
+                }
+                Event::StepFinished { outcome, .. } => outcome
+                    .status
+                    .failure_info()
+                    .map(|failure| failure.message.clone()),
+                _ => None,
+            };
+            if let Some(message) = message
+                && (message.contains("simulated store failure")
+                    || message.contains("an earlier write to the run's store failed"))
+            {
+                violations.push(format!(
+                    "execution {execution} recorded a store failure as a firing's: {message}"
+                ));
+            }
+        }
         let mut open: BTreeMap<(u64, String), u64> = BTreeMap::new();
         let mut asks: BTreeMap<(u64, String), usize> = BTreeMap::new();
         let mut answers: BTreeMap<(u64, String), usize> = BTreeMap::new();
@@ -1503,6 +1760,7 @@ async fn check(
                         }
                         if let Some(end) = ended.get(&key.0)
                             && end < at
+                            && !not_live.contains(&(*execution, key.1.clone()))
                         {
                             violations.push(format!(
                                 "execution {execution} answered {key:?} at {at}, after the \
@@ -1554,6 +1812,18 @@ async fn check(
                      while the run was paused ({windows:?})"
                 ));
             }
+        }
+    }
+    // A question waits on the host only while its lifetime lives: a resumed
+    // run that does not ask it again has nothing waiting.
+    for window in &mut waiting {
+        if let Some(next) = started_at
+            .values()
+            .copied()
+            .filter(|start| *start > window.0)
+            .min()
+        {
+            window.1 = window.1.min(next);
         }
     }
     // The watchdog: a stall cancel only after a whole budget with no
@@ -1668,6 +1938,7 @@ async fn check(
             *noted.entry(key).or_default() += 1;
         }
     }
+    *stats.entry("zombie hook calls").or_default() += sim.hooks.zombie_calls().len() as u64;
     for (key, count) in &noted {
         *stats.entry("run notes").or_default() += *count as u64;
         if *count > 1 {
@@ -1960,6 +2231,12 @@ fn seeded_runs_keep_the_execution_rules() {
             "receipt questions kept across a resume",
             "run notes",
             "repeated run notes",
+            "store faults",
+            "lifetimes a store fault ended",
+            "lost replies",
+            "stores down",
+            "zombie lifetimes",
+            "slow stores",
         ] {
             assert!(
                 totals.get(key).copied().unwrap_or_default() > 0,
