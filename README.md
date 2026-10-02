@@ -112,6 +112,7 @@ crates/core/driver/tests/timeout.rs       exec §7 6: timeouts, and the race und
 crates/core/driver/tests/environments.rs  exec §7 7,10: acquire failure and retention
 crates/core/driver/tests/secrets.rs       exec §7 8: masking, and what reaches the log
 crates/core/driver/tests/docker.rs        exec §7 3,10 Docker halves; skipped without a daemon
+crates/core/driver/tests/determinism.rs   §10 determinism: a seeded run on a simulated clock replays byte for byte
 crates/core/executor-sandbox/tests/docker_backend.rs   the sandbox executor over the Docker plugin: the workspace in the sandbox, exit codes and signals, files over the wire, the crash fence, retention, services, one-shot actions
 crates/core/executor-sandbox/tests/daytona_backend.rs  the same executor over the Daytona plugin, live (`mise run test:daytona`, `PETRI_REQUIRE_DAYTONA`): the runner VM, a nested container job, files, the fence, retention, output after idle and under a burst, a preview URL, the failure modes; `DAYTONA.md` maps Fabro's former live suite onto it
 crates/petri/lib/tests/daytona.rs             the standalone host on `--backend daytona`, live: retention and `prune` with the tombstone, `resume` fencing the crashed VM

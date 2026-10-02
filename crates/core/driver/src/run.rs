@@ -1,12 +1,12 @@
 //! The driver loop.
 
-use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet};
 use std::error::Error;
 use std::fmt::Debug;
 use std::mem;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex, PoisonError};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use engine::{
     Admission, CANCEL_ESCALATION_KEY, CancelTarget, Command, DecisionId, EngineExit, EngineStart,
@@ -41,7 +41,7 @@ use crate::lifecycle::{
     RunFinished, ScopeAcquired, ScopeReleased, TRANSITION_KIND, Transition, TransitionNote,
     apply_transition,
 };
-use crate::observe::{EventObserver, ObserveError, recorded_now};
+use crate::observe::{EventObserver, ObserveError, RecordingClock};
 use crate::sink::LogSink;
 use crate::view::{BranchMap, live_view, routing_view};
 use crate::{
@@ -122,6 +122,9 @@ pub struct RunConfig {
     /// always owns its run; under a coordinator only the root invocation's
     /// executions do. The owner reports [`ExecutionHooks::run_finished`].
     pub run_owner:           bool,
+    /// The clock the driver stamps each observed record with: the wall clock
+    /// unless a host passes a virtual one.
+    pub recording_clock:     RecordingClock,
 }
 
 /// Which durable lease each scope of an execution acquires its sandbox under.
@@ -181,12 +184,20 @@ impl RunConfig {
             runtime_override:    None,
             scope_leases:        ScopeLeases::None,
             run_owner:           true,
+            recording_clock:     RecordingClock::default(),
         }
     }
 
     #[must_use]
     pub fn with_run_owner(mut self, run_owner: bool) -> Self {
         self.run_owner = run_owner;
+        self
+    }
+
+    /// Stamp observed records from `clock` instead of the wall clock.
+    #[must_use]
+    pub fn with_recording_clock(mut self, clock: RecordingClock) -> Self {
+        self.recording_clock = clock;
         self
     }
 
@@ -643,14 +654,14 @@ pub struct Driver {
     decisions:        Arc<dyn DecisionResolver>,
     sink:             Arc<LogSink>,
     config:           RunConfig,
-    envs:             HashMap<ScopeId, EnvHandle>,
-    acquires:         HashMap<ScopeId, ScopeAcquire>,
+    envs:             BTreeMap<ScopeId, EnvHandle>,
+    acquires:         BTreeMap<ScopeId, ScopeAcquire>,
     /// Acquisition, decision, retry, and signal tasks share the driver's
     /// lifetime. Completed tasks are reaped by the run loop.
     background:       JoinSet<()>,
     next_acquire_id:  u64,
-    acquire_failures: HashMap<ScopeId, String>,
-    pending_starts:   HashMap<ScopeId, Vec<ResolvedFiring>>,
+    acquire_failures: BTreeMap<ScopeId, String>,
+    pending_starts:   BTreeMap<ScopeId, Vec<ResolvedFiring>>,
     /// Bounded execution concurrency: the execution holds one of these
     /// slots (`slot`) while it is live, takes one before an attempt starts
     /// when it holds none, and gives its slot back during a retry backoff
@@ -661,14 +672,14 @@ pub struct Driver {
     /// it; the host releases it once the execution's end is recorded.
     slot:             ExecutionSlot,
     /// Attempts waiting for a slot, with the task that awaits it.
-    gated:            HashMap<FiringId, GatedStart>,
+    gated:            BTreeMap<FiringId, GatedStart>,
     /// Deliveries that arrived before execution admission resolved. Unlike
     /// [`Forward`], every buffered delivery carries an ack.
-    early_deliveries: HashMap<FiringId, Vec<(Control, DeliverAck)>>,
-    pending_forwards: HashMap<FiringId, Vec<Forward>>,
-    pending_failures: HashMap<FiringId, (Attempt, String)>,
-    scope_failed:     HashSet<ScopeId>,
-    tasks:            HashMap<FiringId, Task>,
+    early_deliveries: BTreeMap<FiringId, Vec<(Control, DeliverAck)>>,
+    pending_forwards: BTreeMap<FiringId, Vec<Forward>>,
+    pending_failures: BTreeMap<FiringId, (Attempt, String)>,
+    scope_failed:     BTreeSet<ScopeId>,
+    tasks:            BTreeMap<FiringId, Task>,
     caps:             Capabilities,
     observers:        Vec<Arc<dyn EventObserver>>,
     /// Per-run host services riding this run's lifetime: held untouched until
@@ -683,7 +694,7 @@ pub struct Driver {
     cleanup_timer:    Option<AbortHandle>,
     /// One id per attempt-timer arming, so a stale expiry is recognizable.
     next_timer_id:    u64,
-    decision_tasks:   HashMap<DecisionId, AbortHandle>,
+    decision_tasks:   BTreeMap<DecisionId, AbortHandle>,
     /// The host's awaited extension points, when installed, with the
     /// execution they are told about.
     hooks:            Option<InstalledHooks>,
@@ -692,7 +703,7 @@ pub struct Driver {
     branches:         BranchMap,
     /// Finished attempts whose result the host is still preparing: the
     /// outcome as reported, recorded as-is if the run is killed first.
-    preparing:        HashMap<FiringId, (Attempt, Outcome, AbortHandle)>,
+    preparing:        BTreeMap<FiringId, (Attempt, Outcome, AbortHandle)>,
     start:            EngineStart,
     /// Set by [`Driver::resume`]; consumed at the top of [`Driver::run`].
     resume:           Option<PendingResume>,
@@ -874,20 +885,20 @@ impl Driver {
             decisions: Arc::new(DefaultDecisionResolver),
             sink,
             config,
-            envs: HashMap::new(),
-            acquires: HashMap::new(),
+            envs: BTreeMap::new(),
+            acquires: BTreeMap::new(),
             background: JoinSet::new(),
             next_acquire_id: 0,
-            acquire_failures: HashMap::new(),
-            pending_starts: HashMap::new(),
+            acquire_failures: BTreeMap::new(),
+            pending_starts: BTreeMap::new(),
             attempt_slots: None,
             slot: ExecutionSlot::empty(),
-            gated: HashMap::new(),
-            early_deliveries: HashMap::new(),
-            pending_forwards: HashMap::new(),
-            pending_failures: HashMap::new(),
-            scope_failed: HashSet::new(),
-            tasks: HashMap::new(),
+            gated: BTreeMap::new(),
+            early_deliveries: BTreeMap::new(),
+            pending_forwards: BTreeMap::new(),
+            pending_failures: BTreeMap::new(),
+            scope_failed: BTreeSet::new(),
+            tasks: BTreeMap::new(),
             caps: Capabilities::default(),
             observers: Vec::new(),
             run_guards: Vec::new(),
@@ -896,10 +907,10 @@ impl Driver {
             end_gate: watch::channel(false).0,
             cleanup_timer: None,
             next_timer_id: 0,
-            decision_tasks: HashMap::new(),
+            decision_tasks: BTreeMap::new(),
             hooks: None,
             branches: BranchMap::default(),
-            preparing: HashMap::new(),
+            preparing: BTreeMap::new(),
             start,
             resume: None,
             tx,
@@ -1050,8 +1061,11 @@ impl Driver {
         }
 
         while !self.engine.is_finished() {
+            // In a fixed order, so a run replays under a simulated clock: the
+            // two bounded sources first, which cannot starve the signals, then
+            // the signals.
             let signal = tokio::select! {
-                signal = self.rx.recv() => signal,
+                biased;
                 Some(handle) = self.abandoned_rx.recv() => {
                     self.spawn_release(handle, ScopeOutcome::Failed, None);
                     continue;
@@ -1064,13 +1078,14 @@ impl Driver {
                     }
                     continue;
                 }
+                signal = self.rx.recv() => signal,
             };
             let Some(signal) = signal else {
                 break;
             };
             self.on_signal(signal).await;
         }
-        for (_, deliveries) in self.early_deliveries.drain() {
+        for deliveries in mem::take(&mut self.early_deliveries).into_values() {
             for (_, ack) in deliveries {
                 let _ = ack.send(DeliverDisposition::NotLive);
             }
@@ -1510,7 +1525,7 @@ impl Driver {
     /// recorded as it was, so the run can reach quiescence.
     fn abandon_preparation(&mut self) {
         let preparing: Vec<(FiringId, (Attempt, Outcome, AbortHandle))> =
-            self.preparing.drain().collect();
+            mem::take(&mut self.preparing).into_iter().collect();
         for (firing, (attempt, outcome, task)) in preparing {
             task.abort();
             self.feed(Event::StepFinished {
@@ -1658,7 +1673,7 @@ impl Driver {
     }
 
     fn abort_decisions(&mut self) {
-        for (_, task) in self.decision_tasks.drain() {
+        for task in mem::take(&mut self.decision_tasks).into_values() {
             task.abort();
         }
     }
@@ -1737,7 +1752,7 @@ impl Driver {
         if self.observers.is_empty() {
             return;
         }
-        let recorded_at = recorded_now();
+        let recorded_at = self.config.recording_clock.now();
         for record in &self.engine.log.records()[from..] {
             for observer in &self.observers {
                 observer.on_record(record, recorded_at, &self.engine);
@@ -2026,7 +2041,7 @@ impl Driver {
         if current && gated.resolved.attempt() == attempt {
             self.dispatch_admitted(&gated.resolved);
         }
-        let others: Vec<GatedStart> = self.gated.drain().map(|(_, other)| other).collect();
+        let others: Vec<GatedStart> = mem::take(&mut self.gated).into_values().collect();
         for other in others {
             other.wait.abort();
             self.dispatch_admitted(&other.resolved);
@@ -2120,7 +2135,9 @@ impl Driver {
             .checked_add(1)
             .expect("a run cannot start 2^64 scope acquisitions");
         let join = self.background.spawn(async move {
-            let started = Instant::now();
+            // The runtime's clock, which a simulation pauses: the duration is
+            // in the log.
+            let started = time::Instant::now();
             let mut lease = None;
             let mut provider = None;
             let result = async {
@@ -2521,8 +2538,10 @@ impl Driver {
         let (logs_drained, drained) = oneshot::channel();
         workers.spawn(async move {
             loop {
+                // Close first, in a fixed order: closing still hands back
+                // every event already queued.
                 let event = tokio::select! {
-                    event = log_rx.recv() => event,
+                    biased;
                     _ = &mut close_logs, if !log_rx.is_closed() => {
                         // The runner can leave log sender clones in host
                         // services. Stop accepting new output, but preserve
@@ -2530,6 +2549,7 @@ impl Driver {
                         log_rx.close();
                         continue;
                     }
+                    event = log_rx.recv() => event,
                 };
                 let Some(Progress { event, ack }) = event else {
                     break;

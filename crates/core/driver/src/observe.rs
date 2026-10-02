@@ -12,6 +12,8 @@
 //! is the observer's job — hand slow work to a channel and return fast.
 
 use std::error::Error;
+use std::fmt;
+use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use engine::{EngineState, EventRecord};
@@ -26,6 +28,35 @@ pub fn recorded_now() -> u64 {
         .ok()
         .and_then(|elapsed| u64::try_from(elapsed.as_millis()).ok())
         .unwrap_or(0)
+}
+
+/// Where the driver reads the `recorded_at` it hands its observers: the wall
+/// clock ([`recorded_now`]) unless a host passes another. A simulation passes
+/// a virtual one, so the stamps replay with the run.
+#[derive(Clone)]
+pub struct RecordingClock(Arc<dyn Fn() -> u64 + Send + Sync>);
+
+impl RecordingClock {
+    /// A clock that reads milliseconds since the Unix epoch from `now`.
+    pub fn new(now: impl Fn() -> u64 + Send + Sync + 'static) -> Self {
+        Self(Arc::new(now))
+    }
+
+    pub(crate) fn now(&self) -> u64 {
+        (self.0)()
+    }
+}
+
+impl Default for RecordingClock {
+    fn default() -> Self {
+        Self::new(recorded_now)
+    }
+}
+
+impl fmt::Debug for RecordingClock {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("RecordingClock")
+    }
 }
 
 /// A sink for a run's record stream, registered on the driver before `run()`.

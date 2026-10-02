@@ -1,5 +1,7 @@
 //! Host-side admission and routing decisions.
 
+use std::sync::{Mutex, PoisonError};
+
 use engine::{
     Admission, DecisionId, GroupDecision, MiddlewareKey, RouteDecision, RoutingProposal,
     WeightedDraw,
@@ -106,10 +108,17 @@ pub(crate) fn default_admission() -> AdmissionResolution {
 pub(crate) fn default_routing(
     request: &RoutingRequest,
 ) -> Result<RoutingResolution, DecisionError> {
+    routing_with(request, &mut os_roll)
+}
+
+fn routing_with(
+    request: &RoutingRequest,
+    roll: &mut dyn FnMut() -> Result<u64, DecisionError>,
+) -> Result<RoutingResolution, DecisionError> {
     let groups = request
         .groups
         .iter()
-        .map(|proposal| default_group_decision(proposal, request.restart_allowed))
+        .map(|proposal| group_decision_with(proposal, request.restart_allowed, roll))
         .collect::<Result<_, _>>()?;
     Ok(RoutingResolution { groups })
 }
@@ -122,7 +131,15 @@ pub fn default_group_decision(
     proposal: &RoutingProposal,
     restart_allowed: bool,
 ) -> Result<GroupDecision, DecisionError> {
-    let draw = weighted_draw(proposal)?;
+    group_decision_with(proposal, restart_allowed, &mut os_roll)
+}
+
+fn group_decision_with(
+    proposal: &RoutingProposal,
+    restart_allowed: bool,
+    roll: &mut dyn FnMut() -> Result<u64, DecisionError>,
+) -> Result<GroupDecision, DecisionError> {
+    let draw = weighted_draw(proposal, roll)?;
     let picked = engine::deterministic_pick(proposal, draw.as_ref())
         .map_err(|reason| DecisionError::new(reason.as_str()))?;
     let decision = picked.map_or(RouteDecision::None, RouteDecision::Emit);
@@ -135,9 +152,20 @@ pub fn default_group_decision(
     })
 }
 
+/// A draw from the operating system.
+fn os_roll() -> Result<u64, DecisionError> {
+    let mut bytes = [0_u8; 8];
+    getrandom::fill(&mut bytes)
+        .map_err(|error| DecisionError::new(format!("random draw failed: {error}")))?;
+    Ok(u64::from_le_bytes(bytes))
+}
+
 /// Roll the recorded draw a weighted tier needs; every other pick is
 /// deterministic and needs none.
-fn weighted_draw(proposal: &RoutingProposal) -> Result<Option<WeightedDraw>, DecisionError> {
+fn weighted_draw(
+    proposal: &RoutingProposal,
+    roll: &mut dyn FnMut() -> Result<u64, DecisionError>,
+) -> Result<Option<WeightedDraw>, DecisionError> {
     if proposal.pick != Some(PickPolicy::WeightedRandom) || proposal.candidates.is_empty() {
         return Ok(None);
     }
@@ -151,9 +179,7 @@ fn weighted_draw(proposal: &RoutingProposal) -> Result<Option<WeightedDraw>, Dec
             "weighted routing has no positive candidate weight",
         ));
     }
-    let mut bytes = [0_u8; 8];
-    getrandom::fill(&mut bytes)
-        .map_err(|error| DecisionError::new(format!("random draw failed: {error}")))?;
+    let roll = roll()?;
     Ok(Some(WeightedDraw {
         tier: proposal.tier.unwrap_or(0),
         candidates: proposal
@@ -161,7 +187,56 @@ fn weighted_draw(proposal: &RoutingProposal) -> Result<Option<WeightedDraw>, Dec
             .iter()
             .map(|candidate| candidate.edge)
             .collect(),
-        roll: u64::from_le_bytes(bytes) % total,
+        roll: roll % total,
         total,
     }))
+}
+
+/// [`DefaultDecisionResolver`] with its weighted draws rolled from a seed
+/// instead of the operating system, so a simulated run routes the same way
+/// every time. The draws are recorded either way, so replay never needs the
+/// seed.
+pub struct SeededDecisionResolver {
+    state: Mutex<u64>,
+}
+
+impl SeededDecisionResolver {
+    pub fn new(seed: u64) -> Self {
+        Self {
+            state: Mutex::new(seed),
+        }
+    }
+
+    /// The next draw: `SplitMix64` over the seed.
+    fn roll(&self) -> u64 {
+        let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
+        *state = state.wrapping_add(0x9E37_79B9_7F4A_7C15);
+        let mut z = *state;
+        z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+        z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+        z ^ (z >> 31)
+    }
+
+    fn routing(&self, request: &RoutingRequest) -> Result<RoutingResolution, DecisionError> {
+        routing_with(request, &mut || Ok(self.roll()))
+    }
+}
+
+#[async_trait::async_trait]
+impl DecisionResolver for SeededDecisionResolver {
+    async fn admit(&self, _request: AdmitRequest) -> Result<AdmissionResolution, DecisionError> {
+        Ok(default_admission())
+    }
+
+    async fn route(&self, request: RoutingRequest) -> Result<RoutingResolution, DecisionError> {
+        self.routing(&request)
+    }
+
+    fn admit_now(&self, _request: &AdmitRequest) -> Option<AdmissionResolution> {
+        Some(default_admission())
+    }
+
+    fn route_now(&self, request: &RoutingRequest) -> Option<RoutingResolution> {
+        self.routing(request).ok()
+    }
 }

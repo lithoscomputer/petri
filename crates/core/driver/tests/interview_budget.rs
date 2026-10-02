@@ -9,89 +9,25 @@
 mod support;
 
 use std::collections::BTreeSet;
-use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
 
 use driver::lifecycle::{BUDGET_PAUSED_KIND, BUDGET_RESUMED_KIND, BudgetNote, Note};
 use driver::{DeliverDisposition, Driver, EventObserver, ExecutionReport, RunConfig};
 use engine::{EngineState, Event, EventLog, EventRecord};
-use executor::{
-    AcquireContext, EnvError, EnvHandle, ExecEnv, Executor, MapSecrets, ProcessHandle, ProcessSpec,
-    ReleaseReport, ScopeOutcome, ScopeSpec,
-};
+use executor::MapSecrets;
 use ir::{
-    Budget, CancelScopeId, Control, FiringId, Graph, GraphBuilder, Outcome, RunStatus,
-    SandboxInstance, ScopeId, StepKindId, StepRef, TimeoutPolicy, Value, validate,
+    Budget, CancelScopeId, Control, FiringId, Graph, GraphBuilder, Outcome, RunStatus, ScopeId,
+    StepKindId, StepRef, TimeoutPolicy, Value, validate,
 };
 use serde::Deserialize;
 use serde_json::json;
 use steps::{Answer, Question, Registry, Step, StepCtx};
+use support::sim::NoExecutor;
 use support::*;
 use tokio::sync::mpsc;
 use tokio::task::yield_now;
 use tokio::time::{self, Duration as TokioDuration};
-
-// ── A sandbox that runs nothing ───────────────────────────────────────────
-
-#[derive(Debug)]
-struct NoEnv;
-
-#[async_trait::async_trait]
-impl ExecEnv for NoEnv {
-    async fn spawn(&self, _spec: ProcessSpec) -> Result<Box<dyn ProcessHandle>, EnvError> {
-        Err(EnvError::backend(
-            "fake",
-            "spawn",
-            "this environment runs nothing",
-        ))
-    }
-
-    fn workspace_path(&self) -> &'static str {
-        "/work"
-    }
-
-    async fn read_file(&self, _relative: &Path) -> Result<Option<Vec<u8>>, EnvError> {
-        Ok(None)
-    }
-
-    async fn write_file(&self, _relative: &Path, _: &[u8]) -> Result<(), EnvError> {
-        Ok(())
-    }
-
-    fn grace(&self) -> Duration {
-        Duration::from_secs(1)
-    }
-}
-
-struct NoExecutor;
-
-#[async_trait::async_trait]
-impl Executor for NoExecutor {
-    async fn acquire(
-        &self,
-        scope: &ScopeSpec,
-        _ctx: &AcquireContext,
-    ) -> Result<EnvHandle, EnvError> {
-        Ok(EnvHandle::new(
-            scope.id,
-            scope.environment.as_str().into(),
-            SandboxInstance {
-                provider:          "test".into(),
-                instance:          scope.environment.as_str().into(),
-                image:             None,
-                snapshot:          None,
-                working_directory: "/".into(),
-            },
-            Arc::new(NoEnv),
-            (),
-        ))
-    }
-
-    async fn release(&self, _env: EnvHandle, _outcome: ScopeOutcome) -> ReleaseReport {
-        ReleaseReport::default()
-    }
-}
 
 // ── A step that works, asks, waits, and works again ───────────────────────
 
@@ -185,7 +121,7 @@ fn driver(graph: Graph, dir: &RunDir) -> (Driver, mpsc::UnboundedReceiver<(Firin
     let (tx, rx) = mpsc::unbounded_channel();
     let driver = Driver::new(
         graph,
-        Arc::new(NoExecutor),
+        Arc::new(NoExecutor::default()),
         registry(),
         Arc::new(MapSecrets::empty()),
         RunConfig::new(dir.path()).with_grace(Duration::from_millis(100)),
@@ -492,7 +428,7 @@ async fn a_redispatched_firing_gets_a_fresh_budget_and_waits_again() {
     let (driver, _info) = Driver::resume(
         graph.clone(),
         log,
-        Arc::new(NoExecutor),
+        Arc::new(NoExecutor::default()),
         registry(),
         Arc::new(MapSecrets::empty()),
         RunConfig::new(dir.path()).with_grace(Duration::from_millis(100)),

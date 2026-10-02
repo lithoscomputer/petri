@@ -846,6 +846,19 @@ fatal-sink semantics watches its own observer and cancels via `RunHandle`).
 The stock petri host persists a post-mask run dir through an observer battery;
 details live with that host, not here.
 
+**Determinism.** Under a simulated clock the driver is a function of its
+inputs, so a seeded simulation replays a run exactly. Its `select!`s are
+biased: the main loop takes abandoned scope handles, then background task
+exits, both bounded, then signals; a firing's log forwarder closes before it
+receives, and closing still hands back every queued event. Its state maps are
+ordered. Every duration it records, such as `scope.acquired`'s
+`duration_ms`, reads the runtime's clock, and the time it stamps on observed
+records comes from `RunConfig.recording_clock`, the wall clock by default. Its
+one draw, for a weighted routing tier, comes from the operating system in
+`DefaultDecisionResolver` and from a seed in `SeededDecisionResolver`; the
+draw is in the log either way, so replay never needs it. The step-log sink
+still writes through `tokio::fs`, outside a single-threaded simulation.
+
 **Timeout accounting.** `Budget.timeout_policy` says who enforces the
 per-attempt timeout. `ExecutorEnforced` (the default): the driver arms the
 timer at dispatch and it counts **active work only**. A `Question` on the
