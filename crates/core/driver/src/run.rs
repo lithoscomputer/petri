@@ -294,23 +294,27 @@ struct PendingResume {
 
 /// How a run ended, and what it left behind.
 pub struct ExecutionReport {
-    pub exit:            EngineExit,
-    pub status:          RunStatus,
-    pub state:           EngineState,
-    pub releases:        Vec<ReleaseReport>,
+    pub exit:                 EngineExit,
+    /// Overall result, including required finalization for a run owner.
+    pub status:               RunStatus,
+    /// Workflow execution result, also represented by `exit` and `state`.
+    pub execution_status:     RunStatus,
+    pub finalization_failure: Option<ir::FinalizationFailure>,
+    pub state:                EngineState,
+    pub releases:             Vec<ReleaseReport>,
     /// What the host's run-level hook points noted (`run_finished`, then
     /// each `scope_released`), masked, in the order they ran. No firing owns
     /// them, so the driver records nothing itself; a coordinator appends
     /// them at run level.
-    pub run_notes:       Vec<Note>,
+    pub run_notes:            Vec<Note>,
     /// What each failing observer's `finish` reported. Never changes `status`:
     /// a host with fatal-sink semantics watches its own observer and cancels.
-    pub observer_errors: Vec<ObserveError>,
+    pub observer_errors:      Vec<ObserveError>,
     /// The run's store failed a write, and the driver stopped there
     /// without recording anything more: no firing failed for it and no
     /// hook ran after it. The exit and state are not an end; the host
     /// resumes the run from what the store holds.
-    pub store_failure:   Option<String>,
+    pub store_failure:        Option<String>,
 }
 
 /// Why a step was told to stop. The distinction cannot be made by the step —
@@ -1174,7 +1178,7 @@ impl Driver {
 
         // The run-end hook runs while every environment is still usable, then
         // the releases held for it proceed.
-        let mut run_notes = self.report_run_finished().await;
+        let (mut run_notes, finalization_failure) = self.report_run_finished().await;
         let _ = self.end_gate.send_replace(true);
         run_notes.extend(self.report_replayed_releases().await);
         self.release_stored_scopes().await;
@@ -1238,7 +1242,8 @@ impl Driver {
             tracing::warn!(error = ?error, "engine run error");
         }
 
-        let status = self.engine.folded_status();
+        let execution_status = self.engine.folded_status();
+        let status = ir::finalized_status(execution_status, finalization_failure.as_ref());
         tracing::info!(
             status = %status,
             firing_count = self.engine.history().len(),
@@ -1248,14 +1253,14 @@ impl Driver {
             "run finished"
         );
 
-        let exit = self
-            .engine
-            .exit()
-            .cloned()
-            .unwrap_or(EngineExit::Terminal { status });
+        let exit = self.engine.exit().cloned().unwrap_or(EngineExit::Terminal {
+            status: execution_status,
+        });
         ExecutionReport {
             exit,
             status,
+            execution_status,
+            finalization_failure,
             state: mem::replace(&mut self.engine, EngineState::new(Graph::new())),
             releases,
             run_notes,
@@ -2478,15 +2483,15 @@ impl Driver {
     /// Tell the host the run ended, when this execution owns the run and its
     /// exit is terminal (a restart hands the run on; nothing ended). The
     /// host's notes come back for the report.
-    async fn report_run_finished(&self) -> Vec<Note> {
+    async fn report_run_finished(&self) -> (Vec<Note>, Option<ir::FinalizationFailure>) {
         if !self.config.run_owner {
-            return Vec::new();
+            return (Vec::new(), None);
         }
         let Some(hooks) = &self.hooks else {
-            return Vec::new();
+            return (Vec::new(), None);
         };
         if matches!(self.engine.exit(), Some(EngineExit::Restart { .. })) {
-            return Vec::new();
+            return (Vec::new(), None);
         }
         let status = self.engine.folded_status();
         let failure = self
@@ -2496,10 +2501,24 @@ impl Driver {
             .rev()
             .find_map(|record| record.outcome.status.failure_info())
             .map(|info| info.message.clone());
-        hooks
-            .host
-            .run_finished(&hooks.context, RunFinished { status, failure })
-            .await
+        let finished = RunFinished { status, failure };
+        let finalization_failure = if hooks.host.requires_run_finalization() {
+            hooks
+                .host
+                .finalize_run(&hooks.context, finished.clone())
+                .await
+                .err()
+                .map(|failure| {
+                    ir::FinalizationFailure::new(
+                        self.sink.masker().mask(&failure.code),
+                        self.sink.masker().mask(&failure.message),
+                    )
+                })
+        } else {
+            None
+        };
+        let notes = hooks.host.run_finished(&hooks.context, finished).await;
+        (notes, finalization_failure)
     }
 
     /// Run the host's `scope_released` point again for each scope an

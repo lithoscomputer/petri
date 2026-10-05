@@ -95,7 +95,7 @@ fn reconstruct(events: &[RunEvent]) -> Reconstructed {
     let mut out = Reconstructed::default();
     let mut current_route: Option<String> = None;
     for event in events {
-        if let Some(CoordinatorEvent::RunFinished { status }) = event.coordinator() {
+        if let Some(CoordinatorEvent::RunFinished { status, .. }) = event.coordinator() {
             out.run_status = Some(*status);
         }
         if let Some(Event::StepFinished { outcome, .. }) = event.engine() {

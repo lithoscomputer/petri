@@ -252,3 +252,43 @@ future cancels the same way through a guard, and the owner finishes the same
 cleanup on its own, bounded by the grace plus a fixed margin
 (`petri-frontend-fabro::hooks::an_agent_hook_timeout_stops_its_tool_before_failing_open`,
 `a_cancelled_run_stops_an_agent_hooks_running_tool`).
+
+## Required run finalization
+
+Hosts declare required completion work by returning `true` from
+`ExecutionHooks::requires_run_finalization` and implement `finalize_run`.
+Wrappers must forward both methods. The default declares no required work;
+a declaration without an implementation rejects with `finalizer_unavailable`.
+Local workflow hooks remain observational and keep their fail-open behavior.
+
+The run-owning driver awaits `finalize_run` after terminal workflow execution,
+while its environments remain available, before `run_finished` observations
+and `scope_released` cleanup. Child invocations and restart exits do not
+finalize. Failed and cancelled execution also invoke the finalizer, so the
+host can decide which work is appropriate. A blocked callback leaves no
+`run.finished` record. A rejection returns `ir::FinalizationFailure` with a
+host-defined code and rendered message; both are masked before leaving the
+driver. Petri stores this detail without interpreting host policy.
+
+`ExecutionReport.execution_status`, `exit`, and `state` describe execution.
+`ExecutionReport.status` includes finalization. Success plus rejection is
+failed; failed execution stays failed; cancellation stays cancelled even when
+the finalizer rejects, with its failure detail retained. Cancellation controls
+arriving after execution ended do not interrupt the awaited finalizer. Hosts
+own callback timeouts. Release retains the workflow scope/invocation outcome
+and its best-effort semantics; release problems do not change completion.
+The coordinator commits `run.finished` only after finalization and cleanup.
+Once committed, this result is immutable and is returned on resume without
+running completion hooks again.
+
+The declaration is durable and unfinished recovery refuses a changed
+requirement, including a missing finalizer. It does not verify implementation
+identity: the host must restore the appropriate finalizer configuration.
+An interrupted callback, or a crash after it returns but before `run.finished`
+commits, leaves an unfinished run. Existing recovery invokes finalization
+again, even when the root invocation result was already recorded. The host
+must tolerate repetition or reject when it cannot establish success. Recovery
+does not recreate environments for a terminal execution; a finalizer that
+needs an unavailable environment must return a failure. Independent durable
+finalization progress, effect deduplication, and retry orchestration are not
+provided by this contract. Inspection and event replay never invoke callbacks.

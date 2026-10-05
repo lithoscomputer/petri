@@ -370,7 +370,7 @@ impl PrepareError {
     }
 }
 
-/// The run this driver owns has ended: its status is final and no
+/// Workflow execution for this driver has ended: its status is final and no
 /// environment has been released yet. Only the driver that owns the run
 /// reports it (a bare driver, or the coordinator's root invocation on a
 /// terminal exit); a restart successor and an internal child invocation
@@ -538,7 +538,41 @@ pub trait ExecutionHooks: Send + Sync {
         Ok(TransitionReport::default())
     }
 
-    /// The run ended, before its environments are released. Awaited: the
+    /// Declare required finalization for this run. The coordinator records
+    /// this requirement and refuses resume with a different declaration.
+    /// The declaration must stay stable for the run. Wrappers must forward
+    /// both this method and `finalize_run`.
+    fn requires_run_finalization(&self) -> bool {
+        false
+    }
+
+    /// Complete required host work after terminal workflow execution and
+    /// before run-end observations or environment release. Called only when
+    /// `requires_run_finalization` is true, only by the run owner, including
+    /// failed and cancelled executions; restart exits do not finalize.
+    ///
+    /// The argument describes execution, not the overall result. Rejection
+    /// fails an otherwise successful run; cancellation remains cancelled.
+    /// Implementors must support repetition after interruption, or reject
+    /// when they cannot establish success. Recovery does not recreate lost
+    /// environments or provide independent finalization retries. Pending
+    /// finalization keeps the run nonterminal. Cancellation after execution
+    /// has ended does not interrupt this awaited callback.
+    async fn finalize_run(
+        &self,
+        context: &HookContext,
+        finished: RunFinished,
+    ) -> Result<(), ir::FinalizationFailure> {
+        let _ = (context, finished);
+        Err(ir::FinalizationFailure::new(
+            "finalizer_unavailable",
+            "required run finalization has no implementation",
+        ))
+    }
+
+    /// Workflow execution ended, before its environments are released.
+    /// Observational: notes never change the result. Required work belongs in
+    /// `finalize_run`, which is awaited before this point. Awaited: the
     /// release waits for it.
     /// The notes come back to the driver, which hands them to its host in
     /// the [`ExecutionReport`](crate::ExecutionReport) (`run_notes`); a

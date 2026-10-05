@@ -42,7 +42,7 @@ use petri::execution::{
 use petri::executor::Retention;
 use petri::frontend::CompileInputs;
 use petri::frontend::fabro::Fabro;
-use petri::ir::RunStatus;
+use petri::ir::{FinalizationFailure, RunStatus};
 use petri::steps::Answer;
 use petri::{LlmClientConfig, RunOptions, Runtime, build_llm_client};
 use serde_json::{Map, Value, json};
@@ -621,6 +621,18 @@ impl ExecutionHooks for EmbeddingHost {
         Ok(report)
     }
 
+    fn requires_run_finalization(&self) -> bool {
+        self.inner.requires_run_finalization()
+    }
+
+    async fn finalize_run(
+        &self,
+        context: &HookContext,
+        finished: RunFinished,
+    ) -> Result<(), FinalizationFailure> {
+        self.inner.finalize_run(context, finished).await
+    }
+
     async fn run_finished(&self, context: &HookContext, finished: RunFinished) -> Vec<Note> {
         self.inner.run_finished(context, finished).await
     }
@@ -671,7 +683,7 @@ fn project(events: &[RunEvent]) -> Projected {
             }
         }
         match event.coordinator() {
-            Some(CoordinatorEvent::RunFinished { status }) => out.run_status = Some(*status),
+            Some(CoordinatorEvent::RunFinished { status, .. }) => out.run_status = Some(*status),
             Some(CoordinatorEvent::InvocationDeclared { .. }) if event.context.parent.is_some() => {
                 out.branch_children += 1;
             }

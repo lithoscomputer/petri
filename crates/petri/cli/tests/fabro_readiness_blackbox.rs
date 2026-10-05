@@ -817,7 +817,7 @@ fn project(events: &[RunEvent]) -> Projected {
             Some(CoordinatorEvent::InvocationCancelRequested { reason, .. }) => {
                 out.cancel_reason.clone_from(reason);
             }
-            Some(CoordinatorEvent::RunFinished { status }) => {
+            Some(CoordinatorEvent::RunFinished { status, .. }) => {
                 out.run_status = Some(format!("{status:?}"));
             }
             _ => {}

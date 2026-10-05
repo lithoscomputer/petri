@@ -158,7 +158,10 @@ pub use replay::{
 /// record: `underlying` is an `UnderlyingFailure` (`{"failure": {...}}` or
 /// `"timed_out"`) instead of a bare `FailureInfo`. The version moves with the
 /// engine log (v12) and run format (8) that carry it.
-pub const EVENT_CONTRACT_VERSION: u32 = 5;
+///
+/// Version 6 records required finalization (run format 9). `run.finished`
+/// is the overall result; a root invocation's result is workflow execution.
+pub const EVENT_CONTRACT_VERSION: u32 = 6;
 
 /// Which durable log an event was derived from.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]

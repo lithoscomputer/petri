@@ -235,7 +235,13 @@ acknowledgement gates the next step of the run:
   recorded and the run continues, a `TransitionError` blocks every route
   (Fabro's fatal Git commit failure and best-effort metadata writes model
   onto these two).
-- `run_finished` runs at the run's terminal exit before any environment is
+- Required host work uses `requires_run_finalization` and `finalize_run`,
+  awaited on terminal root execution before run-end observations and release.
+  Its generic failure code and message travel into the immutable overall
+  `run.finished` result; the root invocation result remains execution evidence.
+  Wrappers forward both methods. See `crates/core/execution/HOOKS.md` for
+  cancellation and interruption limits.
+- Observational `run_finished` runs at workflow terminal exit before any environment is
   released; `scope_released` runs before each scope's own environment is
   released. Fabro's `run_complete`/`run_failed` (by final status, neither on a
   cancelled run) and `sandbox_cleanup` map onto them.

@@ -978,6 +978,13 @@ pub struct RunRuntime {
 }
 
 impl RunRuntime {
+    /// Whether the installed host declares required completion work.
+    pub fn requires_run_finalization(&self) -> bool {
+        self.hooks
+            .as_ref()
+            .is_some_and(|hooks| hooks.requires_run_finalization())
+    }
+
     /// A standalone driver's completion owns this run's service teardown.
     /// It is the run's one execution: the root invocation's first.
     fn equip_standalone(self, driver: Driver) -> Driver {

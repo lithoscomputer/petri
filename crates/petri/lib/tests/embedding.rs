@@ -765,7 +765,7 @@ impl Timeline {
                     });
                     entry
                 });
-            if let Some(CoordinatorEvent::RunFinished { status }) = event.coordinator() {
+            if let Some(CoordinatorEvent::RunFinished { status, .. }) = event.coordinator() {
                 timeline.run_status = Some(*status);
             }
             if let Some(ViewEvent::ForkCompleted { fork, results, .. }) = event.view() {
