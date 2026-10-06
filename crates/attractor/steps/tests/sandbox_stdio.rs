@@ -8,23 +8,26 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use attractor_steps::acp::{Client, Stage};
-use executor::{ExecEnv, Masker, ProcessSpec, StdinMode};
-use ir::{Attempt, FiringId, ScopeId};
+use executor::{
+    AcquireContext, EnvHandle, ExecEnv, Executor, Masker, ProcessSpec, Retention, ScopeOutcome,
+    ScopeSpec, StdinMode,
+};
+use executor_sandbox::RoutingExecutor;
+use ir::{Attempt, FiringId, RuntimeSpec, ScopeId};
 use sandbox_driver::{
-    Capabilities, Capability, Exec, ExecControls, ExecResult, ExecSpec, ExecStreamingResult,
-    Filesystem, Isolation, PlatformInfo, Sandbox, SandboxId, SandboxStatus, SpawnSpec, StderrTail,
+    Capabilities, Capability, EventContext, Exec, ExecControls, ExecResult, ExecSpec,
+    ExecStreamingResult, Filesystem, Isolation, PlatformInfo, ProviderKind, Sandbox, SandboxFilter,
+    SandboxId, SandboxProvider, SandboxSpec, SandboxState, SandboxStatus, SpawnSpec, StderrTail,
     StdioProcess, StdioProcessHandle, Termination,
 };
 use serde_json::{Value, json};
 use steps::ProgressSender;
+use testkit::RunDir;
 use tokio::io::{AsyncBufReadExt as _, AsyncWriteExt as _, BufReader, duplex};
 use tokio::sync::{Mutex as AsyncMutex, mpsc, watch};
 use tokio::task::JoinSet;
 use tokio::time::{self, timeout};
 use tokio_util::sync::CancellationToken;
-
-use crate::env::SandboxEnv;
-use crate::gate::RunGate;
 
 const BUDGET: Duration = Duration::from_secs(2);
 
@@ -218,7 +221,10 @@ impl Sandbox for TextOnlySandbox {
         panic!("stdio does not use filesystem facet")
     }
     async fn describe(&self) -> sandbox_driver::Result<SandboxStatus> {
-        panic!("no describe")
+        Ok(SandboxStatus::new(self.id.clone(), SandboxState::Running))
+    }
+    async fn environment(&self) -> sandbox_driver::Result<BTreeMap<String, String>> {
+        Ok(BTreeMap::new())
     }
     async fn platform_info(&self) -> sandbox_driver::Result<PlatformInfo> {
         panic!("no platform probe")
@@ -230,11 +236,67 @@ impl Sandbox for TextOnlySandbox {
         panic!("stop the process only")
     }
     async fn delete(&self) -> sandbox_driver::Result<()> {
-        panic!("delete is lease owned")
+        Ok(())
     }
 }
 
-fn environment(peer: Peer) -> (SandboxEnv, Arc<Seen>) {
+struct TextOnlyProvider {
+    kind:    ProviderKind,
+    sandbox: Arc<TextOnlySandbox>,
+}
+
+#[async_trait]
+impl SandboxProvider for TextOnlyProvider {
+    fn kind(&self) -> &ProviderKind {
+        &self.kind
+    }
+
+    fn capabilities(&self) -> &Capabilities {
+        self.sandbox.capabilities()
+    }
+
+    async fn create(
+        &self,
+        _: &SandboxSpec,
+        _: Option<EventContext>,
+    ) -> sandbox_driver::Result<Arc<dyn Sandbox>> {
+        Ok(self.sandbox.clone())
+    }
+
+    async fn attach(
+        &self,
+        id: &SandboxId,
+        _: Option<EventContext>,
+    ) -> sandbox_driver::Result<Arc<dyn Sandbox>> {
+        assert_eq!(id, self.sandbox.id());
+        Ok(self.sandbox.clone())
+    }
+
+    async fn list(&self, _: &SandboxFilter) -> sandbox_driver::Result<Vec<SandboxStatus>> {
+        Ok(Vec::new())
+    }
+}
+
+struct Fixture {
+    _dir:   RunDir,
+    router: RoutingExecutor,
+    handle: EnvHandle,
+}
+
+impl Fixture {
+    async fn close(self) {
+        timeout(BUDGET, self.router.shutdown())
+            .await
+            .expect("admitted processes drain before shutdown");
+        let report = self
+            .router
+            .release(self.handle, ScopeOutcome::Succeeded)
+            .await;
+        assert!(report.is_clean(), "{report:?}");
+    }
+}
+
+async fn environment(peer: Peer) -> (Arc<dyn ExecEnv>, Arc<Seen>, Fixture) {
     let seen = Arc::new(Seen::default());
     let mut capabilities = Capabilities::minimal(Isolation::Container);
     capabilities.exec.stdio_process = true;
@@ -245,20 +307,31 @@ fn environment(peer: Peer) -> (SandboxEnv, Arc<Seen>) {
         peer,
         seen: seen.clone(),
     });
-    let env = SandboxEnv {
-        sandbox,
-        host: false,
-        workspace: "/workspace".into(),
-        ambient: BTreeMap::new(),
-        env: BTreeMap::from([
+    let dir = RunDir::new("acp-text-stdio");
+    let router = RoutingExecutor::with_provider(
+        Arc::new(TextOnlyProvider {
+            kind: ProviderKind::try_new("docker").expect("kind"),
+            sandbox,
+        }),
+        dir.path(),
+        Retention::Never,
+    );
+    let scope = ScopeSpec::new(ScopeId::new(0), "scope-0")
+        .with_runtime(RuntimeSpec::container("text-only"))
+        .with_grace(BUDGET)
+        .with_env(BTreeMap::from([
             ("SCOPE".into(), "scope".into()),
             ("OVERRIDE".into(), "scope".into()),
-        ]),
-        grace: BUDGET,
-        host_address: None,
-        gate: RunGate::default(),
-    };
-    (env, seen)
+        ]));
+    let handle = router
+        .acquire(&scope, &AcquireContext::bare())
+        .await
+        .expect("scope");
+    (handle.exec(), seen, Fixture {
+        _dir: dir,
+        router,
+        handle,
+    })
 }
 
 async fn client(env: &dyn ExecEnv, spec: ProcessSpec) -> Client {
@@ -278,11 +351,11 @@ async fn client(env: &dyn ExecEnv, spec: ProcessSpec) -> Client {
 
 #[tokio::test]
 async fn acp_uses_text_stdio_when_general_streamed_stdin_is_unsupported() {
-    let (env, seen) = environment(Peer::Acp);
+    let (env, seen, fixture) = environment(Peer::Acp).await;
     let spec = ProcessSpec::new("agent", &["literal ; argument"])
         .with_cwd(Some("/workspace/stage directory".into()))
         .with_env(BTreeMap::from([("OVERRIDE".into(), "process".into())]));
-    let mut client = client(&env, spec).await;
+    let mut client = client(&*env, spec).await;
     timeout(BUDGET, client.open_session(env.workspace_path()))
         .await
         .expect("handshake deadline")
@@ -319,7 +392,7 @@ async fn acp_uses_text_stdio_when_general_streamed_stdin_is_unsupported() {
         .await
         .expect("termination");
     assert_eq!(seen.terminated.load(Ordering::SeqCst), 1);
-    assert!(env.gate.close(BUDGET).await);
+    fixture.close().await;
     assert!(
         env.spawn_text_stdio(ProcessSpec::new("agent", &[]))
             .await
@@ -329,7 +402,7 @@ async fn acp_uses_text_stdio_when_general_streamed_stdin_is_unsupported() {
 
 #[tokio::test]
 async fn ordinary_piped_execution_keeps_its_streaming_contract() {
-    let (env, seen) = environment(Peer::Silent);
+    let (env, seen, fixture) = environment(Peer::Silent).await;
     let mut process = env
         .spawn(ProcessSpec::new("cat", &[]).with_stdin(StdinMode::Piped))
         .await
@@ -342,12 +415,14 @@ async fn ordinary_piped_execution_keeps_its_streaming_contract() {
     );
     assert_eq!(seen.streaming.load(Ordering::SeqCst), 1);
     assert!(seen.specs.lock().expect("specs").is_empty());
+    drop(process);
+    fixture.close().await;
 }
 
 #[tokio::test]
 async fn unexpected_acp_exit_reports_status_and_masks_the_stderr_tail() {
-    let (env, _) = environment(Peer::Exit);
-    let mut client = client(&env, ProcessSpec::new("missing-agent", &[])).await;
+    let (env, _, fixture) = environment(Peer::Exit).await;
+    let mut client = client(&*env, ProcessSpec::new("missing-agent", &[])).await;
     let error = timeout(BUDGET, client.open_session(env.workspace_path()))
         .await
         .expect("deadline")
@@ -356,12 +431,14 @@ async fn unexpected_acp_exit_reports_status_and_masks_the_stderr_tail() {
     assert!(error.contains("exit code 127"), "{error}");
     assert!(error.contains("launch failed:"), "{error}");
     assert!(!error.contains("diagnostic-secret"), "{error}");
+    drop(client);
+    fixture.close().await;
 }
 
 #[tokio::test]
 async fn stdio_deadline_and_dropped_handle_terminate_before_gate_drains() {
     for deadline in [true, false] {
-        let (env, seen) = environment(Peer::Silent);
+        let (env, seen, fixture) = environment(Peer::Silent).await;
         let mut spec = ProcessSpec::new("agent", &[]);
         if deadline {
             spec = spec.with_timeout(Some(Duration::from_millis(10)));
@@ -380,7 +457,7 @@ async fn stdio_deadline_and_dropped_handle_terminate_before_gate_drains() {
             assert_eq!(process.wait().await.expect("cached wait"), status);
         }
         drop(process);
-        assert!(env.gate.close(BUDGET).await);
+        fixture.close().await;
         assert_eq!(seen.terminated.load(Ordering::SeqCst), 1);
         assert_eq!(
             seen.waits.load(Ordering::SeqCst),
