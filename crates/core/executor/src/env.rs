@@ -292,6 +292,22 @@ pub struct PreviewUrl {
 pub trait ExecEnv: Send + Sync {
     async fn spawn(&self, spec: ProcessSpec) -> Result<Box<dyn ProcessHandle>, EnvError>;
 
+    /// Start a bidirectional UTF-8 text protocol, with piped stdin and line
+    /// output. Unlike general piped execution, callers need neither arbitrary
+    /// binary input nor stdin EOF. Remote executors may use a dedicated stdio
+    /// process facet. Its stop signals request the provider's termination
+    /// operation; the provider owns any signal escalation.
+    async fn spawn_text_stdio(
+        &self,
+        spec: ProcessSpec,
+    ) -> Result<Box<dyn ProcessHandle>, EnvError> {
+        self.spawn(
+            spec.with_stdin(StdinMode::Piped)
+                .with_output(OutputMode::Lines),
+        )
+        .await
+    }
+
     /// The workspace root as a process running in this environment sees it, for
     /// building paths to hand to the process.
     fn workspace_path(&self) -> &str;

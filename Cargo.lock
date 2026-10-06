@@ -1705,8 +1705,10 @@ name = "petri-executor-sandbox"
 version = "0.1.0"
 dependencies = [
  "async-trait",
+ "petri-attractor-steps",
  "petri-executor",
  "petri-ir",
+ "petri-steps",
  "petri-testkit",
  "reqwest",
  "sandbox-driver",
