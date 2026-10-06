@@ -1,14 +1,12 @@
 //! [`ExecEnv`] and [`ContainerRunner`] over one [`Sandbox`].
 //!
-//! An ordinary step spawn becomes one `run_streaming` call in an owned task;
-//! a text protocol uses `spawn_stdio` through [`crate::stdio`]. A
+//! A step spawn becomes one `run_streaming` call in an owned task; a
 //! Docker action becomes one `OneShot::run` call the same way. Output
 //! chunks are fed through the interface crate's own line pump (a duplex
-//! pipe per stream), so the shared line cap and truncation marker match
-//! every other executor exactly. For ordinary exec, the step's cancellation
-//! ladder is the only one: `SIGTERM` fires the sandbox-driver `term` token,
-//! `SIGKILL` fires `kill`, and the provider sends exactly that signal and
-//! nothing more.
+//! pipe per stream), so the 64 KiB line cap and truncation marker match
+//! every other executor exactly. The step's cancellation ladder is the only
+//! one: `SIGTERM` fires the sandbox-driver `term` token, `SIGKILL` fires
+//! `kill`, and the provider sends exactly that signal and nothing more.
 //!
 //! Workspace files go through the sandbox's filesystem facet. The
 //! workspace lives inside the sandbox — a volume it owns — and nothing on
@@ -29,7 +27,7 @@ use executor::{
 };
 use sandbox_driver::{
     Error as DriverError, ExecControls, ExecSpec, ExecStreamingResult, OneShotImage, OneShotSpec,
-    OutputLoss, OutputStream, Sandbox, SpawnSpec, StdinSource, Termination,
+    OutputLoss, OutputStream, Sandbox, StdinSource, Termination,
 };
 use smol_str::SmolStr;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt, DuplexStream, duplex};
@@ -37,8 +35,8 @@ use tokio::sync::{Mutex, mpsc, watch};
 use tokio::task::JoinSet;
 use tokio_util::sync::CancellationToken;
 
+use crate::BACKEND;
 use crate::gate::{Admission, RunGate};
-use crate::{BACKEND, stdio};
 
 /// Bytes of pipe buffer between the output sink and each line pump.
 const OUTPUT_PIPE_CAPACITY: usize = 64 * 1024;
@@ -69,11 +67,7 @@ pub(crate) struct SandboxEnv {
 /// ladder read the same on every backend. The fallbacks below are for a
 /// provider that stopped the command but could not observe how (Daytona ends
 /// a session without seeing the child's status).
-pub(crate) fn exit_status(
-    termination: Termination,
-    code: Option<i32>,
-    signal: Option<i32>,
-) -> ExitStatus {
+fn exit_status(termination: Termination, code: Option<i32>, signal: Option<i32>) -> ExitStatus {
     // The provider's own deadline ended the command: the step reads it as a
     // timeout, whatever signal the provider observed on the way.
     if termination == Termination::TimedOut {
@@ -304,20 +298,10 @@ fn facet_error(operation: &str, error: &DriverError) -> EnvError {
     EnvError::backend(BACKEND, operation, error.to_string())
 }
 
-/// The scope's env first, the spec's own on top.
-fn merged_env<'a>(
-    scope: &'a BTreeMap<SmolStr, SmolStr>,
-    own: &'a BTreeMap<SmolStr, SmolStr>,
-) -> impl Iterator<Item = (&'a str, &'a str)> {
-    scope
-        .iter()
-        .filter(|(key, _)| !own.contains_key(*key))
-        .chain(own)
-        .map(|(key, value)| (key.as_str(), value.as_str()))
-}
-
-impl SandboxEnv {
-    async fn prepare_cwd(&self, spec: &ProcessSpec) -> Result<(), EnvError> {
+#[async_trait]
+impl ExecEnv for SandboxEnv {
+    async fn spawn(&self, spec: ProcessSpec) -> Result<Box<dyn ProcessHandle>, EnvError> {
+        let admission = self.gate.admit("exec")?;
         // `docker exec -w` refuses a directory that does not exist yet
         // (`repo/` before the first checkout), so create the step's cwd
         // first, with the one command every image contract provides.
@@ -340,43 +324,6 @@ impl SandboxEnv {
                 ));
             }
         }
-        Ok(())
-    }
-}
-
-#[async_trait]
-impl ExecEnv for SandboxEnv {
-    async fn spawn_text_stdio(
-        &self,
-        spec: ProcessSpec,
-    ) -> Result<Box<dyn ProcessHandle>, EnvError> {
-        let admission = self.gate.admit("stdio")?;
-        self.prepare_cwd(&spec).await?;
-        let mut spawn =
-            SpawnSpec::new(spec.program.as_str()).args(spec.args.iter().map(SmolStr::as_str));
-        if let Some(cwd) = &spec.cwd {
-            spawn = spawn.working_dir(cwd.to_string_lossy());
-        }
-        for (key, value) in merged_env(&self.env, &spec.env) {
-            spawn = spawn.env_var(key, value);
-        }
-        let process = self
-            .sandbox
-            .exec()
-            .spawn_stdio(&spawn)
-            .await
-            .map_err(|error| facet_error("stdio", &error))?;
-        Ok(Box::new(stdio::adapt(
-            process,
-            spec.timeout,
-            self.grace,
-            admission,
-        )))
-    }
-
-    async fn spawn(&self, spec: ProcessSpec) -> Result<Box<dyn ProcessHandle>, EnvError> {
-        let admission = self.gate.admit("exec")?;
-        self.prepare_cwd(&spec).await?;
         let working_dir = spec
             .cwd
             .as_ref()
@@ -396,8 +343,13 @@ impl ExecEnv for SandboxEnv {
         if let Some(dir) = working_dir {
             exec_spec = exec_spec.working_dir(dir);
         }
-        for (key, value) in merged_env(&self.env, &spec.env) {
-            exec_spec = exec_spec.env_var(key, value);
+        for (key, value) in self
+            .env
+            .iter()
+            .filter(|(key, _)| !spec.env.contains_key(*key))
+            .chain(spec.env.iter())
+        {
+            exec_spec = exec_spec.env_var(key.as_str(), value.as_str());
         }
         let stdin = matches!(spec.stdin, StdinMode::Piped);
         Ok(Box::new(spawn_streamed(
@@ -648,8 +600,14 @@ impl OneShotRunner {
             one_shot = one_shot.entrypoint(entrypoint.as_str());
         }
         one_shot = one_shot.args(spec.args.iter().map(SmolStr::as_str));
-        for (key, value) in merged_env(&self.env, &spec.env) {
-            one_shot = one_shot.env_var(key, value);
+        // The scope's env first, the spec's own on top.
+        for (key, value) in self
+            .env
+            .iter()
+            .filter(|(key, _)| !spec.env.contains_key(*key))
+            .chain(spec.env.iter())
+        {
+            one_shot = one_shot.env_var(key.as_str(), value.as_str());
         }
         if let Some(workdir) = spec.workdir {
             one_shot = one_shot.working_dir(workdir.as_str());

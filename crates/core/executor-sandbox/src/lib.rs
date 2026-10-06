@@ -41,7 +41,6 @@ mod simulated;
 #[cfg(test)]
 mod simulated_tests;
 mod snapshots;
-mod stdio;
 
 use std::fmt;
 use std::sync::Arc;

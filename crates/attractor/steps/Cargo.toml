@@ -43,9 +43,6 @@ tokio = { workspace = true }
 tracing = { workspace = true }
 
 [dev-dependencies]
-# The ACP transport regression runs through the public sandbox executor.
-executor-sandbox.workspace = true
-sandbox-driver.workspace = true
 pebble-coding-agent = { workspace = true, features = ["test-util"] }
 # The fallback unit tests resolve chains against a catalog whose providers use
 # the OpenAI adapter; the library itself needs no adapter.

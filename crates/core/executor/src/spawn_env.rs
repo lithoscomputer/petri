@@ -3,8 +3,7 @@
 //! An embedding host that must put credentials into every process a scope
 //! starts — renewable ones, minted fresh for each spawn — supplies a
 //! [`SpawnEnv`]. [`crate::EnvHandle::with_spawn_env`] applies it to both ways a
-//! scope starts work: [`ExecEnv::spawn`], [`ExecEnv::spawn_text_stdio`] and
-//! [`ContainerRunner::run`].
+//! scope starts work: [`ExecEnv::spawn`] and [`ContainerRunner::run`].
 //! Everything else about the environment is the executor's, forwarded
 //! unchanged.
 
@@ -79,16 +78,6 @@ impl ExecEnv for LayeredExec {
             .apply(SpawnTarget::Process, &mut spec.env)
             .await?;
         self.inner.spawn(spec).await
-    }
-
-    async fn spawn_text_stdio(
-        &self,
-        mut spec: ProcessSpec,
-    ) -> Result<Box<dyn ProcessHandle>, EnvError> {
-        self.spawn_env
-            .apply(SpawnTarget::Process, &mut spec.env)
-            .await?;
-        self.inner.spawn_text_stdio(spec).await
     }
 
     fn workspace_path(&self) -> &str {
@@ -179,8 +168,7 @@ mod tests {
     /// Records the env of whatever it is asked to start, then refuses.
     #[derive(Default)]
     struct Recorder {
-        seen:       Mutex<Vec<BTreeMap<SmolStr, SmolStr>>>,
-        stdio_seen: Mutex<Vec<BTreeMap<SmolStr, SmolStr>>>,
+        seen: Mutex<Vec<BTreeMap<SmolStr, SmolStr>>>,
     }
 
     impl Recorder {
@@ -194,14 +182,6 @@ mod tests {
     impl ExecEnv for Recorder {
         async fn spawn(&self, spec: ProcessSpec) -> Result<Box<dyn ProcessHandle>, EnvError> {
             Err(self.record(spec.env))
-        }
-
-        async fn spawn_text_stdio(
-            &self,
-            spec: ProcessSpec,
-        ) -> Result<Box<dyn ProcessHandle>, EnvError> {
-            self.stdio_seen.lock().expect("stdio seen").push(spec.env);
-            Err(EnvError::backend("test", "stdio", "recorded"))
         }
 
         fn workspace_path(&self) -> &'static str {
@@ -296,12 +276,6 @@ mod tests {
             env(&[("STORE", "/tmp/store"), ("TOKEN", "own")]),
             env(&[("STORE", "/tmp/store"), ("TOKEN", "fresh")])
         ]);
-        let spec = ProcessSpec::new("agent", &[]).with_env(env(&[("TOKEN", "own")]));
-        assert!(layered.spawn_text_stdio(spec).await.is_err());
-        assert_eq!(*exec.stdio_seen.lock().expect("stdio seen"), [env(&[
-            ("STORE", "/tmp/store"),
-            ("TOKEN", "own")
-        ]),]);
 
         let containers = handle.container_runner().expect("runner");
         assert_eq!(containers.workspace_path(), "/mnt");

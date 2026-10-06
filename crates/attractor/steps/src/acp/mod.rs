@@ -186,7 +186,7 @@ impl Client {
     ) -> Result<Self, AcpError> {
         let program = spec.program.clone();
         let mut handle = env
-            .spawn_text_stdio(spec)
+            .spawn(spec)
             .await
             .map_err(|e| AcpError::ProcessExited(format!(": could not start `{program}`: {e}")))?;
         let stdin = handle
@@ -367,16 +367,6 @@ impl Client {
                 line,
             })
             .await;
-    }
-
-    /// A stdio facet delivers its stderr tail at exit, after the last prompt
-    /// has already returned. Keep those logs on successful shutdown too.
-    async fn drain_stderr(&mut self) {
-        while let Some(line) = self.lines.recv().await {
-            if line.stream == LogStream::Stderr {
-                self.log_stderr(line.line).await;
-            }
-        }
     }
 
     /// Record one ACP exchange on the progress channel as the backend
@@ -845,7 +835,6 @@ impl Client {
             let _ = self.handle.signal(Sig::Kill).await;
             let _ = self.handle.wait().await;
         }
-        let _ = time::timeout(grace, self.drain_stderr()).await;
         self.exited = true;
     }
 }
