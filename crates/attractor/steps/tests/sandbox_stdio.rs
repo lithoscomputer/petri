@@ -23,13 +23,21 @@ use sandbox_driver::{
 use serde_json::{Value, json};
 use steps::ProgressSender;
 use testkit::RunDir;
-use tokio::io::{AsyncBufReadExt as _, AsyncWriteExt as _, BufReader, duplex};
+use tokio::io::{AsyncBufReadExt as _, AsyncWriteExt as _, BufReader, DuplexStream, duplex};
 use tokio::sync::{Mutex as AsyncMutex, mpsc, watch};
 use tokio::task::JoinSet;
 use tokio::time::{self, timeout};
 use tokio_util::sync::CancellationToken;
 
 const BUDGET: Duration = Duration::from_secs(2);
+
+/// Writes one JSON-RPC message as a line of the peer's stdout.
+async fn send(output: &mut DuplexStream, message: &Value) {
+    output
+        .write_all(format!("{message}\n").as_bytes())
+        .await
+        .expect("write message");
+}
 
 #[derive(Clone, Copy)]
 enum Peer {
@@ -132,19 +140,13 @@ impl Exec for TextOnlySandbox {
                                 "content": { "type": "text", "text": "hello 世界" },
                             } },
                         });
-                        output
-                            .write_all(format!("{update}\n").as_bytes())
-                            .await
-                            .expect("update");
+                        send(&mut output, &update).await;
                         json!({ "stopReason": "end_turn" })
                     }
                     other => panic!("unexpected request: {other}"),
                 };
                 let response = json!({ "jsonrpc": "2.0", "id": request["id"], "result": result });
-                output
-                    .write_all(format!("{response}\n").as_bytes())
-                    .await
-                    .expect("response");
+                send(&mut output, &response).await;
             }
             let _ = outcome.send(Some((Termination::Cancelled, None)));
         });
@@ -435,35 +437,41 @@ async fn unexpected_acp_exit_reports_status_and_masks_the_stderr_tail() {
     fixture.close().await;
 }
 
-#[tokio::test]
-async fn stdio_deadline_and_dropped_handle_terminate_before_gate_drains() {
-    for deadline in [true, false] {
-        let (env, seen, fixture) = environment(Peer::Silent).await;
-        let mut spec = ProcessSpec::new("agent", &[]);
-        if deadline {
-            spec = spec.with_timeout(Some(Duration::from_millis(10)));
-        }
-        let mut process = env.spawn_text_stdio(spec).await.expect("stdio process");
-        // Keep both streams after dropping the owner: EOF on stdin must not
-        // be mistaken for the adapter requesting remote termination.
-        let stdin = process.stdin().expect("stdin");
-        let lines = process.lines().expect("lines");
-        if deadline {
-            let status = timeout(BUDGET, process.wait())
-                .await
-                .expect("wait deadline")
-                .expect("status");
-            assert!(status.timed_out);
-            assert_eq!(process.wait().await.expect("cached wait"), status);
-        }
-        drop(process);
-        fixture.close().await;
-        assert_eq!(seen.terminated.load(Ordering::SeqCst), 1);
-        assert_eq!(
-            seen.waits.load(Ordering::SeqCst),
-            1,
-            "termination preserves the pending wait"
-        );
-        drop((stdin, lines));
+/// Spawns a silent peer, optionally waits out `deadline`, drops the handle
+/// and closes the fixture, then checks the remote process was terminated once.
+async fn assert_terminated_before_gate_drains(deadline: Option<Duration>) {
+    let (env, seen, fixture) = environment(Peer::Silent).await;
+    let spec = ProcessSpec::new("agent", &[]).with_timeout(deadline);
+    let mut process = env.spawn_text_stdio(spec).await.expect("stdio process");
+    // Keep both streams after dropping the owner: EOF on stdin must not
+    // be mistaken for the adapter requesting remote termination.
+    let stdin = process.stdin().expect("stdin");
+    let lines = process.lines().expect("lines");
+    if deadline.is_some() {
+        let status = timeout(BUDGET, process.wait())
+            .await
+            .expect("wait deadline")
+            .expect("status");
+        assert!(status.timed_out);
+        assert_eq!(process.wait().await.expect("cached wait"), status);
     }
+    drop(process);
+    fixture.close().await;
+    assert_eq!(seen.terminated.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        seen.waits.load(Ordering::SeqCst),
+        1,
+        "termination preserves the pending wait"
+    );
+    drop((stdin, lines));
+}
+
+#[tokio::test]
+async fn stdio_deadline_terminates_before_gate_drains() {
+    assert_terminated_before_gate_drains(Some(Duration::from_millis(10))).await;
+}
+
+#[tokio::test]
+async fn dropped_stdio_handle_terminates_before_gate_drains() {
+    assert_terminated_before_gate_drains(None).await;
 }

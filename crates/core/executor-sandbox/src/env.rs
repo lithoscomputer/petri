@@ -304,6 +304,18 @@ fn facet_error(operation: &str, error: &DriverError) -> EnvError {
     EnvError::backend(BACKEND, operation, error.to_string())
 }
 
+/// The scope's env first, the spec's own on top.
+fn merged_env<'a>(
+    scope: &'a BTreeMap<SmolStr, SmolStr>,
+    own: &'a BTreeMap<SmolStr, SmolStr>,
+) -> impl Iterator<Item = (&'a str, &'a str)> {
+    scope
+        .iter()
+        .filter(|(key, _)| !own.contains_key(*key))
+        .chain(own)
+        .map(|(key, value)| (key.as_str(), value.as_str()))
+}
+
 impl SandboxEnv {
     async fn prepare_cwd(&self, spec: &ProcessSpec) -> Result<(), EnvError> {
         // `docker exec -w` refuses a directory that does not exist yet
@@ -345,13 +357,8 @@ impl ExecEnv for SandboxEnv {
         if let Some(cwd) = &spec.cwd {
             spawn = spawn.working_dir(cwd.to_string_lossy());
         }
-        for (key, value) in self
-            .env
-            .iter()
-            .filter(|(key, _)| !spec.env.contains_key(*key))
-            .chain(spec.env.iter())
-        {
-            spawn = spawn.env_var(key.as_str(), value.as_str());
+        for (key, value) in merged_env(&self.env, &spec.env) {
+            spawn = spawn.env_var(key, value);
         }
         let process = self
             .sandbox
@@ -389,13 +396,8 @@ impl ExecEnv for SandboxEnv {
         if let Some(dir) = working_dir {
             exec_spec = exec_spec.working_dir(dir);
         }
-        for (key, value) in self
-            .env
-            .iter()
-            .filter(|(key, _)| !spec.env.contains_key(*key))
-            .chain(spec.env.iter())
-        {
-            exec_spec = exec_spec.env_var(key.as_str(), value.as_str());
+        for (key, value) in merged_env(&self.env, &spec.env) {
+            exec_spec = exec_spec.env_var(key, value);
         }
         let stdin = matches!(spec.stdin, StdinMode::Piped);
         Ok(Box::new(spawn_streamed(
@@ -646,14 +648,8 @@ impl OneShotRunner {
             one_shot = one_shot.entrypoint(entrypoint.as_str());
         }
         one_shot = one_shot.args(spec.args.iter().map(SmolStr::as_str));
-        // The scope's env first, the spec's own on top.
-        for (key, value) in self
-            .env
-            .iter()
-            .filter(|(key, _)| !spec.env.contains_key(*key))
-            .chain(spec.env.iter())
-        {
-            one_shot = one_shot.env_var(key.as_str(), value.as_str());
+        for (key, value) in merged_env(&self.env, &spec.env) {
+            one_shot = one_shot.env_var(key, value);
         }
         if let Some(workdir) = spec.workdir {
             one_shot = one_shot.working_dir(workdir.as_str());

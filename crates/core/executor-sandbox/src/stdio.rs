@@ -53,10 +53,9 @@ pub(crate) fn adapt(
         let outcome = tokio::select! {
             (termination, code) = &mut waiting => Ok(env::exit_status(termination, code, None)),
             signal = async {
-                match stopping.wait_for(Option::is_some).await {
-                    Ok(signal) => signal.unwrap_or(Sig::Kill),
-                    Err(_) => Sig::Kill,
-                }
+                // A dropped handle closes the channel; it stops with a kill.
+                let requested = stopping.wait_for(Option::is_some).await.ok();
+                requested.and_then(|signal| *signal).unwrap_or(Sig::Kill)
             } => stop_process(&*handle, waiting.as_mut()).await.map(|()| ExitStatus::signalled(signal.number())),
             () = deadline => stop_process(&*handle, waiting.as_mut()).await
                 .map(|()| ExitStatus::timed_out(Sig::Kill.number())),
@@ -138,16 +137,16 @@ impl ProcessHandle for StdioHandle {
     }
 
     async fn wait(&mut self) -> Result<ExitStatus, EnvError> {
-        if self.cached.is_none() {
-            self.cached = Some(match (&mut self.worker).await {
-                Ok(outcome) => outcome,
-                Err(error) => Err(error.to_string()),
-            });
-        }
-        self.cached
-            .clone()
-            .ok_or(EnvError::Gone)?
-            .map_err(|message| EnvError::backend(BACKEND, "stdio", message))
+        let outcome = if let Some(outcome) = &self.cached {
+            outcome.clone()
+        } else {
+            let outcome = (&mut self.worker)
+                .await
+                .unwrap_or_else(|error| Err(error.to_string()));
+            self.cached = Some(outcome.clone());
+            outcome
+        };
+        outcome.map_err(|message| EnvError::backend(BACKEND, "stdio", message))
     }
 }
 
@@ -155,32 +154,30 @@ impl ProcessHandle for StdioHandle {
 /// Exclusive poll access needs no locking; the mutex supplies the Sync bound.
 struct TextWriter(Mutex<Pin<Box<dyn AsyncWrite + Send>>>);
 
+impl TextWriter {
+    fn inner(self: Pin<&mut Self>) -> Pin<&mut (dyn AsyncWrite + Send)> {
+        self.get_mut()
+            .0
+            .get_mut()
+            .unwrap_or_else(PoisonError::into_inner)
+            .as_mut()
+    }
+}
+
 impl AsyncWrite for TextWriter {
     fn poll_write(
-        mut self: Pin<&mut Self>,
+        self: Pin<&mut Self>,
         cx: &mut Context<'_>,
         bytes: &[u8],
     ) -> Poll<io::Result<usize>> {
-        self.0
-            .get_mut()
-            .unwrap_or_else(PoisonError::into_inner)
-            .as_mut()
-            .poll_write(cx, bytes)
+        self.inner().poll_write(cx, bytes)
     }
 
-    fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        self.0
-            .get_mut()
-            .unwrap_or_else(PoisonError::into_inner)
-            .as_mut()
-            .poll_flush(cx)
+    fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        self.inner().poll_flush(cx)
     }
 
-    fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        self.0
-            .get_mut()
-            .unwrap_or_else(PoisonError::into_inner)
-            .as_mut()
-            .poll_shutdown(cx)
+    fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        self.inner().poll_shutdown(cx)
     }
 }

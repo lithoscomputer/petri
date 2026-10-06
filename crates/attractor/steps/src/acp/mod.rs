@@ -61,7 +61,9 @@ use std::collections::{BTreeMap, VecDeque};
 use std::sync::Arc;
 use std::time::Duration;
 
-use executor::{LineStream, Masker, ProcessHandle, ProcessSpec, Sig, StdinWriter};
+use executor::{
+    EnvError, ExitStatus, LineStream, Masker, ProcessHandle, ProcessSpec, Sig, StdinWriter,
+};
 use ir::{Attempt, Control, FiringId, LogStream, ScopeId, StepEvent, Value};
 use lithos_llm::types::{Cost, CostSource, TokenCounts, Usage};
 use serde_json::json;
@@ -294,15 +296,7 @@ impl Client {
                 let detail = match time::timeout(self.exit_grace, self.handle.wait()).await {
                     Ok(outcome) => {
                         self.exited = true;
-                        match outcome {
-                            Err(error) => format!(": {error}"),
-                            Ok(status) if status.timed_out => ": process timed out".to_owned(),
-                            Ok(status) => match (status.code, status.signal) {
-                                (Some(code), _) => format!(": exit code {code}"),
-                                (_, Some(signal)) => format!(": signal {signal}"),
-                                _ => ": exit status unavailable".to_owned(),
-                            },
-                        }
+                        exit_detail(outcome)
                     }
                     Err(_) => ": stdout closed before the process exited".to_owned(),
                 };
@@ -853,6 +847,19 @@ impl Client {
         }
         let _ = time::timeout(grace, self.drain_stderr()).await;
         self.exited = true;
+    }
+}
+
+/// How the agent process ended, as a suffix for [`AcpError::ProcessExited`].
+fn exit_detail(outcome: Result<ExitStatus, EnvError>) -> String {
+    match outcome {
+        Err(error) => format!(": {error}"),
+        Ok(status) if status.timed_out => ": process timed out".to_owned(),
+        Ok(status) => match (status.code, status.signal) {
+            (Some(code), _) => format!(": exit code {code}"),
+            (_, Some(signal)) => format!(": signal {signal}"),
+            _ => ": exit status unavailable".to_owned(),
+        },
     }
 }
 
