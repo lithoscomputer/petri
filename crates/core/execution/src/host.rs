@@ -179,7 +179,7 @@ impl HostRun {
 pub fn policy_middleware(graph: &Graph) -> Vec<Arc<dyn Middleware>> {
     let mut chain: Vec<Arc<dyn Middleware>> = Vec::new();
     if let Some(limit) = graph.policy.loop_restart_signature_limit {
-        chain.push(Arc::new(CircuitBreaker::reference(limit)));
+        chain.push(Arc::new(CircuitBreaker::reference_for_graph(limit, graph)));
     }
     chain
 }

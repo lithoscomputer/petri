@@ -8,6 +8,13 @@ backend = "cargo:cargo-nextest"
 locked = "true"
 
 [[tools.rust]]
+version = "1.89.0"
+backend = "core:rust"
+
+[tools.rust.options]
+profile = "minimal"
+
+[[tools.rust]]
 version = "1.97.1"
 backend = "core:rust"
 
@@ -21,13 +28,6 @@ backend = "core:rust"
 
 [tools.rust.options]
 components = "rustfmt"
-profile = "minimal"
-
-[[tools.rust]]
-version = "1.89.0"
-backend = "core:rust"
-
-[tools.rust.options]
 profile = "minimal"
 
 [[tools.zizmor]]

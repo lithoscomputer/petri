@@ -22,8 +22,8 @@ use steps::{
 use tokio::io::AsyncWriteExt as _;
 
 use crate::blobs::{self, OutputStore};
-use crate::directive;
 use crate::outcome::{ExplicitRoutes, Stage};
+use crate::{directive, fork_context_tokens, fork_preamble_policy};
 
 /// The step kind id.
 pub const KIND: StepKindId = COMMAND_KIND;
@@ -98,7 +98,31 @@ impl Step for CommandStep {
     const NAME: &'static str = "attractor/command";
     type Config = CommandConfig;
 
-    async fn run(&self, config: CommandConfig, ctx: StepCtx) -> Outcome {
+    async fn run(&self, mut config: CommandConfig, ctx: StepCtx) -> Outcome {
+        let on_failure = config.on_failure;
+        let on_retries_exhausted = config.on_retries_exhausted;
+        let final_attempt = ctx.is_final_attempt();
+        let routes = config.explicit_routes.clone();
+        let kv = config.kv.clone();
+        let fail = |reason: String, class: &str| {
+            Stage::failed(reason, class, on_failure)
+                .with_routing(routes.clone(), kv.clone())
+                .with_retries(on_retries_exhausted, final_attempt)
+                .into_outcome(&config.node)
+        };
+        // fabro-e71b: the script's `{{ context.NAME }}` tokens resolve at
+        // dispatch, before the process spawns — against the run context
+        // WITHOUT the rendered-dedup (a command consumes data: a key some
+        // stage's output already rendered is still readable).
+        let policy = fork_preamble_policy::policy_for(&ctx, &config.node);
+        let script = match fork_context_tokens::resolve(
+            &config.script,
+            &fork_context_tokens::command_pairs(&config.kv, &policy),
+        ) {
+            Ok(script) => script,
+            Err(unresolved) => return fail(unresolved.to_string(), fork_context_tokens::CLASS),
+        };
+        config.script = script;
         match execute(config, ctx).await {
             Ok(outcome) => outcome,
             Err(failure) => failure.into(),

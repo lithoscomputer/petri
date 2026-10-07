@@ -9,6 +9,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use smol_str::SmolStr;
 
+use crate::fork_kv::is_tombstone;
 use crate::ids::{EdgeId, FiringId, Generation};
 use crate::splice::SpliceRequest;
 
@@ -545,14 +546,21 @@ impl RunContext {
         Arc::make_mut(&mut self.nodes).insert(name, record);
     }
 
-    /// Merge `context_updates`, last write winning. Called by the core only.
+    /// Merge `context_updates`, last write winning. A value that is the
+    /// fork's kv tombstone (`fork_kv::tombstone`, fabro-70af PART 2b)
+    /// removes the key instead of storing it — the `x.context_consume_keys`
+    /// removal path. Called by the core only.
     pub fn merge(&mut self, updates: &BTreeMap<SmolStr, Value>) {
         if updates.is_empty() {
             return;
         }
         let kv = Arc::make_mut(&mut self.kv);
         for (key, value) in updates {
-            kv.insert(key.clone(), value.clone());
+            if is_tombstone(value) {
+                kv.remove(key);
+            } else {
+                kv.insert(key.clone(), value.clone());
+            }
         }
     }
 
@@ -566,11 +574,13 @@ impl RunContext {
         )
     }
 
-    /// The `kv` map as expressions see it.
+    /// The `kv` map as expressions see it. A tombstone marker never shows:
+    /// merge removes them, and this hides one that slipped past.
     pub fn kv_value(&self) -> Value {
         Value::Object(
             self.kv
                 .iter()
+                .filter(|(_, value)| !is_tombstone(value))
                 .map(|(key, value)| (key.to_string(), value.clone()))
                 .collect(),
         )

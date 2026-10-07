@@ -525,6 +525,49 @@ script = "echo never >> hooks.log"
     assert_eq!(ctx["handler_type"], "agent");
 }
 
+/// A host hook's context is also a file (fabro-b714): `FABRO_HOOK_CONTEXT`
+/// names a readable copy of the stdin payload — the same contract the
+/// sandbox placement offers — and the copy is removed when the command
+/// ends.
+#[tokio::test]
+async fn a_host_hook_reads_its_context_from_the_file_too() {
+    let dir = RunDir::new("host-hook-context-file");
+    let ws = workspace(&dir);
+    fs::create_dir_all(&ws).expect("workspace");
+    let toml = r#"
+[[run.hooks]]
+event = "run_start"
+script = "test -s \"$FABRO_HOOK_CONTEXT\" && grep -q '\"event\":\"run_start\"' \"$FABRO_HOOK_CONTEXT\" && cp \"$FABRO_HOOK_CONTEXT\" seen.json && printf '%s' \"$FABRO_HOOK_CONTEXT\" > ctx-path.txt"
+sandbox = false
+"#;
+    let graph = lower(
+        r#"digraph W {
+        start [shape=Mdiamond]
+        exit [shape=Msquare]
+        prepare [shape=parallelogram, script="echo prepared"]
+        start -> prepare -> exit
+    }"#,
+        toml,
+    );
+    let (report, customs) = run_with_stub_agents(&dir, graph).await;
+    assert_eq!(
+        report.status,
+        RunStatus::Success,
+        "{:?}\nnotes: {:#?}",
+        report.state.errors(),
+        customs.hook_notes()
+    );
+    let seen = read(&ws.join("seen.json"));
+    assert!(seen.contains("\"event\":\"run_start\""), "{seen}");
+    let path = read(&ws.join("ctx-path.txt"));
+    let path = path.trim();
+    assert!(!path.is_empty(), "the hook recorded its context path");
+    assert!(
+        !Path::new(path).exists(),
+        "the copy is removed after the hook: {path}"
+    );
+}
+
 /// Fabro's exit-code rule and the decision points: a `stage_start` skip
 /// skips the node, a block fails it and the run; a nonblocking post hook's
 /// decision is ignored; a `blocking = false` override on a decision point is

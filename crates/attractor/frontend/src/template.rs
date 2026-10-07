@@ -154,6 +154,83 @@ pub struct Includes<'a> {
     pub base_dir: String,
 }
 
+/// The sentinel pair a masked `{{ context.NAME }}` token travels as
+/// through the MiniJinja render (fabro-e71b): private-use characters
+/// MiniJinja treats as plain text. Stage dispatch (`attractor/steps`
+/// `fork_context_tokens`) restores and resolves them.
+const CONTEXT_OPEN: char = '\u{E00B}';
+const CONTEXT_CLOSE: char = '\u{E00C}';
+
+/// Mask every `{{ context.NAME }}` token in `text` behind the sentinels, so
+/// the MiniJinja pass leaves it verbatim instead of refusing it as an
+/// unbound name (fabro-e71b: the token resolves at stage dispatch, against
+/// the run context — lowering has none).
+fn mask_context_tokens(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut rest = text;
+    while let Some(start) = rest.find("{{") {
+        let after = &rest[start + 2..];
+        let Some(end) = after.find("}}") else {
+            out.push_str(rest);
+            return out;
+        };
+        let token = after[..end].trim();
+        if let Some(name) = token.strip_prefix("context.") {
+            let first = name
+                .chars()
+                .next()
+                .is_some_and(|c| c.is_ascii_alphanumeric() || c == '_');
+            let rest_ok = name
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '.' | '-'));
+            if first && rest_ok {
+                out.push_str(&rest[..start]);
+                out.push(CONTEXT_OPEN);
+                out.push_str(name);
+                out.push(CONTEXT_CLOSE);
+                rest = &after[end + 2..];
+                continue;
+            }
+        }
+        out.push_str(&rest[..start + 2]);
+        rest = &rest[start + 2..];
+    }
+    out.push_str(rest);
+    out
+}
+
+/// Restore what [`mask_context_tokens`] masked. A sentinel without its
+/// partner — a literal private-use character the author wrote — stays as
+/// it is.
+fn restore_context_tokens(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut chars = text.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c != CONTEXT_OPEN {
+            out.push(c);
+            continue;
+        }
+        let mut name = String::new();
+        loop {
+            match chars.next() {
+                Some(CONTEXT_CLOSE) => {
+                    out.push_str("{{ context.");
+                    out.push_str(name.as_str());
+                    out.push_str(" }}");
+                    break;
+                }
+                Some(c) => name.push(c),
+                None => {
+                    out.push(CONTEXT_OPEN);
+                    out.push_str(&name);
+                    return out;
+                }
+            }
+        }
+    }
+    out
+}
+
 /// Render a prompt-like text with MiniJinja, strict about unbound names.
 pub fn render(text: &str, ctx: &Context) -> Result<String, TemplateError> {
     render_with(text, ctx, None)
@@ -165,8 +242,11 @@ pub fn render_with(
     ctx: &Context,
     includes: Option<Includes<'_>>,
 ) -> Result<String, TemplateError> {
+    // fabro-e71b: `{{ context.NAME }}` survives lowering verbatim, masked
+    // for the MiniJinja pass and restored on the way out.
+    let text = &mask_context_tokens(text);
     if !text.contains("{{") && !text.contains("{%") && !text.contains("{#") {
-        return Ok(text.to_string());
+        return Ok(restore_context_tokens(text));
     }
     let mut env = Environment::new();
     env.set_undefined_behavior(UndefinedBehavior::Strict);
@@ -199,7 +279,7 @@ pub fn render_with(
         env.set_path_join_callback(|name, parent| Cow::Owned(join_template_path(name, parent)));
         env.set_loader(move |name| Ok(cache.get(name).cloned().flatten()));
     }
-    env.add_template_owned(root_name.clone(), text.to_string())
+    env.add_template_owned(root_name.clone(), text.clone())
         .map_err(|e| TemplateError::Syntax(e.to_string()))?;
     let template = env
         .get_template(&root_name)
@@ -209,28 +289,31 @@ pub fn render_with(
     // analysis, and renders fine). The analysis only names the missing input
     // afterwards, since MiniJinja's own undefined error does not say which
     // name it was; an input or var comes before a template-local name.
-    template.render(ctx.value()).map_err(|e| match e.kind() {
-        minijinja::ErrorKind::UndefinedError => {
-            let mut unbound: Vec<String> = template
-                .undeclared_variables(true)
-                .into_iter()
-                .filter(|name| !ctx.binds(name))
-                .collect();
-            unbound.sort_by_key(|name| {
-                let input =
-                    name.starts_with("inputs.") || name.starts_with("vars.") || name == "goal";
-                (!input, name.clone())
-            });
-            TemplateError::Unbound {
-                name: unbound
+    template
+        .render(ctx.value())
+        .map(|rendered| restore_context_tokens(&rendered))
+        .map_err(|e| match e.kind() {
+            minijinja::ErrorKind::UndefinedError => {
+                let mut unbound: Vec<String> = template
+                    .undeclared_variables(true)
                     .into_iter()
-                    .next()
-                    .or_else(|| undefined_name(&e))
-                    .unwrap_or_else(|| "?".into()),
+                    .filter(|name| !ctx.binds(name))
+                    .collect();
+                unbound.sort_by_key(|name| {
+                    let input =
+                        name.starts_with("inputs.") || name.starts_with("vars.") || name == "goal";
+                    (!input, name.clone())
+                });
+                TemplateError::Unbound {
+                    name: unbound
+                        .into_iter()
+                        .next()
+                        .or_else(|| undefined_name(&e))
+                        .unwrap_or_else(|| "?".into()),
+                }
             }
-        }
-        _ => TemplateError::Render(e.to_string()),
-    })
+            _ => TemplateError::Render(e.to_string()),
+        })
 }
 
 fn join(base: &str, name: &str) -> String {
@@ -381,6 +464,56 @@ mod tests {
                 .expect_err("syntax")
                 .to_string()
                 .contains("syntax")
+        );
+    }
+
+    /// fabro-e71b: a `{{ context.NAME }}` token survives the prompt render
+    /// verbatim, masked behind the sentinels for the MiniJinja pass —
+    /// it resolves at stage dispatch, against the run context.
+    #[test]
+    fn a_context_token_survives_the_prompt_render_verbatim() {
+        assert_eq!(
+            render(
+                "goal {{ goal }} then {{ context.seed_id }} and {{ inputs.mode }}",
+                &ctx()
+            )
+            .expect("renders"),
+            "goal Ship it then {{ context.seed_id }} and fast"
+        );
+    }
+
+    /// The mask survives template constructs: a token inside a control
+    /// block still comes back verbatim, and an unbound name beside a
+    /// masked token still fails strictly.
+    #[test]
+    fn a_context_token_survives_inside_control_structures() {
+        assert_eq!(
+            render(
+                "{% if inputs.mode == \"fast\" %}{{ context.k }}{% endif %}",
+                &ctx()
+            )
+            .expect("renders"),
+            "{{ context.k }}"
+        );
+        let error = render("{{ inputs.nope }} {{ context.k }}", &ctx()).expect_err("unbound");
+        assert_eq!(error, TemplateError::Unbound {
+            name: "inputs.nope".into(),
+        });
+    }
+
+    /// fabro-e71b: a script's context token stays verbatim at lowering —
+    /// `render_script` only interpolates `inputs.`/`vars.`/`goal`; the
+    /// stage dispatch pass resolves the context namespace.
+    #[test]
+    fn a_context_token_stays_verbatim_in_scripts() {
+        assert_eq!(
+            render_script(
+                "run --seed {{ context.seed_id }} --mode {{ inputs.mode }}",
+                "shell",
+                &ctx()
+            )
+            .expect("renders"),
+            "run --seed {{ context.seed_id }} --mode fast"
         );
     }
 

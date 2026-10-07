@@ -126,6 +126,20 @@ impl<D> Next<'_, D> {
     pub async fn run(&self) -> Result<D, MiddlewareError> {
         (self.call)().await
     }
+
+    /// A next that returns one fixed decision — the seam a middleware
+    /// test drives a layer over, as the coordinator's inner chain would.
+    #[cfg(test)]
+    pub(crate) fn from_decision(decision: Result<D, MiddlewareError>) -> Self
+    where
+        D: Clone + Send + Sync + 'static,
+    {
+        use std::future::ready;
+
+        Self {
+            call: Box::new(move || Box::pin(ready(decision.clone()))),
+        }
+    }
 }
 
 pub type AdmitNext<'a> = Next<'a, Admission>;

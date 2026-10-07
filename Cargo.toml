@@ -166,3 +166,11 @@ thiserror = "2"
 tracing = "0.1"
 # `env-filter` is not a default feature. Only `petri-cli` may depend on this.
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+
+# The pebble fork carries the skill-expansion source fix (a person's typed
+# turn expands, harness-synthesized input passes through - fabro-3fce) until
+# upstream wires `is_prompt_source` itself.
+[patch."https://github.com/lithoscomputer/pebble.git"]
+pebble-coding-agent = { git = "https://github.com/denkhaus/pebble", branch = "fabro" }
+pebble-agent = { git = "https://github.com/denkhaus/pebble", branch = "fabro" }

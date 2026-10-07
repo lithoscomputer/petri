@@ -68,7 +68,7 @@ use pebble_coding_agent::extensions::Redactor;
 use pebble_coding_agent::steering::{DroppedSteer, SteeringBus};
 use pebble_coding_agent::{
     CodingAgent, CodingAgentBuilder, CodingAgentExport, CodingAgentOptions, CodingInput,
-    MemoryDiscovery, PromptReport, ShutdownReason, SteeringMessage,
+    InputSource, MemoryDiscovery, PromptReport, ShutdownReason, SteeringMessage,
 };
 use questions::AgentQuestions;
 use serde_json::json;
@@ -447,9 +447,11 @@ impl NativeSession {
         let cancel = self.cancel.clone();
         let kill = self.kill.clone();
         let report = {
-            let prompt = self
-                .agent
-                .prompt_with_cancellation(CodingInput::text(prompt), &cancel);
+            // The assembled stage prompt is harness-synthesized, never typed:
+            // its paths hold slash-prefixed words of their own, which pebble's
+            // skill-reference expansion must leave alone.
+            let input = CodingInput::text(prompt).with_source(InputSource::Agent);
+            let prompt = self.agent.prompt_with_cancellation(input, &cancel);
             tokio::pin!(prompt);
             let mut closed = false;
             // A plain interrupt parked the prompt: the next delivered text

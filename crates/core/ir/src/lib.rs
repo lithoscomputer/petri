@@ -18,6 +18,7 @@ mod desugar;
 mod digest;
 pub mod expr;
 mod flow;
+pub mod fork_kv;
 mod graph;
 mod ids;
 pub mod placeholder;

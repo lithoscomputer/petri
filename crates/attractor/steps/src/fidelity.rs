@@ -20,6 +20,7 @@ use frontend_attractor::kinds::GOAL_CHECK_NODE;
 use ir::Value;
 use serde::Deserialize;
 
+use crate::fork_preamble_policy::PreamblePolicy;
 use crate::outcome::fabro_outcome;
 
 /// The compact and medium preambles keep this many trailing lines of a
@@ -150,6 +151,9 @@ pub struct Preamble<'a> {
     pub nodes:  &'a Value,
     /// The run context's `kv`.
     pub kv:     &'a Value,
+    /// The node's fork preamble policy (fabro-70af PART 2b): `None` is the
+    /// no-op default, exactly the rendering without a policy.
+    pub policy: Option<&'a PreamblePolicy>,
 }
 
 /// One completed stage, as the preamble renders it.
@@ -181,15 +185,20 @@ enum Detail {
 }
 
 impl Preamble<'_> {
-    /// The preamble for `fidelity`. Empty for `full`.
+    /// The preamble for `fidelity`. Empty for `full`. The fork's preamble
+    /// budget (`x.preamble_budget_kb`, fabro-70af PART 2b) caps the result.
     pub fn render(&self, fidelity: Fidelity) -> String {
-        match fidelity {
+        let rendered = match fidelity {
             Fidelity::Full => String::new(),
             Fidelity::Truncate => format!("Goal: {}\nRun ID: {}\n", self.goal, self.run_id),
             Fidelity::Compact => self.compact(),
             Fidelity::SummaryLow => self.summary_low(),
             Fidelity::SummaryMedium => self.summary_medium(),
             Fidelity::SummaryHigh => self.summary_high(),
+        };
+        match self.policy {
+            Some(policy) => policy.enforce_budget(rendered),
+            None => rendered,
         }
     }
 
@@ -204,30 +213,50 @@ impl Preamble<'_> {
         }
     }
 
-    /// The completed stages, in declaration order then by name.
+    /// The output-block line ceiling for this preamble: the policy's
+    /// `x.preamble_output_max_lines`, else the fidelity default.
+    fn output_cap(&self, default: usize) -> usize {
+        self.policy
+            .map_or(default, |policy| policy.output_line_cap(default))
+    }
+
+    /// The completed stages, in declaration order then by name. The fork's
+    /// policy (fabro-70af PART 2b) hides `stages_ignore` stages and, under
+    /// `stages_latest_only`, collapses repeated firings to the latest.
     fn completed(&self) -> Vec<Completed<'_>> {
         let Value::Object(nodes) = self.nodes else {
             return Vec::new();
         };
         let mut seen = BTreeSet::new();
-        let mut out = Vec::new();
+        let mut candidates: Vec<(&str, Option<&StageInfo>, &Value)> = Vec::new();
         for stage in self.stages {
             if let Some(record) = nodes.get(&stage.id) {
                 seen.insert(stage.id.as_str());
-                if let Some(completed) = completed_stage(&stage.id, Some(stage), record) {
-                    out.push(completed);
-                }
+                candidates.push((&stage.id, Some(stage), record));
             }
         }
         for (name, record) in nodes {
             if seen.contains(name.as_str()) {
                 continue;
             }
-            if let Some(completed) = completed_stage(name, None, record) {
-                out.push(completed);
-            }
+            candidates.push((name.as_str(), None, record));
         }
-        out
+        let drops = self
+            .policy
+            .filter(|policy| policy.stages_latest_only)
+            .map(|policy| {
+                let ids = candidates.iter().map(|(id, _, _)| *id).collect::<Vec<_>>();
+                policy.latest_only_drops(&ids)
+            })
+            .unwrap_or_default();
+        candidates
+            .into_iter()
+            .filter(|(id, _, _)| {
+                self.policy.is_none_or(|policy| policy.stage_visible(id))
+                    && !drops.contains_key(*id)
+            })
+            .filter_map(|(id, info, record)| completed_stage(id, info, record))
+            .collect()
     }
 
     fn compact(&self) -> String {
@@ -237,7 +266,11 @@ impl Preamble<'_> {
             parts.push("\n## Completed stages".to_owned());
             for stage in &completed {
                 parts.push(format!("- **{}**: {}", stage.id, stage.status));
-                parts.extend(stage.details(Detail::Compact, "  "));
+                parts.extend(stage.details(
+                    Detail::Compact,
+                    "  ",
+                    self.output_cap(COMPACT_OUTPUT_MAX_LINES),
+                ));
             }
         }
         parts.extend(self.context_list(&completed));
@@ -264,7 +297,11 @@ impl Preamble<'_> {
         for stage in &completed {
             parts.push(format!("\n## Stage: {}", stage.id));
             parts.push(format!("- Status: {}", stage.status));
-            parts.extend(stage.details(Detail::High, ""));
+            parts.extend(stage.details(
+                Detail::High,
+                "",
+                self.output_cap(SUMMARY_HIGH_OUTPUT_MAX_LINES),
+            ));
         }
         let rows = self.context_rows(&completed);
         if !rows.is_empty() {
@@ -290,7 +327,11 @@ impl Preamble<'_> {
         let start = completed.len().saturating_sub(SUMMARY_MEDIUM_STAGES);
         for stage in &completed[start..] {
             parts.push(stage.line());
-            parts.extend(stage.details(Detail::Compact, "  "));
+            parts.extend(stage.details(
+                Detail::Compact,
+                "  ",
+                self.output_cap(COMPACT_OUTPUT_MAX_LINES),
+            ));
         }
         parts.extend(self.context_list(&completed));
         parts.push(String::new());
@@ -303,7 +344,11 @@ impl Preamble<'_> {
         let start = completed.len().saturating_sub(SUMMARY_LOW_STAGES);
         for stage in &completed[start..] {
             parts.push(stage.line());
-            parts.extend(stage.details(Detail::Low, "  "));
+            parts.extend(stage.details(
+                Detail::Low,
+                "  ",
+                self.output_cap(SUMMARY_HIGH_OUTPUT_MAX_LINES),
+            ));
         }
         parts.push(String::new());
         parts.join("\n")
@@ -338,6 +383,32 @@ impl Preamble<'_> {
         parts
     }
 
+    /// The node's visible context projection with raw values (fabro-e71b):
+    /// the same keys the `## Context` rows show — public, non-blank,
+    /// policy-allowed, not already rendered by a completed stage's output.
+    /// The stage-time `{{ context.NAME }}` pass resolves against exactly
+    /// this set, so a token can read what `## Context` shows and nothing
+    /// more.
+    pub(crate) fn context_pairs(&self) -> Vec<(String, Value)> {
+        let completed = self.completed();
+        let rendered: BTreeSet<&str> = completed
+            .iter()
+            .flat_map(|stage| stage.rendered.iter().map(String::as_str))
+            .collect();
+        let Value::Object(kv) = self.kv else {
+            return Vec::new();
+        };
+        kv.iter()
+            .filter(|(key, value)| {
+                !is_hidden_key(key)
+                    && !rendered.contains(key.as_str())
+                    && !is_blank(value)
+                    && self.policy.is_none_or(|policy| policy.context_visible(key))
+            })
+            .map(|(key, value)| (key.clone(), value.clone()))
+            .collect()
+    }
+
     fn context_rows(&self, completed: &[Completed<'_>]) -> Vec<(String, String)> {
         let Value::Object(kv) = self.kv else {
             return Vec::new();
@@ -348,7 +419,10 @@ impl Preamble<'_> {
             .collect();
         kv.iter()
             .filter(|(key, value)| {
-                !is_hidden_key(key) && !rendered.contains(key.as_str()) && !is_blank(value)
+                !is_hidden_key(key)
+                    && !rendered.contains(key.as_str())
+                    && !is_blank(value)
+                    && self.policy.is_none_or(|policy| policy.context_visible(key))
             })
             .map(|(key, value)| (key.clone(), render_value(value)))
             .collect()
@@ -440,7 +514,7 @@ impl Completed<'_> {
 
     /// The bullet lines under the stage's heading, each prefixed with
     /// `indent`.
-    fn details(&self, detail: Detail, indent: &str) -> Vec<String> {
+    fn details(&self, detail: Detail, indent: &str, max_lines: usize) -> Vec<String> {
         let handler = self.kind.map(|kind| format!("{indent}- Handler: {kind}"));
         let script = self
             .script
@@ -454,7 +528,7 @@ impl Completed<'_> {
             Detail::Compact => match self.kind {
                 Some("command") => {
                     parts.extend(script);
-                    parts.extend(self.output_block(COMPACT_OUTPUT_MAX_LINES, indent));
+                    parts.extend(self.output_block(max_lines, indent));
                 }
                 Some("agent" | "prompt") => parts.extend(model),
                 _ => {}
@@ -467,7 +541,7 @@ impl Completed<'_> {
             Detail::High => {
                 parts.extend(handler);
                 parts.extend(script);
-                parts.extend(self.output_block(SUMMARY_HIGH_OUTPUT_MAX_LINES, indent));
+                parts.extend(self.output_block(max_lines, indent));
                 parts.extend(model);
                 if let Some(text) = &self.text {
                     parts.push(format!("{indent}- Response:"));
@@ -528,7 +602,7 @@ fn tail_lines(text: &str, max: usize, indent: &str) -> String {
 
 /// A context value as the preamble shows it: a string as written, anything
 /// else as JSON, bounded to [`INLINE_VALUE_MAX`].
-fn render_value(value: &Value) -> String {
+pub(crate) fn render_value(value: &Value) -> String {
     let text = match value {
         Value::String(text) => text.clone(),
         other => other.to_string(),
@@ -549,7 +623,7 @@ fn bounded(text: &str) -> String {
 
 /// Keys Fabro keeps out of preambles: engine state, graph mirrors, thread
 /// bookkeeping, and the keys a stage's own output already shows.
-fn is_hidden_key(key: &str) -> bool {
+pub(crate) fn is_hidden_key(key: &str) -> bool {
     key.starts_with("internal.")
         || key.starts_with("graph.")
         || key.starts_with("thread.")
@@ -561,7 +635,7 @@ fn is_hidden_key(key: &str) -> bool {
         )
 }
 
-fn is_blank(value: &Value) -> bool {
+pub(crate) fn is_blank(value: &Value) -> bool {
     match value {
         Value::Null => true,
         Value::String(text) => text.trim().is_empty(),
@@ -614,6 +688,7 @@ mod tests {
             stages,
             nodes,
             kv,
+            policy: None,
         }
     }
 

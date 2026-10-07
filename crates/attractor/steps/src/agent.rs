@@ -42,16 +42,17 @@ use steps::{Step, StepCtx};
 
 use crate::acp::{AgentCommand, EnvValue};
 use crate::blobs::{self, OutputStore};
-use crate::compaction;
 use crate::contract::{Contract, Parsed, repair_message, validate};
 use crate::fallback::{self, FrozenPlan, Plan, Route, StageRequest};
 use crate::fidelity::{
     self, Fidelity, Incoming, Preamble, Resolved, Source, StageInfo, ThreadConfig,
 };
+use crate::fork_preamble_policy::{self, PreamblePolicy};
 use crate::outcome::{ExplicitRoutes, Stage};
 use crate::pebble::{PebbleClient, Resume};
 use crate::sessions::{Retained, SessionService};
 use crate::stage::{self, RunInfo};
+use crate::{compaction, fork_context_tokens};
 
 pub const KIND: StepKindId = AGENT_KIND;
 
@@ -233,9 +234,16 @@ impl AgentConfig {
         )
     }
 
-    /// The prompt as the agent receives it: the preamble for `fidelity`,
+    /// The prompt as the agent receives it: the preamble for `fidelity`
+    /// (shaped by the node's fork preamble policy, fabro-70af PART 2b),
     /// the node's prompt, the contract.
-    pub fn assemble(&self, fidelity: Fidelity, run_id: &str, contract: &Contract) -> String {
+    pub fn assemble(
+        &self,
+        fidelity: Fidelity,
+        run_id: &str,
+        contract: &Contract,
+        policy: Option<&PreamblePolicy>,
+    ) -> Result<String, String> {
         let stages: Vec<StageInfo> = fidelity::stages(&self.stages);
         let preamble = Preamble {
             goal: &self.goal,
@@ -243,6 +251,7 @@ impl AgentConfig {
             stages: &stages,
             nodes: &self.nodes,
             kv: &self.kv,
+            policy,
         };
         let mut body = self.prompt.clone();
         if let Some(item) = self.item_data.as_deref().filter(|item| !item.is_empty()) {
@@ -253,7 +262,11 @@ impl AgentConfig {
         }
         let mut out = preamble.prompt(fidelity, &body);
         out.push_str(&contract.prompt_suffix());
-        out
+        // fabro-e71b: the second, narrow pass over the assembled prompt —
+        // `{{ context.NAME }}` resolves against the node's visible context
+        // projection, strictly.
+        fork_context_tokens::resolve(&out, &preamble.context_pairs())
+            .map_err(|unresolved| unresolved.to_string())
     }
 
     /// The `provider/model` selector a native session runs on.
@@ -515,7 +528,15 @@ async fn run_session(
     session: &mut Session,
     turn_count: &mut u64,
 ) -> Result<Stage, AgentError> {
-    let mut prompt = config.assemble(fidelity, run_id, contract);
+    // The node's preamble policy (fabro-70af PART 2b): the host's source
+    // shapes the preamble, and its consume-keys tombstone the inputs this
+    // stage consumed once it records.
+    let policy = fork_preamble_policy::policy_for(ctx, &config.node);
+    let mut prompt = config
+        .assemble(fidelity, run_id, contract, Some(&policy))
+        // fabro-e71b: strict resolution — a typo names the token and the
+        // visible keys instead of rendering empty.
+        .map_err(|message| AgentError::failed(fork_context_tokens::CLASS, message))?;
     let mut repairs = 0_u64;
     // Each turn is marked live for the control service while it runs, so a
     // host's interrupt finds it; a driver built outside the coordinator has
@@ -567,6 +588,7 @@ async fn run_session(
     };
 
     let mut stage = Stage::new(StageOutcome::Succeeded, config.on_failure);
+    fork_preamble_policy::consume_tombstones(&policy, &mut stage.context_updates);
     stage.output.insert("text".into(), json!(text));
     stage.output.insert("turns".into(), json!(turn_count));
     stage.context_updates.insert(
@@ -583,11 +605,39 @@ async fn run_session(
         .insert(SmolStr::new("last_stage"), json!(config.node));
     match outcome {
         Parsed::Directive(directive) => directive.apply_to(&mut stage),
+        // Fabro's schema contracts promise routing-kind context_updates
+        // semantics: a top-level `context_updates` object inside the
+        // validated response reaches the run context exactly like a
+        // routing directive's does, so later stages can read the keys
+        // through `stdin_source`/kv. Without this spread, a schema'd
+        // stage's updates stay buried under `output.<node>` and every
+        // downstream reader resolves them as missing.
         Parsed::Structured(value) => {
             stage.output.insert("structured".into(), value.clone());
-            stage
-                .context_updates
-                .insert(SmolStr::new(format!("output.{}", config.node)), value);
+            stage.context_updates.insert(
+                SmolStr::new(format!("output.{}", config.node)),
+                value.clone(),
+            );
+            if let Some(updates) = value.get("context_updates").and_then(Value::as_object) {
+                for (key, item) in updates {
+                    stage
+                        .context_updates
+                        .insert(SmolStr::new(key.clone()), item.clone());
+                }
+            }
+            // The routing contract survives the schema contract: routing fields
+            // the directive kind applies, a schema response carries too (Fabro's
+            // schema files document "keeps the routing contract" — required routing
+            // fields, label enums). Without this extraction every conditional edge
+            // on preferred_label falls through to the catch-all under a schema.
+            if let Some(label) = value.get("preferred_next_label").and_then(Value::as_str) {
+                stage.output.insert("preferred_label".into(), json!(label));
+            }
+            if let Some(ids) = value.get("suggested_next_ids") {
+                stage
+                    .output
+                    .insert("suggested_next_ids".into(), ids.clone());
+            }
         }
         Parsed::Plain => {}
     }
