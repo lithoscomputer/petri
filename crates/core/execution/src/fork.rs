@@ -123,10 +123,7 @@ pub async fn fork_from(
             owner: OwnerId::mint(),
         })
         .await?;
-    let required_finalization = rt
-        .installed_hooks()
-        .is_some_and(|hooks| hooks.requires_run_finalization());
-    write_fork(&*logs, source, &plan, key, required_finalization).await
+    write_fork(&*logs, source, &plan, key, rt.requires_run_finalization()).await
 }
 
 /// Everything the fork copies, decided before the new run is created.

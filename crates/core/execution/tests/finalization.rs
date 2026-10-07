@@ -9,8 +9,8 @@ use execution::controls::ControlService;
 use execution::events::replay_run;
 use execution::inspect::inspect_run;
 use execution::{
-    Coordinator, CoordinatorError, CoordinatorEvent, CoordinatorOptions, CoordinatorState,
-    InvocationId, StateError, read_coordinator_log,
+    Coordinator, CoordinatorError, CoordinatorEvent, CoordinatorOptions, CoordinatorRecord,
+    CoordinatorState, GraphDigest, InvocationId, StateError, read_coordinator_log,
 };
 use ir::{FinalizationFailure, GraphBuilder, Outcome, RunStatus, ScopeId, StepRef};
 use runtime::{RunOptions, Runtime};
@@ -95,6 +95,60 @@ impl Step for ResultStep {
     }
 }
 
+/// A coordinator for a new run of `graph`, and the graph's digest.
+async fn start(
+    runtime: &Runtime,
+    directory: &RunDir,
+    graph: GraphBuilder,
+) -> (Coordinator, GraphDigest) {
+    let mut coordinator = Coordinator::create(
+        runtime.prepare_run(directory.path()),
+        Vec::new(),
+        CoordinatorOptions::default(),
+    )
+    .await
+    .expect("create");
+    let digest = coordinator
+        .register_graph(&graph.build())
+        .await
+        .expect("register");
+    (coordinator, digest)
+}
+
+/// A committed run's state refuses a second end, and the state before it
+/// refuses an end that does not match execution and finalization.
+fn assert_run_finish_is_validated(
+    records: &[CoordinatorRecord],
+    committed: &CoordinatorState,
+    expected: RunStatus,
+    failure: Option<FinalizationFailure>,
+) {
+    let mut before_finish =
+        CoordinatorState::replay(&records[..records.len() - 1]).expect("replay before completion");
+    let unchanged = before_finish.clone();
+    assert_eq!(
+        before_finish.apply(&CoordinatorEvent::RunFinished {
+            status:               if expected == RunStatus::Success {
+                RunStatus::Failed
+            } else {
+                RunStatus::Success
+            },
+            finalization_failure: failure,
+        }),
+        Err(StateError::RunStatusMismatch)
+    );
+    assert_eq!(before_finish, unchanged);
+    let mut immutable = committed.clone();
+    assert_eq!(
+        immutable.apply(&CoordinatorEvent::RunFinished {
+            status:               RunStatus::Success,
+            finalization_failure: None,
+        }),
+        Err(StateError::DuplicateRunFinish)
+    );
+    assert_eq!(&immutable, committed);
+}
+
 async fn complete(execution_status: RunStatus, failure: Option<FinalizationFailure>) {
     let directory = RunDir::new("required-finalization");
     let hooks = Arc::new(Finalizer::new(failure.clone()));
@@ -104,13 +158,6 @@ async fn complete(execution_status: RunStatus, failure: Option<FinalizationFailu
         .step(ResultStep)
         .hooks(ControlService::new().hooks(Some(hooks.clone())))
         .options(RunOptions::new(directory.path()));
-    let mut coordinator = Coordinator::create(
-        runtime.prepare_run(directory.path()),
-        Vec::new(),
-        CoordinatorOptions::default(),
-    )
-    .await
-    .expect("create");
     let mut graph = GraphBuilder::new();
     graph.add_node(
         "result",
@@ -120,10 +167,7 @@ async fn complete(execution_status: RunStatus, failure: Option<FinalizationFailu
             serde_json::to_value(execution_status).expect("status encodes"),
         ),
     );
-    let digest = coordinator
-        .register_graph(&graph.build())
-        .await
-        .expect("register");
+    let (mut coordinator, digest) = start(&runtime, &directory, graph).await;
     let logs = coordinator.store().logs().clone();
     let handle = coordinator.handle();
     let mut running = Box::pin(coordinator.run_root(digest, BTreeMap::new()));
@@ -162,7 +206,6 @@ async fn complete(execution_status: RunStatus, failure: Option<FinalizationFailu
     let expected = ir::finalized_status(execution_status, failure.as_ref());
     let report = coordinator.take_root_report().expect("report");
     assert_eq!(report.status, expected);
-    assert_eq!(report.execution_status, execution_status);
     assert_eq!(report.finalization_failure, failure);
     assert_eq!(report.state.folded_status(), execution_status);
     assert_eq!(hooks.observations.load(Ordering::SeqCst), 1);
@@ -194,30 +237,7 @@ async fn complete(execution_status: RunStatus, failure: Option<FinalizationFailu
     assert!(events.iter().any(|event| matches!(event.coordinator(),
         Some(CoordinatorEvent::RunFinished { status, finalization_failure })
             if *status == expected && *finalization_failure == failure)));
-    let mut before_finish =
-        CoordinatorState::replay(&records[..records.len() - 1]).expect("replay before completion");
-    let unchanged = before_finish.clone();
-    assert_eq!(
-        before_finish.apply(&CoordinatorEvent::RunFinished {
-            status:               if expected == RunStatus::Success {
-                RunStatus::Failed
-            } else {
-                RunStatus::Success
-            },
-            finalization_failure: failure.clone(),
-        }),
-        Err(StateError::RunStatusMismatch)
-    );
-    assert_eq!(before_finish, unchanged);
-    let mut immutable = committed.clone();
-    assert_eq!(
-        immutable.apply(&CoordinatorEvent::RunFinished {
-            status:               RunStatus::Success,
-            finalization_failure: None,
-        }),
-        Err(StateError::DuplicateRunFinish)
-    );
-    assert_eq!(immutable, committed);
+    assert_run_finish_is_validated(&records, &committed, expected, failure.clone());
     // The callback would block if called again: committed completion must
     // return the original result without rerunning it.
     let mut resumed = Coordinator::resume(
@@ -280,19 +300,9 @@ async fn interrupted_completion_requires_the_finalizer_on_resume() {
     let runtime = Runtime::standard()
         .hooks(hooks.clone())
         .options(RunOptions::new(directory.path()));
-    let mut coordinator = Coordinator::create(
-        runtime.prepare_run(directory.path()),
-        Vec::new(),
-        CoordinatorOptions::default(),
-    )
-    .await
-    .expect("create");
     let mut graph = GraphBuilder::new();
     graph.add_step("only", ScopeId::new(0), "noop");
-    let digest = coordinator
-        .register_graph(&graph.build())
-        .await
-        .expect("register");
+    let (mut coordinator, digest) = start(&runtime, &directory, graph).await;
     coordinator
         .run_root(digest, BTreeMap::new())
         .await
@@ -300,15 +310,18 @@ async fn interrupted_completion_requires_the_finalizer_on_resume() {
     coordinator.finish().await;
     // The workflow and its result survived, but the completion commit did
     // not. Recovery cannot promote that narrower result into run success.
-    let path = directory.path().join("coordinator.jsonl");
-    let text = fs::read_to_string(&path).expect("log");
-    let prefix = text
-        .lines()
-        .filter(|line| !line.contains("\"run.finished\""))
-        .collect::<Vec<_>>()
-        .join("\n")
-        + "\n";
-    fs::write(path, prefix).expect("interrupted log");
+    let decoded = read_coordinator_log(&*testkit::read_run_dir(directory.path()).await)
+        .await
+        .expect("coordinator log decodes");
+    let mut prefix = Vec::new();
+    for record in decoded {
+        if matches!(record.body, CoordinatorEvent::RunFinished { .. }) {
+            continue;
+        }
+        serde_json::to_writer(&mut prefix, &record).expect("record encodes");
+        prefix.push(b'\n');
+    }
+    fs::write(directory.path().join("coordinator.jsonl"), prefix).expect("interrupted log");
     let no_finalizer = Runtime::standard().options(RunOptions::new(directory.path()));
     let Err(error) = Coordinator::resume(
         no_finalizer.prepare_run(directory.path()),

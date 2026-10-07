@@ -430,8 +430,18 @@ impl Coordinator {
             .join(execution_relative_dir(execution))
     }
 
+    /// The root's last report, carrying the committed overall result once
+    /// the run has recorded its end.
     pub fn take_root_report(&mut self) -> Option<driver::ExecutionReport> {
-        self.last_root_report.take()
+        let mut report = self.last_root_report.take()?;
+        let state = self.store.state();
+        if let Some(status) = state.run_status {
+            report.status = status;
+            report
+                .finalization_failure
+                .clone_from(&state.finalization_failure);
+        }
+        Some(report)
     }
 
     pub async fn register_graph(&mut self, graph: &Graph) -> Result<GraphDigest, CoordinatorError> {
@@ -501,16 +511,11 @@ impl Coordinator {
                     None,
                 )
                 .await?;
-            let mut report = driver.run().await;
+            let report = driver.run().await;
             Self::check_report(execution, &report)?;
-            if let Some(status) = self.store.state().run_status {
-                // A committed outcome is immutable: reconstruct execution for
-                // the host report, without calling completion hooks again.
-                report.status = status;
-                report
-                    .finalization_failure
-                    .clone_from(&self.store.state().finalization_failure);
-            } else {
+            // A committed run does not own this replay: its completion hooks
+            // already ran, and `take_root_report` carries the committed result.
+            if self.store.state().run_status.is_none() {
                 self.append_run_notes(execution, &report).await?;
             }
             if report.exit != recorded {

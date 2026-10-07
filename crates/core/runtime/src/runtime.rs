@@ -468,6 +468,13 @@ impl Runtime {
         self.hooks.clone()
     }
 
+    /// Whether the installed host declares required completion work.
+    pub fn requires_run_finalization(&self) -> bool {
+        self.hooks
+            .as_ref()
+            .is_some_and(|hooks| hooks.requires_run_finalization())
+    }
+
     /// The step registry, for lookups (`type_known`-style lints, validation).
     pub fn registry(&self) -> &::steps::Registry {
         &self.steps
