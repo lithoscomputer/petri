@@ -94,6 +94,8 @@ impl Default for CoordinatorOptions {
 
 #[derive(Debug, thiserror::Error)]
 pub enum CoordinatorError {
+    #[error("the configured required finalizer differs from the recorded requirement")]
+    FinalizationRequirementMismatch,
     #[error(transparent)]
     Store(#[from] StoreError),
     /// The run could not be opened in its store.
@@ -260,6 +262,7 @@ impl Coordinator {
             runtime.run_key().clone(),
             keys,
             clock.clone(),
+            runtime.requires_run_finalization(),
         )
         .await?;
         let resources = ResourceStore::load(&logs).await?.with_clock(clock);
@@ -307,6 +310,11 @@ impl Coordinator {
         let keys: Vec<MiddlewareKey> = middleware.iter().map(|item| item.key()).collect();
         if store.state().middleware_chain != keys {
             return Err(StoreError::State(crate::StateError::MiddlewareChain).into());
+        }
+        if store.state().run_status.is_none()
+            && store.state().required_finalization != runtime.requires_run_finalization()
+        {
+            return Err(CoordinatorError::FinalizationRequirementMismatch);
         }
         let total = store.state().invocations.len() as u64;
         if total > u64::from(options.max_invocations) {
@@ -422,8 +430,18 @@ impl Coordinator {
             .join(execution_relative_dir(execution))
     }
 
+    /// The root's last report, carrying the committed overall result once
+    /// the run has recorded its end.
     pub fn take_root_report(&mut self) -> Option<driver::ExecutionReport> {
-        self.last_root_report.take()
+        let mut report = self.last_root_report.take()?;
+        let state = self.store.state();
+        if let Some(status) = state.run_status {
+            report.status = status;
+            report
+                .finalization_failure
+                .clone_from(&state.finalization_failure);
+        }
+        Some(report)
     }
 
     pub async fn register_graph(&mut self, graph: &Graph) -> Result<GraphDigest, CoordinatorError> {
@@ -495,7 +513,11 @@ impl Coordinator {
                 .await?;
             let report = driver.run().await;
             Self::check_report(execution, &report)?;
-            self.append_run_notes(execution, &report).await?;
+            // A committed run does not own this replay: its completion hooks
+            // already ran, and `take_root_report` carries the committed result.
+            if self.store.state().run_status.is_none() {
+                self.append_run_notes(execution, &report).await?;
+            }
             if report.exit != recorded {
                 return Err(CoordinatorError::ConflictingExit { execution });
             }
@@ -517,8 +539,16 @@ impl Coordinator {
     async fn finish_run(&mut self, status: RunStatus) -> Result<(), CoordinatorError> {
         if self.store.state().run_status.is_none() {
             self.release_remaining(status).await;
-            self.append(CoordinatorEvent::RunFinished { status })
-                .await?;
+            let finalization_failure = self
+                .last_root_report
+                .as_ref()
+                .and_then(|report| report.finalization_failure.clone());
+            let status = ir::finalized_status(status, finalization_failure.as_ref());
+            self.append(CoordinatorEvent::RunFinished {
+                status,
+                finalization_failure,
+            })
+            .await?;
         }
         Ok(())
     }
@@ -1093,7 +1123,9 @@ impl Coordinator {
         };
         let fold = Arc::new(pipeline.fold_observer());
         let mut driver = driver
-            .with_run_owner(invocation == InvocationId::ROOT)
+            .with_run_owner(
+                invocation == InvocationId::ROOT && self.store.state().run_status.is_none(),
+            )
             .observe_run_log(writer.clone())
             .observe(fold)
             .with_decision_resolver(pipeline.clone())

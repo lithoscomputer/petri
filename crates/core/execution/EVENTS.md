@@ -1,9 +1,18 @@
 # The public event contract
 
 `execution::events` is the versioned event stream an embedding host projects a
-run from. This file is the contract for `EVENT_CONTRACT_VERSION` 5. The Rust
+run from. This file is the contract for `EVENT_CONTRACT_VERSION` 6. The Rust
 types in `crates/core/execution/src/events.rs` are authoritative for field
 detail; this file states the guarantees.
+
+Version 6 (2026-10-05) changes the completion contract. `run.started`
+records `required_finalization`; `run.finished` carries the authoritative
+`status` and optional `finalization_failure: {code, message}`. The root
+invocation and execution retain workflow outcomes. A successful workflow
+can therefore have a failed overall run. Cancellation retains precedence.
+The run format moves to 9; version 8 runs are refused, never migrated.
+The engine log remains version 12. Update stream readers and storage
+readers together; do not infer final success from invocation completion.
 
 Version 5 (2026-09-26) changes one shape inside a record: a partial
 success's `underlying` (in a `step.finished` record's `outcome.status`) is
@@ -248,7 +257,7 @@ run directory), origin always external. Log identity
 
 | `event` | Body type | Fields and derived values |
 | --- | --- | --- |
-| `run.started` | `CoordinatorEvent::RunStarted` | `format_version`, `key`, `root`, `middleware_chain`, and `forked_from` on a forked run (`source`, the source run's key; `execution` and `firing`, the position its records were kept up to; `rerun_last`). Nothing derived |
+| `run.started` | `CoordinatorEvent::RunStarted` | `format_version`, `key`, `root`, `middleware_chain`, `required_finalization`, and `forked_from` on a forked run (`source`, the source run's key; `execution` and `firing`, the position its records were kept up to; `rerun_last`). Nothing derived |
 | `graph.registered` | `GraphRegistered` | `digest`, before any invocation declares the graph. Nothing derived |
 | `invocation.declared` | `InvocationDeclared` | `invocation`, `call` (absent on the root), `graph`, `context`, the name-only `secret_bindings`, the `sandbox` binding, the `admission` gate. Nothing derived; `context.parent` is the call as a `ParentLink` |
 | `execution.declared` | `ExecutionDeclared` | `execution`, `invocation`, `predecessor`, the whole engine `start` (entry, context, inherited firing counts, index, restart limit), `middleware_state`. Nothing derived |
@@ -258,7 +267,7 @@ run directory), origin always external. Log identity
 | `run.paused`, `run.unpaused` | `RunPaused`, `RunUnpaused` | the control service held or released admission. Replay carries them, and a resume whose last recorded control is a pause starts with admission held. The stall watchdog's clock is parked from a pause to its unpause, which restarts its full budget |
 | `run.note.recorded` | `RunNoteRecorded` | `execution` (the one whose driver ran the point, when known), `kind`, `payload`: a note from a run-level hook point (`run_finished`, `scope_released`), appended from the execution's report before `run.finished`. At least once: a crash can record a point's notes again (`HOOKS.md`). Derived: `parsed`, the same reading a firing's note gets |
 | `scope.released` | `ScopeReleased` | `invocation` (the lease's owner), `lease`, `scope` (the coordinator's stable `ScopeIdentity`: `{"declared": <scope>}` or `{"spliced": [..]}`), `workspace`, `provider`, `instance` (the provider's id for the sandbox; absent when none was created), `outcome` (`succeeded` or `failed`, the invocation's status as retention reads it), `retained` (whether the sandbox and its workspace still exist on the provider afterwards: stopped and kept, or deleted; a dry run's `simulated` lease is always released deleted, there being nothing to keep), `problems` (what the release could not do; the sandbox is then still there and the next release, the run's end or `petri sandbox prune`, tries again; a sandbox someone deleted outside the run cannot be kept, so its lease ends deleted, `retained: false`, and the loss is a problem). Appended once per lease the finished invocation owned, after the executor released it. At its end, before `run.finished`, the run releases every lease still holding a sandbox (one a crash left live, one whose release failed or never ran) and records each release, and records a release a crash cut off before its record; `run.finished` stays the log's last record. A lease retried after a problem has one record per attempt. An inherited invocation owns no lease and records none. `context.invocation` is the owner. Nothing derived |
-| `run.finished` | `RunFinished` | `status`. Nothing derived |
+| `run.finished` | `RunFinished` | `status`: authoritative overall result after required finalization; optional `finalization_failure` with host-defined `code` and `message`. The root invocation remains workflow execution evidence. Nothing derived |
 
 Engine records, one engine log per execution
 (`executions/<execution>/events.jsonl` in a run directory). Log identity

@@ -286,7 +286,7 @@ async fn a_crash_between_the_roots_end_and_the_runs_end_still_ends_the_run() {
         .expect("coordinator log decodes")
         .into_iter()
         .filter_map(|record| match record.body {
-            CoordinatorEvent::RunFinished { status } => Some(status),
+            CoordinatorEvent::RunFinished { status, .. } => Some(status),
             _ => None,
         })
         .collect();

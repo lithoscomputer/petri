@@ -25,6 +25,14 @@ fabro_core). Root cancellation and engine `RunError`s outrank both. The
 failed history), under every policy — deliberately not the folded status,
 which under `TerminalNode` would read `Failed` until the exit record exists.
 
+This quiescence result describes workflow execution. An embedding host may
+declare required run finalization through `ExecutionHooks`. The IO driver
+awaits it before environment release; the coordinator then commits the
+overall run result. Required finalization can fail successful execution,
+never upgrade failed execution, and never replace cancellation. Execution
+results remain distinct. The committed terminal result and finalization
+failure detail are immutable (`crates/core/execution/HOOKS.md`).
+
 All coordination lives in a pure, sans-IO core: `apply(state, event) ->
 (state, commands)` — deterministic, no clocks, no RNG, no filesystem. All side
 effects live behind traits (`Executor`, `StepKind`, `LogSink`,
