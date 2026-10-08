@@ -15,7 +15,7 @@
 //! mutated), packed as one tarball — mode bits and symlinks survive — written
 //! through `ExecEnv::write_file` like every other runner file, and extracted
 //! by the environment's own `tar`. Host and container scopes get the workspace
-//! identically.
+//! identically, owned by the user the job's steps run as.
 //!
 //! A repository without `.git` — the corpus's fetched workflow trees — copies
 //! as a plain tree: no history to clone, nothing ignored to skip.
@@ -312,14 +312,21 @@ fn copy_tree(from: &Path, to: &Path) -> io::Result<()> {
 }
 
 /// Run the environment's `tar` over the streamed tarball; the cancel ladder
-/// applies as it does to every process.
+/// applies as it does to every process. `--no-same-owner` gives the files to
+/// the extracting user: a container job runs as root, and root's `tar` would
+/// otherwise restore the host user's uid, so a later `git` step refuses the
+/// workspace as a repository of dubious ownership.
 async fn extract(tar_rel: &str, ctx: &mut StepCtx) -> Result<Ending, StepFailure> {
     let workspace = ctx.env.workspace_path().to_string();
     let archive = format!("{workspace}/{tar_rel}");
     let mut handle = ctx
         .env
         .spawn(executor::ProcessSpec::new("tar", &[
-            "-xf", &archive, "-C", &workspace,
+            "--no-same-owner",
+            "-xf",
+            &archive,
+            "-C",
+            &workspace,
         ]))
         .await
         .map_err(|e| checkout_error(format!("could not run `tar`: {e}")))?;

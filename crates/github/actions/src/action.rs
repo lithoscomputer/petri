@@ -297,14 +297,20 @@ fn stage_error(message: String) -> StepFailure {
 
 /// Extract the staged archive with the environment's own `tar`. No cancel
 /// ladder: action trees are small, `tar` always terminates, and the streamed
-/// per-file writes this replaced never consulted cancellation either.
+/// per-file writes this replaced never consulted cancellation either. The
+/// files belong to the extracting user, as the checkout's do, never to the
+/// host user that fetched them.
 async fn unpack(ctx: &StepCtx, tar_rel: &Path, pinned: &PinnedAction) -> Result<(), StepFailure> {
     let workspace = ctx.env.workspace_path().to_string();
     let archive = format!("{workspace}/{}", tar_rel.display());
     let mut handle = ctx
         .env
         .spawn(executor::ProcessSpec::new("tar", &[
-            "-xf", &archive, "-C", &workspace,
+            "--no-same-owner",
+            "-xf",
+            &archive,
+            "-C",
+            &workspace,
         ]))
         .await
         .map_err(|e| stage_error(format!("could not run `tar` for `{pinned}`: {e}")))?;
