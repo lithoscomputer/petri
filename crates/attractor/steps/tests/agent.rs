@@ -176,6 +176,12 @@ async fn an_agent_that_exits_early_fails_the_stage_routably() {
         output_of(&report, "a")["failure_class"],
         json!("retry_requested")
     );
+    // The failure says how the agent ended and what it last wrote to stderr.
+    let output = output_of(&report, "a").to_string();
+    assert!(
+        output.contains("exit code 2") && output.contains("early boom"),
+        "{output}"
+    );
     assert_eq!(status_of(&report, "recover").as_deref(), Some("success"));
 }
 

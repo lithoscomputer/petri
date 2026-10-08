@@ -61,7 +61,9 @@ use std::collections::{BTreeMap, VecDeque};
 use std::sync::Arc;
 use std::time::Duration;
 
-use executor::{LineStream, Masker, ProcessHandle, ProcessSpec, Sig, StdinWriter};
+use executor::{
+    EnvError, ExitStatus, LineStream, Masker, ProcessHandle, ProcessSpec, Sig, StdinWriter,
+};
 use ir::{Attempt, Control, FiringId, LogStream, ScopeId, StepEvent, Value};
 use lithos_llm::types::{Cost, CostSource, TokenCounts, Usage};
 use serde_json::json;
@@ -138,6 +140,8 @@ pub struct Client {
     next_id:      u64,
     session_id:   Option<String>,
     exited:       bool,
+    exit_grace:   Duration,
+    stderr_tail:  String,
     hooks:        Option<Arc<AcpHooks>>,
     /// The envelope sequence, per connection.
     seq:          u64,
@@ -200,6 +204,8 @@ impl Client {
             next_id: 1,
             session_id: None,
             exited: false,
+            exit_grace: env.grace(),
+            stderr_tail: String::new(),
             hooks: None,
             seq: 0,
             auth_methods: Vec::new(),
@@ -287,17 +293,22 @@ impl Client {
     async fn receive(&mut self) -> Result<Incoming, AcpError> {
         loop {
             let Some(line) = self.lines.recv().await else {
-                self.exited = true;
-                return Err(AcpError::ProcessExited(String::new()));
+                let detail = match time::timeout(self.exit_grace, self.handle.wait()).await {
+                    Ok(outcome) => {
+                        self.exited = true;
+                        exit_detail(outcome)
+                    }
+                    Err(_) => ": stdout closed before the process exited".to_owned(),
+                };
+                let detail = if self.stderr_tail.is_empty() {
+                    detail
+                } else {
+                    format!("{detail}; stderr: {}", self.stderr_tail.trim_end())
+                };
+                return Err(AcpError::ProcessExited(self.stage.masker.mask(&detail)));
             };
             if line.stream == LogStream::Stderr {
-                let _ = self
-                    .logs
-                    .send(StepEvent::Log {
-                        stream: LogStream::Stderr,
-                        line:   line.line,
-                    })
-                    .await;
+                self.log_stderr(line.line).await;
                 continue;
             }
             let text = line.line;
@@ -338,6 +349,24 @@ impl Client {
                 }
             });
         }
+    }
+
+    async fn log_stderr(&mut self, line: String) {
+        self.stderr_tail.push_str(&self.stage.masker.mask(&line));
+        self.stderr_tail.push('\n');
+        // Keep a bounded UTF-8 tail for unexpected protocol EOF.
+        let mut excess = self.stderr_tail.len().saturating_sub(8 * 1024);
+        while !self.stderr_tail.is_char_boundary(excess) {
+            excess += 1;
+        }
+        self.stderr_tail.drain(..excess);
+        let _ = self
+            .logs
+            .send(StepEvent::Log {
+                stream: LogStream::Stderr,
+                line,
+            })
+            .await;
     }
 
     /// Record one ACP exchange on the progress channel as the backend
@@ -807,6 +836,19 @@ impl Client {
             let _ = self.handle.wait().await;
         }
         self.exited = true;
+    }
+}
+
+/// How the agent process ended, as a suffix for [`AcpError::ProcessExited`].
+fn exit_detail(outcome: Result<ExitStatus, EnvError>) -> String {
+    match outcome {
+        Err(error) => format!(": {error}"),
+        Ok(status) if status.timed_out => ": process timed out".to_owned(),
+        Ok(status) => match (status.code, status.signal) {
+            (Some(code), _) => format!(": exit code {code}"),
+            (_, Some(signal)) => format!(": signal {signal}"),
+            _ => ": exit status unavailable".to_owned(),
+        },
     }
 }
 
