@@ -84,7 +84,14 @@ impl CoordinatorStore {
         key: RunKey,
         middleware_chain: Vec<engine::MiddlewareKey>,
     ) -> Result<Self, StoreError> {
-        Self::create_with_clock(logs, key, middleware_chain, RecordingClock::default()).await
+        Self::create_with_clock(
+            logs,
+            key,
+            middleware_chain,
+            RecordingClock::default(),
+            false,
+        )
+        .await
     }
 
     /// [`CoordinatorStore::create`], stamping every record with `clock`.
@@ -93,6 +100,7 @@ impl CoordinatorStore {
         key: RunKey,
         middleware_chain: Vec<engine::MiddlewareKey>,
         clock: RecordingClock,
+        required_finalization: bool,
     ) -> Result<Self, StoreError> {
         let mut store = Self {
             logs,
@@ -109,6 +117,7 @@ impl CoordinatorStore {
                 key,
                 root: InvocationId::ROOT,
                 middleware_chain,
+                required_finalization,
                 forked_from: None,
             })
             .await?;

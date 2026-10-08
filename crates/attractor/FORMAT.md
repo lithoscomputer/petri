@@ -750,16 +750,30 @@ scope runs (a container image with the product on `PATH`).
 
 The agent's environment is the scope's, plus:
 
-- every product credential the run's secrets know: `ANTHROPIC_API_KEY`,
-  `GEMINI_API_KEY` and `OPENAI_API_KEY` (`attractor_steps::acp::PRODUCT_CREDENTIALS`),
-  each resolved through the run's secret provider (the standalone runner
-  reads `PETRI_SECRET_<NAME>`; Fabro its vault) and masked in every log; a
-  name the provider does not know is left out. A product in a container
-  gets its key this way without the workflow naming it.
+- the workflow environment's secret references (the step config's `env`,
+  which a frontend lowers from secret-valued workflow environment entries,
+  such as Fabro's `[run.environment.env]`). These reach the agent however it
+  is named: `acp.command`, `acp.config` or `PETRI_ACP_COMMAND`.
 - the command's own `env` from `acp.config`, on top. A value is a string or
-  a `{"$secret": "NAME"}` reference resolved the same way; a reference the
-  run cannot supply fails the node with class `secret_unavailable` before
-  the agent starts.
+  a `{"$secret": "NAME"}` reference.
+
+Each reference resolves through the run's secret provider (the standalone
+runner reads `PETRI_SECRET_<NAME>`; Fabro its vault) and is masked in every
+log. No other secret reaches the agent. That includes a product's API key
+(`ANTHROPIC_API_KEY`, `GEMINI_API_KEY`, `OPENAI_API_KEY`) the provider knows
+but the workflow does not name: a product signed in to a subscription can
+bill an API key it finds in its environment instead, so the workflow names
+the key when it wants the agent to use one, as it does in Fabro.
+
+Every reference, the workflow's and the command's, resolves when the agent
+starts. One the run cannot supply fails the node with class
+`secret_unavailable` before the agent starts, whether or not the agent reads
+it.
+
+A native (`backend="api"`) agent's tool shells get the same workflow secret
+references, resolved when its session opens, beneath the variables a tool call
+sets itself; a reference the run cannot supply fails the node the same way.
+Its MCP servers get only their own configured env.
 
 The session opens in the scope's workspace (`session/new` with `cwd`). An
 agent that answers `session/new` with `auth_required` (Gemini CLI, until

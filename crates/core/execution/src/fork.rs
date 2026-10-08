@@ -123,7 +123,7 @@ pub async fn fork_from(
             owner: OwnerId::mint(),
         })
         .await?;
-    write_fork(&*logs, source, &plan, key).await
+    write_fork(&*logs, source, &plan, key, rt.requires_run_finalization()).await
 }
 
 /// Everything the fork copies, decided before the new run is created.
@@ -357,16 +357,18 @@ async fn write_fork(
     source: &dyn RunLogs,
     plan: &ForkPlan,
     key: RunKey,
+    required_finalization: bool,
 ) -> Result<ForkedRun, HostError> {
     let mut records = vec![CoordinatorRecord::external(
         0,
         driver::recorded_now(),
         CoordinatorEvent::RunStarted {
-            format_version:   COORDINATOR_FORMAT_VERSION,
-            key:              key.clone(),
-            root:             InvocationId::ROOT,
+            format_version: COORDINATOR_FORMAT_VERSION,
+            key: key.clone(),
+            root: InvocationId::ROOT,
             middleware_chain: plan.middleware_chain.clone(),
-            forked_from:      Some(plan.origin.clone()),
+            required_finalization,
+            forked_from: Some(plan.origin.clone()),
         },
     )];
     records.extend(

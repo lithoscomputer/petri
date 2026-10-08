@@ -35,7 +35,7 @@ import sys
 import threading
 import time
 import uuid
-from http.server import BaseHTTPRequestHandler, HTTPServer, ThreadingHTTPServer
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, urlsplit
 
 SERVER_INFO = {"name": "petri-test-mcp", "version": "1.0.0"}
@@ -272,7 +272,10 @@ def serve_http(server, port):
             self.send_header("Content-Length", "0")
             self.end_headers()
 
-    class Server(LoopbackBind, HTTPServer):
+    # A pooled client may send its next request on another connection while
+    # the previous HTTP/1.1 connection stays open. Serve both independently
+    # so an idle connection cannot block the initialized notification.
+    class Server(LoopbackBind, ThreadingHTTPServer):
         pass
 
     serve_forever(Server, port, Handler)

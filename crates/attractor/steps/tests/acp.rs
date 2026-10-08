@@ -4,10 +4,10 @@
 //! recorded as the `acp` envelope, a permission request is allowed always
 //! when no `pre_tool_use` hook is configured, the session usage extension
 //! folds into the stage's metrics, an agent that requires authentication is
-//! authenticated with its API-key method, and the run's secrets reach the
-//! agent's environment (a product credential by name, a `$secret` reference
-//! in `acp.config`) masked in every log. The hook mapping itself is covered
-//! with `[[run.hooks]]` in `crates/fabro/frontend/tests/hooks.rs`.
+//! authenticated with its API-key method, and the secrets a launch names
+//! reach the agent's environment, and no others, masked in every log. The hook
+//! mapping itself is covered with `[[run.hooks]]` in
+//! `crates/fabro/frontend/tests/hooks.rs`.
 
 use std::collections::BTreeMap;
 use std::fs;
@@ -311,11 +311,11 @@ async fn an_agent_that_requires_authentication_gets_its_api_key_method() {
     );
 }
 
-/// The agent starts with every product credential the run's secrets know
-/// and the `$secret` references its `acp.config` names, and nothing else of
-/// the secrets; what the agent prints of them is masked.
+/// The agent starts with the `$secret` references its `acp.config` names
+/// and nothing else of the secrets, not even a product's API key the
+/// provider knows; what the agent prints of them is masked.
 #[tokio::test]
-async fn product_credentials_and_secret_references_reach_the_agent_masked() {
+async fn only_named_secrets_reach_the_agent_masked() {
     let dir = RunDir::new("acp-credentials");
     let agent = scripted_agent(&dir);
     let env_record = dir.path().join("env.json");
@@ -348,14 +348,10 @@ async fn product_credentials_and_secret_references_reach_the_agent_masked() {
     .expect("json");
     assert_eq!(
         seen,
-        json!({ "AGENT_KEY": "agent-secret-value", "GEMINI_API_KEY": "gemini-secret-value" }),
-        "the named reference and the known product credential, no other secret"
+        json!({ "AGENT_KEY": "agent-secret-value" }),
+        "the named reference, no other secret"
     );
     let lines = log_lines(&report);
-    assert!(
-        lines.iter().any(|line| line == "GEMINI_API_KEY=***"),
-        "the credential the agent printed is masked: {lines:?}"
-    );
     assert!(
         lines.iter().any(|line| line == "AGENT_KEY=***"),
         "the referenced secret the agent printed is masked: {lines:?}"
@@ -401,4 +397,47 @@ async fn a_secret_reference_the_run_cannot_supply_fails_the_node() {
             .is_some_and(|reason| reason.contains("NOT_THERE")),
         "{output}"
     );
+}
+
+#[tokio::test]
+async fn workflow_secrets_reach_command_and_config_acp_agents_with_explicit_overrides() {
+    for config_launch in [false, true] {
+        let dir = RunDir::new("acp-workflow-secrets");
+        let agent = scripted_agent(&dir);
+        let record = dir.path().join("env.json");
+        let mut graph = with_env(agent_graph(&agent), &[
+            ("ACP_MODE", "tools"),
+            ("ACP_ENV_RECORD", record.to_str().expect("utf-8")),
+            ("ACP_ENV_RECORD_KEYS", "AGENT_KEY"),
+        ]);
+        let config = node_config(&mut graph, "a");
+        config["env"] = json!({ "AGENT_KEY": { "$secret": "WORKFLOW_KEY" } });
+        if config_launch {
+            config["acp"] = json!({
+                "config": {"command":"python3", "args":[agent], "env":{"AGENT_KEY":{"$secret":"OVERRIDE_KEY"}}},
+            });
+        }
+        let secrets = MapSecrets::from_pairs(&[
+            ("WORKFLOW_KEY", "workflow-secret-value"),
+            ("OVERRIDE_KEY", "override-secret-value"),
+        ]);
+        let report = run(&dir, graph, secrets).await;
+        assert_eq!(
+            report.status,
+            RunStatus::Success,
+            "{:?}",
+            report.state.errors()
+        );
+        let seen: Value =
+            serde_json::from_str(&fs::read_to_string(record).expect("record")).expect("json");
+        let expected = if config_launch {
+            "override-secret-value"
+        } else {
+            "workflow-secret-value"
+        };
+        assert_eq!(seen, json!({"AGENT_KEY": expected}));
+        let logs = log_lines(&report);
+        assert!(logs.iter().any(|line| line == "AGENT_KEY=***"), "{logs:?}");
+        assert!(!format!("{logs:?}").contains("secret-value"));
+    }
 }

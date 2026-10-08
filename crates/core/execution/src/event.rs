@@ -31,7 +31,10 @@ use crate::{ExecutionId, GraphDigest, InvocationId, ParentCallKey, SandboxLeaseI
 /// (`FORK.md`); a version 6 run is refused, never migrated. Version 8 pins
 /// engine log version 12 (a partial success keeps its underlying failure
 /// whole, a timeout included); a version 7 run is refused, never migrated.
-pub const COORDINATOR_FORMAT_VERSION: u32 = 8;
+// Version 9 records required finalization on run.started and its failure on
+// run.finished. Older readers must not mistake workflow success for run
+// success.
+pub const COORDINATOR_FORMAT_VERSION: u32 = 9;
 
 /// Name-only child secret bindings. Plaintext is not representable here.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -155,16 +158,18 @@ pub enum InvocationStatus {
 pub enum CoordinatorEvent {
     #[serde(rename = "run.started")]
     RunStarted {
-        format_version:   u32,
+        format_version:        u32,
         /// The run's identity in its store and on its sandbox providers.
-        key:              RunKey,
-        root:             InvocationId,
-        middleware_chain: Vec<MiddlewareKey>,
+        key:                   RunKey,
+        root:                  InvocationId,
+        middleware_chain:      Vec<MiddlewareKey>,
+        #[serde(default)]
+        required_finalization: bool,
         /// Where a forked run was seeded from: the source run and the
         /// position its records were kept up to. Absent on a run that
         /// started fresh. See `FORK.md`.
         #[serde(default, skip_serializing_if = "Option::is_none")]
-        forked_from:      Option<ForkOrigin>,
+        forked_from:           Option<ForkOrigin>,
     },
     #[serde(rename = "graph.registered")]
     GraphRegistered { digest: GraphDigest },
@@ -254,7 +259,13 @@ pub enum CoordinatorEvent {
         problems:   Vec<String>,
     },
     #[serde(rename = "run.finished")]
-    RunFinished { status: RunStatus },
+    RunFinished {
+        /// Authoritative overall status; the root result remains execution
+        /// evidence.
+        status:               RunStatus,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        finalization_failure: Option<ir::FinalizationFailure>,
+    },
 }
 
 /// One `coordinator.jsonl` line, `{"seq", "origin", "recorded_at", "body"}`:

@@ -101,9 +101,9 @@ impl Session {
                 {
                     tracing::warn!(node = %config.node, "the ACP command owns model selection; model, provider and reasoning_effort are observer metadata");
                 }
-                // The agent's environment: the command's own `env` with its
-                // secret references resolved, and every product credential the
-                // run's secrets know, so a product in a container has its key.
+                // The agent's environment: the workflow's secrets and the
+                // command's own `env`, references resolved. Nothing else of
+                // the run's secrets, not even a product's API key.
                 let spec = command
                     .spec(ctx.secrets.as_ref())
                     .map_err(|e| AgentError::failed(SECRET_UNAVAILABLE_CLASS.as_str(), e))?;

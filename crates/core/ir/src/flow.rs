@@ -617,6 +617,33 @@ pub enum Control {
     Deliver(Value),
 }
 
+/// A host's rendered required-finalization failure. The code is host-defined:
+/// the engine stores it without interpreting publication or other host policy.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, thiserror::Error)]
+#[error("{code}: {message}")]
+pub struct FinalizationFailure {
+    pub code:    SmolStr,
+    pub message: String,
+}
+
+impl FinalizationFailure {
+    pub fn new(code: impl Into<SmolStr>, message: impl Into<String>) -> Self {
+        Self {
+            code:    code.into(),
+            message: message.into(),
+        }
+    }
+}
+
+/// The overall result after required finalization. Cancellation takes
+/// precedence; successful finalization never upgrades failed execution.
+pub fn finalized_status(execution: RunStatus, failure: Option<&FinalizationFailure>) -> RunStatus {
+    match execution {
+        RunStatus::Success if failure.is_some() => RunStatus::Failed,
+        status => status,
+    }
+}
+
 /// How a whole run ended.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]

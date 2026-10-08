@@ -1551,3 +1551,34 @@ fn the_run_goal_overrides_the_graphs_goal_and_the_launch_overrides_both() {
         json!("Settings main")
     );
 }
+
+#[test]
+fn workflow_secrets_reach_agent_processes_as_references() {
+    for agent in [
+        r#"backend="acp", acp.command="agent --acp""#,
+        r#"backend="acp", acp.config="{\"command\":\"agent\"}""#,
+        r#"backend="api", model="claude-sonnet-5-5""#,
+    ] {
+        let files = files(&[(
+            "wf/workflow.toml",
+            "[environments.default]\nprovider = \"local\"\n[run.environment.env]\nTOKEN = \"{{ secrets.REVIEW_TOKEN }}\"\n",
+        )]);
+        let lowered = load(
+            "wf/workflow.fabro",
+            &dot(&format!(r#"a [{agent}, prompt="x"]; start -> a -> exit"#)),
+            &files,
+            &CompileInputs::new(),
+        );
+        assert!(
+            !lowered.diagnostics.has_errors(),
+            "{:?}",
+            lowered.diagnostics
+        );
+        let graph = lowered.graph.expect("lowers");
+        assert!(!graph.scopes[0].env.contains_key("TOKEN"));
+        assert_eq!(
+            node(&graph, "a").step.config["env"]["TOKEN"],
+            json!({"$secret": "REVIEW_TOKEN"})
+        );
+    }
+}

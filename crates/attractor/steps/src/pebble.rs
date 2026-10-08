@@ -54,7 +54,7 @@ use std::error::Error;
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
-use environment::{PebbleEnvironment, ScopePortRoutes, elapsed_ms};
+use environment::{InheritedEnv, PebbleEnvironment, ScopePortRoutes, elapsed_ms};
 use execution::hooks::HookServiceHandle;
 use executor::Masker;
 use ir::{Attempt, Control, FiringId, LogStream, ScopeId, StepEvent, Value};
@@ -73,10 +73,11 @@ use pebble_coding_agent::{
 use questions::AgentQuestions;
 use serde_json::json;
 use smol_str::SmolStr;
-use steps::{Interrupt, ProgressError, ProgressSender, Steer, StepCtx};
+use steps::{Interrupt, ProgressError, ProgressSender, SECRET_UNAVAILABLE_CLASS, Steer, StepCtx};
 use tokio::sync::mpsc;
 use tokio_util::sync::{CancellationToken, DropGuard};
 
+use crate::acp::resolve_env;
 use crate::agent::backend::AgentError;
 use crate::agent::{AgentConfig, INTERRUPTED_EVENT};
 use crate::compaction::{self, CompactionPolicyHandle};
@@ -282,6 +283,11 @@ impl NativeSession {
         // when it expires. Pebble's own wall-clock timer stays unset, so it
         // cannot expire during an excluded interview wait.
         let env = ctx.env.clone();
+        // A tool shell sees the workflow's secrets beneath its own env, as
+        // Fabro's did; MCP servers and port routes use the scope as it is.
+        let inherited = resolve_env(&config.env, ctx.secrets.as_ref())
+            .map_err(|e| AgentError::failed(SECRET_UNAVAILABLE_CLASS.as_str(), e))?;
+        let shell_env = executor::layer_exec(env.clone(), Arc::new(InheritedEnv::new(inherited)));
         let provider = questions.clone();
         let tool_hooks = hook_service.map(|handle| {
             let view = hooks::step_view(ctx, "agent", &config.label, &config.kv);
@@ -298,7 +304,7 @@ impl NativeSession {
         let secrets = ctx.secrets.clone();
         let session_events = events.clone();
         let build = async {
-            let environment = PebbleEnvironment::prepare(env.clone(), cancel.clone(), kill.clone())
+            let environment = PebbleEnvironment::prepare(shell_env, cancel.clone(), kill.clone())
                 .await
                 .map_err(|e| AgentError::failed("pebble_environment", e.to_string()))?;
             let environment = Arc::new(environment);

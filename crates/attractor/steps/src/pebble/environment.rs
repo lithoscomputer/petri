@@ -2,13 +2,16 @@
 //! The same scope is the route to a sandbox-hosted MCP server's port
 //! ([`ScopePortRoutes`]).
 
+use std::collections::BTreeMap;
 use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
-use executor::{EnvError, ExecEnv, OutputMode, ProcessHandle, ProcessSpec, Sig};
+use executor::{
+    EnvError, ExecEnv, OutputMode, ProcessHandle, ProcessSpec, Sig, SpawnEnv, SpawnTarget,
+};
 use globset::{GlobBuilder, GlobMatcher};
 use ir::LogStream;
 use pebble_coding_agent::environment::support::{
@@ -21,9 +24,34 @@ use pebble_coding_agent::environment::{
 use pebble_coding_agent::events::CommandTermination;
 use pebble_coding_agent::mcp::{PortRoute, PortRouteError, PortRoutes};
 use pebble_coding_agent::tools::OutputCaptureStats;
+use smol_str::SmolStr;
 use tokio::task::JoinSet;
 use tokio::time::{sleep, timeout};
 use tokio_util::sync::CancellationToken;
+
+/// What a tool shell's environment starts from beneath the variables its tool
+/// call sets: the workflow's secrets, resolved when the session opened.
+pub struct InheritedEnv(BTreeMap<SmolStr, SmolStr>);
+
+impl InheritedEnv {
+    pub fn new(env: BTreeMap<SmolStr, SmolStr>) -> Self {
+        Self(env)
+    }
+}
+
+#[async_trait]
+impl SpawnEnv for InheritedEnv {
+    async fn apply(
+        &self,
+        _target: SpawnTarget,
+        env: &mut BTreeMap<SmolStr, SmolStr>,
+    ) -> Result<(), EnvError> {
+        for (key, value) in &self.0 {
+            env.entry(key.clone()).or_insert_with(|| value.clone());
+        }
+        Ok(())
+    }
+}
 
 /// Adapts the execution scope supplied by Petri to Pebble's coding tools.
 /// Bash, find, and grep must be available inside the scope. Uses ripgrep

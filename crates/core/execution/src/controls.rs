@@ -160,6 +160,23 @@ impl ExecutionHooks for PauseHooks {
         }
     }
 
+    fn requires_run_finalization(&self) -> bool {
+        self.inner
+            .as_ref()
+            .is_some_and(|inner| inner.requires_run_finalization())
+    }
+
+    async fn finalize_run(
+        &self,
+        context: &HookContext,
+        finished: RunFinished,
+    ) -> Result<(), ir::FinalizationFailure> {
+        match &self.inner {
+            Some(inner) => inner.finalize_run(context, finished).await,
+            None => Ok(()),
+        }
+    }
+
     async fn run_finished(&self, context: &HookContext, finished: RunFinished) -> Vec<Note> {
         match &self.inner {
             Some(inner) => inner.run_finished(context, finished).await,

@@ -138,6 +138,11 @@ pub struct RunInspection {
     /// The recorded run status: `success`, `failed` or `cancelled`. Absent
     /// until the run has recorded its finish.
     pub status: Option<String>,
+    /// Required host work declared for this run.
+    pub required_finalization: bool,
+    /// The committed failure of that work. Execution evidence stays in the
+    /// root invocation and its engine log.
+    pub finalization_failure: Option<ir::FinalizationFailure>,
     /// Every reason `complete` is false, in the order found.
     pub incomplete: Vec<String>,
     /// Whether the last recorded run control was a pause: a resume starts
@@ -477,6 +482,8 @@ pub async fn inspect_run(logs: &dyn RunLogs) -> Result<RunInspection, InspectErr
         forked_from,
         complete: incomplete.is_empty(),
         status: state.run_status.map(|status| status.to_string()),
+        required_finalization: state.required_finalization,
+        finalization_failure: state.finalization_failure.clone(),
         incomplete,
         paused: state.paused,
         notes: state.run_notes.clone(),

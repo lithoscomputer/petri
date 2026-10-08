@@ -41,10 +41,10 @@
 //! `acp.turns` and the last `acp.context`.
 //!
 //! The agent process starts in the scope (a host directory or a container)
-//! with the scope's environment, the command's own `env` (a value may be a
-//! `{"$secret": NAME}` reference, resolved through the run's secrets), and
-//! every product credential in [`PRODUCT_CREDENTIALS`] the run's secret
-//! provider knows; the session's `cwd` is the scope's workspace.
+//! with the scope's environment, the workflow's secrets and the command's
+//! own `env` (a value may be a `{"$secret": NAME}` reference, resolved
+//! through the run's secrets); no secret it does not name. The session's
+//! `cwd` is the scope's workspace.
 //!
 //! A host's interrupt (`Interrupt` under `$interrupt`) is `session/cancel`
 //! without ending the process: the agent answers the prompt in flight with
@@ -71,7 +71,7 @@ use tokio::io::AsyncWriteExt as _;
 use tokio::sync::mpsc;
 use tokio::time;
 
-pub use self::command::{AgentCommand, EnvValue, PRODUCT_CREDENTIALS};
+pub use self::command::{AgentCommand, EnvValue, resolve_env};
 pub use self::hooks::AcpHooks;
 use self::hooks::{Finished, ToolCall, tool_output};
 use crate::agent::INTERRUPTED_EVENT;

@@ -146,28 +146,31 @@ pub trait AdmissionPass: Send + Sync {
     fn admit(&self, graph: &mut Graph, caps: &::steps::Capabilities) -> Vec<AdmissionProblem>;
 }
 
+type ExecutorLayer = Arc<dyn Fn(Arc<dyn Executor>) -> Arc<dyn Executor> + Send + Sync>;
+
 /// The assembled system: frontends, step kinds, executors, secrets, options.
 pub struct Runtime {
-    frontends:    Vec<Box<dyn Frontend>>,
-    steps:        ::steps::Registry,
-    executor:     Option<Arc<dyn Executor>>,
+    frontends:       Vec<Box<dyn Frontend>>,
+    steps:           ::steps::Registry,
+    executor:        Option<Arc<dyn Executor>>,
+    executor_layers: Vec<ExecutorLayer>,
     /// The store runs live in; `None` is the run directory under
     /// `RunOptions::run_dir`.
-    store:        Option<Arc<dyn RunStore>>,
-    secrets:      Arc<dyn SecretProvider>,
-    observers:    Vec<Arc<dyn EventObserver>>,
-    progress:     Option<Arc<dyn ProgressSink>>,
-    hooks:        Option<Arc<dyn ExecutionHooks>>,
-    caps:         ::steps::CapabilitiesBuilder,
-    provisioners: Vec<RunProvisioner>,
-    admissions:   Vec<Arc<dyn AdmissionPass>>,
-    options:      RunOptions,
+    store:           Option<Arc<dyn RunStore>>,
+    secrets:         Arc<dyn SecretProvider>,
+    observers:       Vec<Arc<dyn EventObserver>>,
+    progress:        Option<Arc<dyn ProgressSink>>,
+    hooks:           Option<Arc<dyn ExecutionHooks>>,
+    caps:            ::steps::CapabilitiesBuilder,
+    provisioners:    Vec<RunProvisioner>,
+    admissions:      Vec<Arc<dyn AdmissionPass>>,
+    options:         RunOptions,
     /// The standard router acquires every scope on the simulated provider:
     /// a dry run.
-    simulated:    bool,
+    simulated:       bool,
     /// Built-in providers the standard router reaches instead of plugins.
-    in_process:   Option<InProcessProviders>,
-    sources:      Sources,
+    in_process:      Option<InProcessProviders>,
+    sources:         Sources,
 }
 
 /// Makes a store for the step output of the execution whose directory it is
@@ -230,23 +233,24 @@ impl Runtime {
     )]
     pub fn standard() -> Self {
         Self {
-            frontends:    vec![Box::new(frontend_native::Native)],
-            steps:        crate::steps::standard(),
-            executor:     None,
-            store:        None,
-            secrets:      Arc::new(MapSecrets::empty()),
-            observers:    Vec::new(),
-            progress:     None,
-            hooks:        None,
-            caps:         ::steps::Capabilities::builder(),
-            provisioners: Vec::new(),
-            admissions:   Vec::new(),
-            options:      RunOptions::new(
+            frontends:       vec![Box::new(frontend_native::Native)],
+            steps:           crate::steps::standard(),
+            executor:        None,
+            executor_layers: Vec::new(),
+            store:           None,
+            secrets:         Arc::new(MapSecrets::empty()),
+            observers:       Vec::new(),
+            progress:        None,
+            hooks:           None,
+            caps:            ::steps::Capabilities::builder(),
+            provisioners:    Vec::new(),
+            admissions:      Vec::new(),
+            options:         RunOptions::new(
                 env::temp_dir().join(format!("petri-run-{}", process::id())),
             ),
-            simulated:    false,
-            in_process:   None,
-            sources:      Sources::default(),
+            simulated:       false,
+            in_process:      None,
+            sources:         Sources::default(),
         }
     }
 
@@ -254,23 +258,24 @@ impl Runtime {
     /// itself.
     pub fn bare() -> Self {
         Self {
-            frontends:    Vec::new(),
-            steps:        ::steps::Registry::new(),
-            executor:     None,
-            store:        None,
-            secrets:      Arc::new(MapSecrets::empty()),
-            observers:    Vec::new(),
-            progress:     None,
-            hooks:        None,
-            caps:         ::steps::Capabilities::builder(),
-            provisioners: Vec::new(),
-            admissions:   Vec::new(),
-            options:      RunOptions::new(
+            frontends:       Vec::new(),
+            steps:           ::steps::Registry::new(),
+            executor:        None,
+            executor_layers: Vec::new(),
+            store:           None,
+            secrets:         Arc::new(MapSecrets::empty()),
+            observers:       Vec::new(),
+            progress:        None,
+            hooks:           None,
+            caps:            ::steps::Capabilities::builder(),
+            provisioners:    Vec::new(),
+            admissions:      Vec::new(),
+            options:         RunOptions::new(
                 env::temp_dir().join(format!("petri-run-{}", process::id())),
             ),
-            simulated:    false,
-            in_process:   None,
-            sources:      Sources::default(),
+            simulated:       false,
+            in_process:      None,
+            sources:         Sources::default(),
         }
     }
 
@@ -328,6 +333,21 @@ impl Runtime {
     #[must_use]
     pub fn executor(mut self, executor: impl Executor + 'static) -> Self {
         self.executor = Some(Arc::new(executor));
+        self
+    }
+
+    /// Wrap the run's executor while retaining the standard router's lease
+    /// ledger, reconciliation and pruning. Layers are applied in registration
+    /// order; the last registered layer is outermost. Each layer must forward
+    /// acquisition and release to the executor it receives. A layer that adds
+    /// to every process's environment, such as credentials, applies
+    /// [`executor::EnvHandle::with_spawn_env`] to the handle it acquired.
+    #[must_use]
+    pub fn executor_layer(
+        mut self,
+        layer: impl Fn(Arc<dyn Executor>) -> Arc<dyn Executor> + Send + Sync + 'static,
+    ) -> Self {
+        self.executor_layers.push(Arc::new(layer));
         self
     }
 
@@ -466,6 +486,13 @@ impl Runtime {
     /// delegates every other point to these).
     pub fn installed_hooks(&self) -> Option<Arc<dyn ExecutionHooks>> {
         self.hooks.clone()
+    }
+
+    /// Whether the installed host declares required completion work.
+    pub fn requires_run_finalization(&self) -> bool {
+        self.hooks
+            .as_ref()
+            .is_some_and(|hooks| hooks.requires_run_finalization())
     }
 
     /// The step registry, for lookups (`type_known`-style lints, validation).
@@ -803,12 +830,17 @@ impl Runtime {
         // The standard router is kept by its own type too: the coordinator
         // hands it the lease ledger and releases leases through it. A
         // caller-supplied executor manages its own sandboxes.
-        if let Some(executor) = self.executor.clone() {
-            (executor, None)
-        } else {
-            let router = self.default_router_for(run_dir, key);
-            (router.clone(), Some(router))
+        let (mut executor, router): (Arc<dyn Executor>, _) =
+            if let Some(executor) = self.executor.clone() {
+                (executor, None)
+            } else {
+                let router = self.default_router_for(run_dir, key);
+                (router.clone(), Some(router))
+            };
+        for layer in &self.executor_layers {
+            executor = layer(executor);
         }
+        (executor, router)
     }
 
     fn provision_run(
@@ -978,6 +1010,13 @@ pub struct RunRuntime {
 }
 
 impl RunRuntime {
+    /// Whether the installed host declares required completion work.
+    pub fn requires_run_finalization(&self) -> bool {
+        self.hooks
+            .as_ref()
+            .is_some_and(|hooks| hooks.requires_run_finalization())
+    }
+
     /// A standalone driver's completion owns this run's service teardown.
     /// It is the run's one execution: the root invocation's first.
     fn equip_standalone(self, driver: Driver) -> Driver {

@@ -1326,7 +1326,7 @@ async fn check(
     let finishes: Vec<RunStatus> = records
         .iter()
         .filter_map(|record| match &record.body {
-            CoordinatorEvent::RunFinished { status } => Some(*status),
+            CoordinatorEvent::RunFinished { status, .. } => Some(*status),
             _ => None,
         })
         .collect();
