@@ -405,7 +405,7 @@ fn goal_gates_insert_a_check_with_back_arms_in_resolution_order() {
     let none = statics("success", &json!({}));
     assert!(
         eval_guard(&graph, arms[0].guard, &none, &[]),
-        "unvisited: jump"
+        "unvisited: back to the retry target"
     );
     assert!(
         !eval_guard(&graph, arms[2].guard, &none, &[]),

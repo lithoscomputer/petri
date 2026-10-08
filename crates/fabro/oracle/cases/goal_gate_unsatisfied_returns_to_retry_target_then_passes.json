@@ -1,5 +1,5 @@
 {
-  "name": "goal_gate_unsatisfied_jumps_to_retry_target_then_passes",
+  "name": "goal_gate_unsatisfied_returns_to_retry_target_then_passes",
   "workflow": "digraph T {\n  start [shape=Mdiamond]\n  exit [shape=Msquare]\n\n  graph [retry_target=\"work\"]\n  work [prompt=\"x\", max_visits=3]\n  verify [prompt=\"x\", goal_gate=true, max_visits=3]\n  start -> work -> verify -> exit\n\n}\n",
   "scripts": {
     "verify": {

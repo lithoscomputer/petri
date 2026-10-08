@@ -186,9 +186,22 @@ fn with_env(mut graph: Graph, pairs: &[(&str, &str)]) -> Graph {
     graph
 }
 
-/// The runtime with the product's credential as the run's secret: the ACP
-/// step forwards it into the agent's environment, on the host and in the
-/// container alike.
+/// The agent stage names the product's credential, as a workflow does with
+/// `KEY = "{{ secrets.KEY }}"` under `[run.environment.env]`: Petri gives an
+/// ACP agent no secret it does not name.
+fn with_credential(mut graph: Graph, product: &Product) -> Graph {
+    let write = graph
+        .body
+        .nodes
+        .iter_mut()
+        .find(|node| node.name == "write")
+        .expect("the write stage");
+    write.step.config["env"] = json!({ product.credential: { "$secret": product.credential } });
+    graph
+}
+
+/// The runtime with the product's credential as the run's secret, which the
+/// workflow names for the agent, on the host and in the container alike.
 fn runtime(dir: &RunDir, product: &Product, credential: &str) -> Runtime {
     let mut options = RunOptions::new(dir.path());
     options.grace = Duration::from_secs(5);
@@ -316,6 +329,7 @@ fn assert_session_on_stream(report: &driver::ExecutionReport, product: &Product)
 /// node, and the session is on the stream.
 async fn writes_a_file(product: &Product, rt: &Runtime, toml: &str, env: &[(&str, &str)]) {
     let graph = with_env(lower(&workflow(product, "cat hello.txt"), toml), env);
+    let graph = with_credential(graph, product);
     let report = run(rt, graph).await;
     assert_eq!(
         report.status,
@@ -343,6 +357,7 @@ async fn a_hook_blocks_the_write(product: &Product, rt: &Runtime, env: &[(&str, 
         lower(&workflow(product, "test ! -e hello.txt"), DENY_HOOK_TOML),
         env,
     );
+    let graph = with_credential(graph, product);
     let report = run(rt, graph).await;
     assert_eq!(
         status_of(&report, "check").as_deref(),

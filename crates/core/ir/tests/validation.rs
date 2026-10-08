@@ -290,7 +290,7 @@ fn expansion_regions_may_only_be_entered_at_the_entry() {
     b.link(entry, middle);
     b.link(middle, exit);
     b.link(exit, after);
-    // `outside` jumps straight into the middle of the region.
+    // `outside` enters the region in the middle.
     b.link(outside, middle);
     let items = b.exprs().lit(json!([1]));
     b.set_expansion(entry, Expansion::ForEach {
@@ -687,6 +687,53 @@ fn a_for_each_node_counts_its_own_quorum() {
         n:      3,
         fan_in: 2,
     }]);
+}
+
+/// A join that meets a loop's exit and a branch that skips the loop fires only
+/// when the loop exits in generation 0. It is warned about, not refused: it
+/// works for a loop that does not iterate, and nothing else can express the
+/// wait yet.
+#[test]
+fn a_join_across_generations_is_a_warning() {
+    let build = |join: JoinPolicy| {
+        let mut b = GraphBuilder::new();
+        let scope = ScopeId::new(0);
+        let start = b.add_step("start", scope, NOOP);
+        let plan = b.add_step("plan", scope, NOOP);
+        let work = b.add_step("work", scope, NOOP);
+        let side = b.add_step("side", scope, NOOP);
+        let report = b.add_step("report", scope, NOOP);
+        b.fan_out(start, &[plan, side]);
+        ir::sequential_for_each(&mut b, plan, work, work, report, 10);
+        b.link(side, report);
+        b.set_join(report, join);
+        (b.build(), report, work, side)
+    };
+
+    let (graph, report, work, side) = build(JoinPolicy::All);
+    let checked = ir::check(&graph);
+    assert!(checked.is_ok(), "{:?}", checked.errors);
+    assert_eq!(checked.warnings, vec![
+        ValidationWarning::JoinAcrossGenerations {
+            node:    report,
+            inside:  work,
+            outside: side,
+        }
+    ]);
+    assert_eq!(checked.warnings[0].code(), "lint.join_across_generations");
+    assert!(checked.warnings[0].hint().is_some());
+
+    // A quorum of two needs both sides, so it waits the same way.
+    assert_eq!(
+        ir::check(&build(JoinPolicy::Quorum { n: 2 }).0)
+            .warnings
+            .len(),
+        1
+    );
+    // `Any`, and a quorum either side reaches alone, can fire in every generation.
+    for join in [JoinPolicy::Any, JoinPolicy::Quorum { n: 1 }] {
+        assert!(ir::check(&build(join).0).warnings.is_empty(), "{join:?}");
+    }
 }
 
 /// A scope a path can leave and return to gets a warning, not an error: release

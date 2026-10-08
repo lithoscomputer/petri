@@ -3,6 +3,7 @@ use std::fs;
 use std::sync::Arc;
 use std::time::Duration;
 
+use driver::lifecycle::{ExecutionHooks, HookContext, Note, RunFinished};
 use execution::{
     Access, CallSite, Coordinator, CoordinatorEvent, CoordinatorInvocationClient,
     CoordinatorOptions, CoordinatorStore, ExecutionId, FoldEvent, GraphDigest,
@@ -219,6 +220,173 @@ async fn resume_folds_a_final_outcome_before_reissuing_pending_routing() {
         .expect("pending routing resumes");
 
     assert_eq!(result.status, RunStatus::Success);
+    coordinator.finish().await;
+}
+
+/// A crash after the root's result is stored but before the run's end is:
+/// the resumed run replays the finished root and still ends the run, once.
+#[tokio::test]
+async fn a_crash_between_the_roots_end_and_the_runs_end_still_ends_the_run() {
+    let directory = RunDir::new("coordinator-run-finished-on-resume");
+    let mut options = RunOptions::new(directory.path());
+    options.retention = Retention::Always;
+    let runtime = Runtime::standard().options(options);
+    let mut coordinator = Coordinator::create(
+        runtime.prepare_run(directory.path()),
+        Vec::new(),
+        CoordinatorOptions::default(),
+    )
+    .await
+    .expect("the coordinator starts");
+    let mut builder = GraphBuilder::bare();
+    let scope = builder.add_scope(Scope::new(ScopeId::new(0)));
+    builder.add_step("only", scope, "noop");
+    let digest = coordinator
+        .register_graph(&builder.build())
+        .await
+        .expect("graph registers");
+    coordinator
+        .run_root(digest, BTreeMap::new())
+        .await
+        .expect("the first run completes");
+    drop(coordinator);
+
+    // The crash: the log ends at the root's result.
+    let decoded = read_coordinator_log(&*testkit::read_run_dir(directory.path()).await)
+        .await
+        .expect("coordinator log decodes");
+    let mut prefix = Vec::new();
+    for record in decoded {
+        let root_finished = matches!(
+            record.body,
+            CoordinatorEvent::InvocationFinished { invocation, .. } if invocation == InvocationId::ROOT
+        );
+        serde_json::to_writer(&mut prefix, &record).expect("record encodes");
+        prefix.push(b'\n');
+        if root_finished {
+            break;
+        }
+    }
+    fs::write(directory.path().join("coordinator.jsonl"), prefix).expect("coordinator prefix");
+
+    let runtime = Runtime::standard().options(RunOptions::new(directory.path()));
+    let mut coordinator = Coordinator::resume(
+        runtime.prepare_run(directory.path()),
+        Vec::new(),
+        CoordinatorOptions::default(),
+    )
+    .await
+    .expect("the coordinator resumes");
+    let result = coordinator
+        .run_root(digest, BTreeMap::new())
+        .await
+        .expect("the finished root replays");
+    let ends: Vec<RunStatus> = read_coordinator_log(&**coordinator.store().logs())
+        .await
+        .expect("coordinator log decodes")
+        .into_iter()
+        .filter_map(|record| match record.body {
+            CoordinatorEvent::RunFinished { status, .. } => Some(status),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        ends,
+        vec![result.status],
+        "the run ends once, as its root did"
+    );
+    // The crash cut off the root's `scope.released` too; its lease was
+    // settled, and the resumed run records that before the run's end.
+    assert_release_before_end(&coordinator).await;
+    coordinator.finish().await;
+}
+
+/// The log's one `scope.released`, then `run.finished` as its last record.
+async fn assert_release_before_end(coordinator: &Coordinator) {
+    let kinds: Vec<&str> = read_coordinator_log(&**coordinator.store().logs())
+        .await
+        .expect("coordinator log decodes")
+        .into_iter()
+        .filter_map(|record| match record.body {
+            CoordinatorEvent::ScopeReleased { .. } => Some("scope.released"),
+            CoordinatorEvent::RunFinished { .. } => Some("run.finished"),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(kinds, ["scope.released", "run.finished"]);
+}
+
+/// A crash after the root's result is stored but before its lease was
+/// released: the resumed run releases it at the run's end, and records the
+/// release before `run.finished`, which stays the last record.
+#[tokio::test]
+async fn a_crash_before_the_roots_release_still_records_it_before_the_runs_end() {
+    let directory = RunDir::new("coordinator-release-on-resume");
+    let runtime = Runtime::standard().options(RunOptions::new(directory.path()));
+    let mut coordinator = Coordinator::create(
+        runtime.prepare_run(directory.path()),
+        Vec::new(),
+        CoordinatorOptions::default(),
+    )
+    .await
+    .expect("the coordinator starts");
+    let mut builder = GraphBuilder::bare();
+    let scope = builder.add_scope(Scope::new(ScopeId::new(0)));
+    builder.add_step("only", scope, "noop");
+    let digest = coordinator
+        .register_graph(&builder.build())
+        .await
+        .expect("graph registers");
+    coordinator
+        .run_root(digest, BTreeMap::new())
+        .await
+        .expect("the first run completes");
+    drop(coordinator);
+
+    // The crash: the coordinator log ends at the root's result, and the
+    // resource log at the lease's sandbox going live.
+    let decoded = read_coordinator_log(&*testkit::read_run_dir(directory.path()).await)
+        .await
+        .expect("coordinator log decodes");
+    let mut prefix = Vec::new();
+    for record in decoded {
+        let root_finished = matches!(
+            record.body,
+            CoordinatorEvent::InvocationFinished { invocation, .. } if invocation == InvocationId::ROOT
+        );
+        serde_json::to_writer(&mut prefix, &record).expect("record encodes");
+        prefix.push(b'\n');
+        if root_finished {
+            break;
+        }
+    }
+    fs::write(directory.path().join("coordinator.jsonl"), prefix).expect("coordinator prefix");
+    let resources = fs::read_to_string(directory.path().join("resources.jsonl"))
+        .expect("the resource log reads");
+    let mut kept = String::new();
+    for line in resources.lines() {
+        kept.push_str(line);
+        kept.push('\n');
+        let record: serde_json::Value = serde_json::from_str(line).expect("a record parses");
+        if record["body"]["state"] == "live" {
+            break;
+        }
+    }
+    fs::write(directory.path().join("resources.jsonl"), kept).expect("resource prefix");
+
+    let runtime = Runtime::standard().options(RunOptions::new(directory.path()));
+    let mut coordinator = Coordinator::resume(
+        runtime.prepare_run(directory.path()),
+        Vec::new(),
+        CoordinatorOptions::default(),
+    )
+    .await
+    .expect("the coordinator resumes");
+    coordinator
+        .run_root(digest, BTreeMap::new())
+        .await
+        .expect("the finished root replays");
+    assert_release_before_end(&coordinator).await;
     coordinator.finish().await;
 }
 
@@ -945,6 +1113,139 @@ async fn assert_terminal_parent_recovers_child(cancel_recorded: bool) {
         "the parent call was not reissued"
     );
     coordinator.finish().await;
+}
+
+/// Notes the run's end, so a record can land between a cancel and its
+/// cascade.
+struct NotingHooks;
+
+#[async_trait::async_trait]
+impl ExecutionHooks for NotingHooks {
+    async fn run_finished(&self, _context: &HookContext, _finished: RunFinished) -> Vec<Note> {
+        vec![Note::new("test.run", serde_json::json!({}))]
+    }
+}
+
+/// A crash can cut a cancel's cascade short: the root's cancel is
+/// recorded, its child's is not. The resumed coordinator records the
+/// child's cancel before anything else, so the root cannot reach its end,
+/// and run its end hooks, while its child is still uncancelled.
+#[tokio::test]
+async fn a_resumed_run_finishes_a_cancel_a_crash_cut_short() {
+    let directory = RunDir::new("coordinator-cut-cancel");
+    let started = Arc::new(Notify::new());
+    let mut options = RunOptions::new(directory.path());
+    options.retention = Retention::Always;
+    let runtime = Runtime::standard()
+        .step(InvokeStep)
+        .step(WaitForCancelStep)
+        .capability(TestStarted(started.clone()))
+        .hooks(Arc::new(NotingHooks))
+        .options(options);
+    let mut coordinator = Coordinator::create(
+        runtime.prepare_run(directory.path()),
+        Vec::new(),
+        CoordinatorOptions::default(),
+    )
+    .await
+    .expect("the coordinator starts");
+    let mut child = GraphBuilder::new();
+    child.add_step("wait", ScopeId::new(0), WaitForCancelStep::NAME);
+    let child = coordinator
+        .register_graph(&child.build())
+        .await
+        .expect("child registers");
+    let mut parent = GraphBuilder::new();
+    parent.add_node(
+        "invoke",
+        ScopeId::new(0),
+        StepRef::new(InvokeStep::NAME, serde_json::json!({ "graph": child })),
+    );
+    let parent = coordinator
+        .register_graph(&parent.build())
+        .await
+        .expect("parent registers");
+    let control = coordinator.handle();
+    let mut running = Box::pin(coordinator.run_root(parent, BTreeMap::new()));
+    tokio::select! {
+        () = started.notified() => control.cancel_root(),
+        result = &mut running => panic!("the run finished before cancellation: {result:?}"),
+    }
+    let result = timeout(Duration::from_secs(5), running)
+        .await
+        .expect("the cancelled tree settles")
+        .expect("the run ends");
+    assert_eq!(result.status, RunStatus::Cancelled);
+    coordinator.finish().await;
+
+    // Model a crash between the root's cancel and its child's: the
+    // coordinator log ends with the root's cancel, and neither engine log
+    // holds the cancel yet.
+    let lifecycle = read_coordinator_log(&*testkit::read_run_dir(directory.path()).await)
+        .await
+        .expect("coordinator log decodes");
+    let mut prefix = Vec::new();
+    let mut kept = 0;
+    for record in lifecycle {
+        serde_json::to_writer(&mut prefix, &record).expect("record encodes");
+        prefix.push(b'\n');
+        kept += 1;
+        if matches!(
+            record.body,
+            CoordinatorEvent::InvocationCancelRequested { invocation, .. }
+                if invocation == InvocationId::ROOT
+        ) {
+            break;
+        }
+    }
+    fs::write(directory.path().join("coordinator.jsonl"), prefix).expect("coordinator prefix");
+    for execution in ["0000000000000000", "0000000000000001"] {
+        let path = directory
+            .path()
+            .join(format!("executions/{execution}/events.jsonl"));
+        let events = fs::read_to_string(&path).expect("engine log");
+        let mut lines = events.lines();
+        let mut prefix = format!("{}\n", lines.next().expect("engine header"));
+        for line in lines {
+            let record: StoredEngineRecord = serde_json::from_str(line).expect("engine record");
+            if matches!(record.body, Event::CancelRequested { .. }) {
+                break;
+            }
+            prefix.push_str(line);
+            prefix.push('\n');
+        }
+        fs::write(&path, prefix).expect("engine prefix");
+    }
+
+    let mut coordinator = Coordinator::resume(
+        runtime.prepare_run(directory.path()),
+        Vec::new(),
+        CoordinatorOptions::default(),
+    )
+    .await
+    .expect("the coordinator resumes");
+    let result = timeout(
+        Duration::from_secs(5),
+        coordinator.run_root(parent, BTreeMap::new()),
+    )
+    .await
+    .expect("the resumed tree settles")
+    .expect("the resumed run ends");
+    assert_eq!(result.status, RunStatus::Cancelled);
+    coordinator.finish().await;
+
+    let records = read_coordinator_log(&*testkit::read_run_dir(directory.path()).await)
+        .await
+        .expect("coordinator log decodes");
+    let first = records.get(kept).map(|record| &record.body);
+    assert!(
+        matches!(
+            first,
+            Some(CoordinatorEvent::InvocationCancelRequested { invocation, .. })
+                if *invocation == InvocationId::new(1)
+        ),
+        "the cut cascade is the resumed lifetime's first record: {first:?}"
+    );
 }
 
 #[tokio::test]

@@ -52,7 +52,9 @@ use executor::{
     ScopeOutcome, ScopeSpec,
 };
 use ir::{ContainerOptions, RuntimeTarget, SandboxInstance};
-use sandbox_driver::{Sandbox, SandboxProvider, SandboxSource, SandboxSpec, WorkspaceOwnership};
+use sandbox_driver::{
+    NetworkPolicy, Sandbox, SandboxProvider, SandboxSource, SandboxSpec, WorkspaceOwnership,
+};
 use sandbox_driver_daytona_config::{
     DaytonaProviderConfig, DockerExecutionTarget, NestedDockerConfig,
 };
@@ -202,12 +204,40 @@ impl SandboxExecutor {
                     standalone,
                 },
                 |labels, provider| async move {
-                    self.build_spec(scope, &labels, &name, ctx, &*provider)
-                        .await
+                    let mut spec = self
+                        .build_spec(scope, &labels, &name, ctx, &*provider)
+                        .await?;
+                    if !self.simulated {
+                        spec.network = self.options.network.clone();
+                    }
+                    Ok(spec)
                 },
             )
             .await?;
         let sandbox = acquired.sandbox();
+        // A retained sandbox may predate the requested block policy. Check
+        // provider state before handing it to hooks or executing any stage.
+        if !self.simulated && self.options.network == NetworkPolicy::Block {
+            let status = sandbox
+                .describe()
+                .await
+                .map_err(|error| acquire_failed(&error));
+            let verified = status.and_then(|status| {
+                if status.network == Some(NetworkPolicy::Block) {
+                    Ok(())
+                } else {
+                    Err(EnvError::backend(
+                        BACKEND,
+                        "acquire",
+                        "the sandbox does not report blocked networking; refusing to execute a blocked run",
+                    ))
+                }
+            });
+            if let Err(error) = verified {
+                acquired.release().await;
+                return Err(error);
+            }
+        }
 
         // The ambient environment is a fact the steps rely on (`PATH` for
         // the process step, say); a provider that cannot report it is not

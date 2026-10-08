@@ -60,17 +60,59 @@ pub enum Status {
     Success,
     /// Soft failure or partial completion. Routing-visible, and success-like.
     ///
-    /// `underlying` carries the real failure whenever one was converted into
-    /// this, so the log never records a clean success for something that
-    /// failed.
+    /// `underlying` is the failure this partial success was converted from,
+    /// whenever one was: what the step really ended with, a failure or a
+    /// timeout. It is not a cause — a policy made the conversion (`soft_fail`,
+    /// `continue-on-error`, `AcceptPartial`) — and it keeps the log from
+    /// recording a clean success for something that failed (§3.1 rule 3).
     PartialSuccess {
-        underlying: Option<FailureInfo>,
+        underlying: Option<UnderlyingFailure>,
     },
     Failure(FailureInfo),
     /// The precondition was false, or an upstream skip propagated.
     Skipped,
     Cancelled,
     TimedOut,
+}
+
+/// The failure a [`Status::PartialSuccess`] was converted from: one of the two
+/// statuses [`Status::is_failure`] names, kept whole so a timeout stays a
+/// timeout.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum UnderlyingFailure {
+    Failure(FailureInfo),
+    TimedOut,
+}
+
+impl UnderlyingFailure {
+    /// The failure `status` is, when it is one.
+    pub fn of(status: &Status) -> Option<Self> {
+        match status {
+            Status::Failure(info) => Some(Self::Failure(info.clone())),
+            Status::TimedOut => Some(Self::TimedOut),
+            Status::Success
+            | Status::PartialSuccess { .. }
+            | Status::Skipped
+            | Status::Cancelled => None,
+        }
+    }
+
+    /// The failure's info. A timeout carries none.
+    pub fn failure_info(&self) -> Option<&FailureInfo> {
+        match self {
+            Self::Failure(info) => Some(info),
+            Self::TimedOut => None,
+        }
+    }
+
+    /// The status the step really ended with.
+    pub fn status(&self) -> Status {
+        match self {
+            Self::Failure(info) => Status::Failure(info.clone()),
+            Self::TimedOut => Status::TimedOut,
+        }
+    }
 }
 
 /// A [`Status`] with its payload stripped, for matching on the variant alone.
@@ -153,12 +195,14 @@ impl Status {
         matches!(self, Self::Failure(_) | Self::TimedOut)
     }
 
-    /// The failure behind this status, if any: the failure itself, or the one a
-    /// `PartialSuccess` was converted from.
+    /// The failure info behind this status, if any: the failure itself, or the
+    /// one a `PartialSuccess` was converted from.
     pub fn failure_info(&self) -> Option<&FailureInfo> {
         match self {
             Self::Failure(info) => Some(info),
-            Self::PartialSuccess { underlying } => underlying.as_ref(),
+            Self::PartialSuccess { underlying } => underlying
+                .as_ref()
+                .and_then(UnderlyingFailure::failure_info),
             // `TimedOut` is a failure by `is_failure`, but it carries no info.
             Self::Success | Self::Skipped | Self::Cancelled | Self::TimedOut => None,
         }
@@ -182,7 +226,10 @@ impl Status {
         match self {
             Self::Failure(info) => Self::Failure(map_info(info)),
             Self::PartialSuccess { underlying } => Self::PartialSuccess {
-                underlying: underlying.map(map_info),
+                underlying: underlying.map(|underlying| match underlying {
+                    UnderlyingFailure::Failure(info) => UnderlyingFailure::Failure(map_info(info)),
+                    UnderlyingFailure::TimedOut => UnderlyingFailure::TimedOut,
+                }),
             },
             status @ (Self::Success | Self::Skipped | Self::Cancelled | Self::TimedOut) => status,
         }
@@ -191,7 +238,7 @@ impl Status {
     /// A soft failure that keeps the real failure on the record.
     pub fn partial(underlying: FailureInfo) -> Self {
         Self::PartialSuccess {
-            underlying: Some(underlying),
+            underlying: Some(UnderlyingFailure::Failure(underlying)),
         }
     }
 
@@ -568,6 +615,33 @@ pub enum Control {
     /// instruction. May be delivered repeatedly to one firing (steering is a
     /// stream). Never starts the cancellation ladder or the kill tier.
     Deliver(Value),
+}
+
+/// A host's rendered required-finalization failure. The code is host-defined:
+/// the engine stores it without interpreting publication or other host policy.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, thiserror::Error)]
+#[error("{code}: {message}")]
+pub struct FinalizationFailure {
+    pub code:    SmolStr,
+    pub message: String,
+}
+
+impl FinalizationFailure {
+    pub fn new(code: impl Into<SmolStr>, message: impl Into<String>) -> Self {
+        Self {
+            code:    code.into(),
+            message: message.into(),
+        }
+    }
+}
+
+/// The overall result after required finalization. Cancellation takes
+/// precedence; successful finalization never upgrades failed execution.
+pub fn finalized_status(execution: RunStatus, failure: Option<&FinalizationFailure>) -> RunStatus {
+    match execution {
+        RunStatus::Success if failure.is_some() => RunStatus::Failed,
+        status => status,
+    }
 }
 
 /// How a whole run ended.

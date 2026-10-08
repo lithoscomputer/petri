@@ -21,6 +21,8 @@ use steps::{ProcessStep, Registry};
 pub(crate) use testkit::*;
 use tokio::time;
 
+pub(crate) mod sim;
+
 // ── Helpers over the log and report ───────────────────────────────────────
 
 /// The log position of the first record matching `pred`.

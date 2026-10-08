@@ -140,7 +140,7 @@ deterministic run needs a scripted stand-in for the GitHub API and an
 offline-installable Node target. The owner judged that overkill. The repair
 loop's behavior that does not depend on GitHub is covered elsewhere: a real
 deterministic check driving a repair loop until it passes, with the visit
-totals surviving the jump, is `routing/goal-gate-restart-and-visit-limit`;
+totals surviving the return to the retry target, is `routing/goal-gate-restart-and-visit-limit`;
 a provider failure, an exhausted retry budget, a hanging request and a
 cancellation are the `provider-faults` family; a failing stage's policy is
 `routing/failure-policy`. What stays uncovered is the bundle's own GitHub
@@ -267,15 +267,14 @@ None. The matrix (task 18) found one, since retired:
 
 - **The interview bundle needed a `[run.model]` default**
   (`interview-run-model-migration`, retired). `petri run --provider` and
-  `--model` now supply a launch-level model default below the node, the
-  graph and the `[run.model]` layers, and `--provider` alone runs the
-  provider's catalog default (`gpt-5.6-sol` for `openai`), as `fabro run
-  --provider` does. The interview cell runs the unchanged bundle with
-  `--provider openai` on both engines, and
+  `--model` now choose the model over the graph and the `[run.model]`
+  layers, below a model a node names itself, as the pinned Fabro's launch
+  layer sits above `workflow.toml`; `--provider` alone runs the provider's
+  catalog default (`gpt-5.6-sol` for `openai`), as `fabro run --provider`
+  does. The interview cell runs the unchanged bundle with `--provider openai`
+  on both engines, and
   `fabro_blackbox::the_unchanged_interview_bundle_runs_with_a_launch_provider`
-  runs it against the twin. One ordering difference stays, documented in
-  `crates/fabro/FORMAT.md`: the pinned Fabro's launch layer sits above
-  `workflow.toml`, Petri's below it.
+  runs it against the twin.
 
 Resolved by the matrix (Petri fixed, no departure): a `yes_no` or
 `confirmation` gate records `yes`/`no` under `human.gate.<node>.answer` as
@@ -545,7 +544,7 @@ names the decision record under `decisions/`; "gap" names the owner.
 | `default_fidelity`, `fidelity=*`, `thread_id`, `default_thread`, `project_memory` | `petri-frontend-fabro::hooks::full_fidelity_nodes_continue_their_thread_and_others_start_fresh`, `petri-frontend-fabro::hooks::edge_fidelity_wins_and_a_lost_thread_degrades_to_summary_high`, `petri-frontend-fabro::hooks::project_memory_follows_the_profile_and_the_node_kind`, `fabro_hooks_blackbox::full_fidelity_nodes_share_one_conversation_through_the_binary`, `fabro_compaction_blackbox::a_node_that_lost_its_conversation_starts_at_summary_high`, `fabro_fallback_blackbox::a_retained_thread_continues_on_the_fallback_route`, both readiness suites (the `notes` and `docs` threads, the memory rule in the first request). Across `petri resume` a retained thread restarts from the `summary:high` preamble under Fabro's discarded-session rule (`petri-attractor-steps::subagents::a_resumed_run_restarts_the_stage_and_keeps_an_unfinished_childs_files`); this matches the pinned Fabro, whose `AgentApiBackend` keeps full-fidelity sessions in an in-memory map per worker, so it is parity, not a gap (owner decision of 2026-09-08; persisting threads would be an improvement beyond Fabro) |
 | sub-agents | the C4 row above; `fabro_subagents_blackbox` (8), `petri-attractor-steps::subagents` (14), both readiness suites (a hooked child, cancellation inside the child's tool). Accepted difference `subagent-usage-separate` (nesting under the open-session bound and inherited MCP tools are the reference's behaviour too since `05ebd0f`) |
 | `stall_timeout`, `loop_restart_signature_limit`, `goal_gate`, `retry_target`, `max_visits`, `max_node_visits` | `petri::controls::an_idle_run_is_cancelled_by_the_watchdog`, `petri::controls::a_pending_question_parks_the_watchdog`, `fabro_blackbox::a_stalled_run_is_cancelled_by_the_watchdog`, `petri::controls::a_repeated_deterministic_failure_trips_the_breaker_across_restarts`, `petri::controls::a_restart_edge_admits_only_transient_failures`, `petri::controls::the_breaker_state_is_restored_on_resume`, `petri::controls::node_visit_totals_survive_a_restart_while_context_resets`, cell `routing/goal-gate-restart-and-visit-limit`, the oracle |
-| `hexagon` gates, every `question_type`, accelerator labels, `freeform=true`, `human.default_choice`, `review_target`, gate `timeout` | `fabro_blackbox::a_multi_select_answer_routes_on_the_first_key_and_records_all`, `fabro_blackbox::an_invalid_scripted_answer_is_re_asked_and_the_second_entry_routes`, `fabro_blackbox::a_delayed_reply_lands_on_its_gate`, `fabro_blackbox::a_withheld_reply_expires_into_the_default_choice`, `fabro_blackbox::a_withheld_reply_without_a_default_fails_with_the_retry_outcome`, `fabro_blackbox::a_review_target_gate_shows_its_reference_in_the_terminal`, `fabro_terminal_blackbox::interactive_multi_select_takes_comma_separated_keys`, `fabro_terminal_blackbox::interactive_freeform_takes_a_line_of_text`, `fabro_terminal_blackbox::interactive_invalid_input_is_refused_and_asked_again`, `fabro_terminal_blackbox::interactive_without_terminal_input_fails_closed_with_a_reason`, the eleven `interview/*` cells, differential `interview_scripted_choices_match_the_pinned_fabro`. Accepted difference `sensitive-answers`; the launch-level model default (`petri run --provider`, `--model`) runs the unchanged bundle (`fabro_blackbox::the_unchanged_interview_bundle_runs_with_a_launch_provider`) |
+| `hexagon` gates, every `question_type`, accelerator labels, `freeform=true`, `human.default_choice`, `review_target`, gate `timeout` | `fabro_blackbox::a_multi_select_answer_routes_on_the_first_key_and_records_all`, `fabro_blackbox::an_invalid_scripted_answer_is_re_asked_and_the_second_entry_routes`, `fabro_blackbox::a_delayed_reply_lands_on_its_gate`, `fabro_blackbox::a_withheld_reply_expires_into_the_default_choice`, `fabro_blackbox::a_withheld_reply_without_a_default_fails_with_the_retry_outcome`, `fabro_blackbox::a_review_target_gate_shows_its_reference_in_the_terminal`, `fabro_terminal_blackbox::interactive_multi_select_takes_comma_separated_keys`, `fabro_terminal_blackbox::interactive_freeform_takes_a_line_of_text`, `fabro_terminal_blackbox::interactive_invalid_input_is_refused_and_asked_again`, `fabro_terminal_blackbox::interactive_without_terminal_input_fails_closed_with_a_reason`, the eleven `interview/*` cells, differential `interview_scripted_choices_match_the_pinned_fabro`. Accepted difference `sensitive-answers`; the launch model choice (`petri run --provider`, `--model`) runs the unchanged bundle (`fabro_blackbox::the_unchanged_interview_bundle_runs_with_a_launch_provider`) |
 | `tab` prompt nodes | `petri-attractor-steps::prompt`, `fabro_blackbox::a_prompt_node_makes_one_tool_free_model_call`, `fabro_fallback_blackbox::a_prompt_node_fails_over_and_repairs_on_its_plan`. Accepted difference `event-kinds` |
 | `house` manager loop, `stack.child_workflow`, `manager.max_cycles` | `petri-attractor-steps::manager` (`a_thousand_polls_consume_one_child_then_exhaustion_cancels_it`, `a_redispatched_attempt_reattaches_and_a_new_attempt_starts_a_new_child`, `the_stop_condition_reads_the_parent_context_and_cancels_the_child`, `a_parent_cancel_cancels_the_child`, `max_cycles_normalizes_as_fabro_does`), `petri-fabro-acceptance::workflow`, the six `implement/*` host cells and `implement/child-runs-successfully@docker/openrouter` (inline graphs of the bundle's shape: an accepted migration, task 17; the Docker cell runs the manager loop, the child and its deterministic check inside the container). The pinned bundle itself is not run: its child's verify node hard-codes the Fabro repository's own toolchain |
 | conditions, `{{ inputs.* }}`, `[run.inputs]`, `import` | `petri-frontend-attractor::conditions`, the oracle, `fabro_blackbox::workflow_toml_inputs_bind_and_unsupported_sections_are_reported`, `petri-frontend-attractor::lowering::imports_expand_at_load_with_fabro_rules`, `fabro_blackbox::an_import_is_expanded_at_load_and_its_nodes_run_under_the_prefix` |
@@ -556,7 +555,7 @@ names the decision record under `decisions/`; "gap" names the owner.
 | `[run.agent]` `fabro_tools`, `skills`, `compaction`; `[run.agent.mcps]` | the C2, C3, C5 rows; `petri-frontend-fabro::lowering::run_agent_skills_is_a_warned_extension`, `petri-frontend-fabro::lowering::mcps_lower_onto_agent_nodes_and_into_nested_workflows`, `fabro_mcp_blackbox::unsupported_mcp_settings_are_refused_before_the_run`, `fabro_mcp_blackbox::a_sandbox_server_in_a_docker_scope_is_reached_through_the_plugins_forward`, both readiness suites. Accepted differences `mcp-catalog-and-transports`, `mcp-server-lifetime`, `run-agent-skills-extension`, `malformed-skills-reported`, `missing-skill-failure-class` (compaction runs in Pebble with the same values on both engines since `05ebd0f`) |
 | `[[run.hooks]]` | `petri-frontend-fabro::hooks` (`command_hooks_fire_at_every_reference_phase_with_fabros_payload`, `a_blocking_run_start_hook_stops_the_run_before_work`, `command_decisions_skip_block_and_ignore_nonblocking_hooks`, `edge_hooks_override_and_block_routes`, `native_tool_hooks_block_pre_and_observe_post`, `acp_tool_hooks_are_best_effort_with_explicit_warnings`, `a_command_hook_timeout_blocks`, `http_hooks_post_the_context_and_fail_open`, `prompt_hooks_evaluate_with_one_model_call_and_fail_open`, `agent_hooks_investigate_the_workspace_then_decide`, `hooks_load_from_every_layer_and_merge_by_id`, `run_failed_then_sandbox_cleanup_run_at_the_run_end_in_fabros_order`, `parallel_start_and_parallel_complete_surround_the_branches`, `a_replacement_service_receives_every_step_driven_phase_once`, `a_replacement_service_serves_acp_permission_requests_best_effort`, `an_agent_hook_timeout_stops_its_tool_before_failing_open`, `a_cancelled_run_stops_an_agent_hooks_running_tool`, `prompt_hook_usage_records_a_failed_and_a_timed_out_request`, `an_agent_hooks_activity_is_kept_apart_from_the_stages_own`, `agent_hook_tool_rounds_are_a_hard_bound_that_fails_open`), `fabro_hooks_blackbox::a_configured_hook_blocks_a_real_tool_effect_in_the_native_backend`, `fabro_milestone_blackbox` (run-end hooks), both readiness suites (hooks on a skill-driven call, an MCP call, inside a child; every report on the public stream). Accepted differences `acp-tool-hooks-best-effort`, `stage-retrying-hook`, `checkpoint-saved-hook`; the run-level reports are recorded (`fabro_milestone_blackbox::assert_run_level_notes`) |
 | `[run.clone]` | the code-review and security-review cells of `fabro_scenarios_blackbox` (the fixture repository checked out on the host and in a container), the `attractor.checkout` event |
-| `backend="acp"`, `acp.command` | the `acp` cells of `fabro_scenarios_blackbox` (a scripted agent on the host and in a container: turn text, routing directive, retry on agent exit, permission hooks, cancellation), `petri-attractor-steps::agent`, `petri-attractor-steps::acp` (Petri's scripted agent: the `acp` envelope for every update, the permission policy, the session usage extension, `authenticate`, product credentials and `$secret` references in the agent's environment), `petri-frontend-fabro::hooks::acp_tool_hooks_are_best_effort_with_explicit_warnings`, `petri-frontend-fabro::hooks::a_proceeding_pre_tool_use_hook_allows_once_so_every_call_asks`; the real products (Claude Code through `claude-code-acp`, Gemini CLI through `gemini --acp`) in the live tier `petri::acp_products` (`--ignored`, the product on `PATH` and its credential set; not part of this gate). Accepted difference `acp-tool-hooks-best-effort`. An ACP turn failure is classed `retry_requested`, as Fabro's retryable handler error is (`FORMAT.md`) |
+| `backend="acp"`, `acp.command` | the `acp` cells of `fabro_scenarios_blackbox` (a scripted agent on the host and in a container: turn text, routing directive, retry on agent exit, permission hooks, cancellation), `petri-attractor-steps::agent`, `petri-attractor-steps::acp` (Petri's scripted agent: the `acp` envelope for every update, the permission policy, the session usage extension, `authenticate`, only the named `$secret` references in the agent's environment), `petri-frontend-fabro::hooks::acp_tool_hooks_are_best_effort_with_explicit_warnings`, `petri-frontend-fabro::hooks::a_proceeding_pre_tool_use_hook_allows_once_so_every_call_asks`; the real products (Claude Code through `claude-code-acp`, Gemini CLI through `gemini --acp`) in the live tier `petri::acp_products` (`--ignored`, the product on `PATH` and its credential set; not part of this gate). Accepted difference `acp-tool-hooks-best-effort`. An ACP turn failure is classed `retry_requested`, as Fabro's retryable handler error is (`FORMAT.md`) |
 | pause, unpause, steer, interrupt, cancellation, retention | `petri::controls::pause_holds_admission_and_unpause_releases_it`, `petri::controls::a_paused_run_can_still_be_cancelled`, `petri::controls::a_steer_reaches_the_stage_and_does_not_answer_its_question`, `petri::interrupt::an_interrupt_with_text_ends_the_turn_and_the_text_opens_the_next`, `petri::interrupt::a_plain_interrupt_waits_for_the_next_steer`, `petri::interrupt::an_interrupt_on_a_stage_with_no_live_turn_is_refused`, `petri::interrupt::an_acp_interrupt_cancels_the_turn_and_the_text_is_the_next_prompt`, `fabro_blackbox::the_control_file_pauses_unpauses_and_steers_without_answering`, the cancellation cases of `fabro_milestone_blackbox` and `fabro_readiness_blackbox`, `fabro_blackbox::retain_never_deletes_the_workspace`. The pause is durable: `petri::controls::a_pause_survives_resume_and_holds_admission_until_unpaused`, `petri::controls::a_paused_resumed_run_can_be_cancelled`, `fabro_resume_blackbox::a_paused_run_stays_paused_across_resume_until_unpaused`, `fabro_resume_blackbox::inspect_reports_a_paused_run_as_paused`. Recovery through the binary: `fabro_resume_blackbox::a_killed_run_resumes_without_repeating_finished_work`, `a_gate_waiting_at_the_crash_asks_again_on_resume`, and the three refusal cases |
 
 ### Known limitations carried into the handoff
@@ -611,7 +610,7 @@ names the decision record under `decisions/`; "gap" names the owner.
    owns the budget, deduplication and truncation for native sessions and
    prompt nodes alike; `attractor_steps::memory` keeps only Fabro's path
    selection.
-9. Retired: the interview bundle's launch-level model default is
+9. Retired: the interview bundle's model comes from the launch,
    `petri run --provider` and `--model`.
 
 ## Library pin
@@ -784,26 +783,23 @@ agent's event stream as `LlmRetry`.
 ## Pinned revisions
 
 Every library Petri runs Fabro workflows through is locked to one commit
-(see "Git dependencies" in `DEVELOPING.md`). This table is the
-citation the evidence records and `scripts/check-pins.py` compare against
-`Cargo.lock`, `crates/fabro/corpus-pin.txt`, and `bundles.lock.json`.
-`mise run check:pins` fails when any of them disagree, when an internal
-dependency names anything but `branch = "main"`, or when `Cargo.lock` holds
-two copies of one library. The row names are the keys of a record's
-`pins` block.
+(see "Git dependencies" in `DEVELOPING.md`). Each revision has one home, and
+this table names it instead of copying it. The row names are the keys of an
+evidence record's `pins` block, which the record reads from these sources
+when it is written.
 
 | Pin | Revision | Repository | Role |
 |---|---|---|---|
-| `pebble` | `ba2928d7407a536de817667d5cea02d8595d4167` | `lithoscomputer/pebble` (public) | the agent loop and coding agent (`pebble-coding-agent`, `pebble-agent`) |
-| `lithos_llm` | `f40391aa8b3c3871bbac3dced2f4e26ddc46a743` | `lithoscomputer/lithos-llm` (public) | provider transport, request retries, and the `Usage` type every usage takes |
-| `sandbox_driver` | `7d1932b5fd758dbc67ae5a34aaed08d8733ddaba` | `lithoscomputer/sandbox-driver` (public) | the sandbox plugin protocol and the host, Docker, and Daytona plugins |
-| `twins` | `ca45f0e50a6716d716aa2f638ca3cf767e88f613` | `lithoscomputer/twins` (public) | the OpenAI and Anthropic provider twins the harness serves on loopback |
-| `fabro_reference` | `05ebd0fd1beec214b558f4b478e36bd08b507dc7` | `fabro-sh/fabro` (public, `main`) | the reference Fabro the corpus, oracle, bundles, and differential matrix use |
-| `runner_image` | `f8bbbfd81934` | `lithoscomputer/sandbox-images` (public) | the default runner images (`ghcr.io/lithoscomputer/ubuntu-*`) Docker and Daytona scopes start from (`RUNNER_PIN` in `crates/core/executor-sandbox/src/backend.rs`; PyYAML present since `df708f910111`) |
+| `pebble` | `Cargo.lock` | `lithoscomputer/pebble` (public) | the agent loop and coding agent (`pebble-coding-agent`, `pebble-agent`) |
+| `lithos_llm` | `Cargo.lock` | `lithoscomputer/lithos-llm` (public) | provider transport, request retries, and the `Usage` type every usage takes |
+| `sandbox_driver` | `Cargo.lock` | `lithoscomputer/sandbox-driver` (public) | the sandbox plugin protocol and the host, Docker, and Daytona plugins |
+| `twins` | `Cargo.lock` | `lithoscomputer/twins` (public) | the OpenAI and Anthropic provider twins the harness serves on loopback |
+| `fabro_reference` | `crates/fabro/corpus-pin.txt` | `fabro-sh/fabro` (public, `main`) | the reference Fabro the corpus, oracle, bundles, and differential matrix use |
+| `runner_image` | `RUNNER_PIN` in `crates/core/executor-sandbox/src/backend.rs` | `lithoscomputer/sandbox-images` (public) | the default runner images (`ghcr.io/lithoscomputer/ubuntu-*`) Docker and Daytona scopes start from (PyYAML present since `df708f910111`) |
 
 A change to Pebble or lithos-llm runs the owning
-repository's required checks before Petri moves its lock; then this table,
-`Cargo.lock`, and the affected evidence records move together. The library batch
+repository's required checks before Petri moves its lock; then the affected
+scenarios run again, and their evidence records cite the new commits. The library batch
 the readiness work asked for is inside the pinned revisions (Pebble `4c00633`,
 sandbox-driver `a92c0db6`); the twins track `main` in both test crates that
 serve them. Since Pebble `6996942` Pebble's `mcp` feature no longer names
@@ -861,7 +857,7 @@ it.
 |---|---|---|
 | Repeatable focused task on the same required set as CI | `mise run test:fabro:blackbox` runs `scripts/test-fabro-blackbox.sh`: every `petri-cli` `fabro_*blackbox` binary (the readiness suite included) plus `standalone`, `fabro_cli` and the oracle test, same build and features as `mise run test`, evidence and coverage report per run | met |
 | Extended variations and repeated process-isolation runs in `check:nightly` | `mise run check:nightly` on every nightly runner: `test:fabro:blackbox:repeat` (three runs under different schedules), `test:long`, `test:fabro:differential`, `check:msrv`, `test:release`; the nightly workflow then runs `check:fabro:readiness` (the strict set, `test:fabro:blackbox:strict`, plus the readiness verdict) on the runners that have Docker, since the strict task requires a daemon | met |
-| Library changes run the owning repository's checks before Petri pins them | `README.md` "Library and repository gates", `DEVELOPING.md`; the "Pinned revisions" table above; `mise run check:pins` (the runner image included) | met; the batch is pinned |
+| Library changes run the owning repository's checks before Petri pins them | `README.md` "Library and repository gates", `DEVELOPING.md`; the "Pinned revisions" table above | met; the batch is locked |
 | Protocol retry, Pebble replay, Petri retry, and cross-layer cases distinct; a provider interruption after a non-idempotent tool effect | `llm_client.rs`, `fabro_fallback_blackbox::a_tool_effect_is_not_repeated_across_a_failover`, `client_retries_are_spent_before_the_chain_advances`, `a_workflow_retry_is_not_a_failover`, `fallback_events.rs` | met |
 | Required CI verifies the vendored bundles and the pinned twins, requires the corpus, fails on an absent asset, binary, scenario, or backend | `.github/workflows/ci.yml`; `PETRI_REQUIRE_*`; `tests/support/fabro/require.rs`; `mise run check:bundles` | met: the push runs on `67f4cb0` (34325364222), `97fb247` (34379457228) and `2463979` (34394908040) passed every job with no fetch and no key (2026-09-09) |
 | Every required host scenario in routine CI; the Docker subset on Linux | `mise run check` runs the whole suite on both runners; Docker cases skip on macOS and are required on Linux; every planned cell of `matrix.json` has a test | met; hosted on the runs above (Linux with Docker required, macOS host cells) |

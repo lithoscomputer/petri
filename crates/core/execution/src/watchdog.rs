@@ -5,7 +5,9 @@
 //! question parks the clock: while a step of the run waits on a person, the
 //! run is not stalled, it is blocked. When the last pending question is
 //! answered, or expires by the step's own report, the run gets a full stall
-//! budget again.
+//! budget again. A pause parks it too: a paused run waits on its host, by
+//! the host's own choice, and its unpause restarts the full budget. A run
+//! resumed paused starts parked.
 //!
 //! This is separate from each attempt's active-work timer
 //! ([`ir::TimeoutPolicy`]): that one bounds one step's own work, this one
@@ -27,7 +29,10 @@ use tokio::task::JoinHandle;
 use tokio::time::{Instant, sleep_until};
 use tokio_util::sync::CancellationToken;
 
-use crate::{CancelReason, CoordinatorHandle, CoordinatorRecord, ExecutionId, ExecutionObserver};
+use crate::{
+    CancelReason, CoordinatorEvent, CoordinatorHandle, CoordinatorRecord, CoordinatorState,
+    ExecutionId, ExecutionObserver,
+};
 
 /// Why the watchdog cancelled the run.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -42,7 +47,17 @@ struct State {
     last_activity: Instant,
     /// Questions asked and not yet answered, by execution and question id.
     pending:       BTreeSet<(ExecutionId, String)>,
+    /// The run's last recorded control is a pause.
+    paused:        bool,
     tripped:       Option<StallTimeout>,
+}
+
+impl State {
+    /// The clock is parked: a question waits on a person, or the host
+    /// paused the run.
+    fn parked(&self) -> bool {
+        self.paused || !self.pending.is_empty()
+    }
 }
 
 struct Inner {
@@ -76,6 +91,7 @@ impl StallWatchdog {
                 state: Mutex::new(State {
                     last_activity: Instant::now(),
                     pending:       BTreeSet::new(),
+                    paused:        false,
                     tripped:       None,
                 }),
                 changed: Notify::new(),
@@ -109,7 +125,7 @@ impl StallWatchdog {
         });
         WatchdogTask {
             stop: self.stop.clone(),
-            task,
+            task: Some(task),
         }
     }
 
@@ -133,6 +149,22 @@ impl StallWatchdog {
         }
     }
 
+    /// The run was paused, or unpaused: a pause parks the clock, and an
+    /// unpause restarts the full budget.
+    fn set_paused(&self, paused: bool) {
+        let mut state = self.inner.state();
+        if state.paused == paused {
+            return;
+        }
+        state.paused = paused;
+        if !paused {
+            state.last_activity = Instant::now();
+        }
+        drop(state);
+        tracing::debug!(paused, "stall watchdog follows the run's pause");
+        self.inner.changed.notify_one();
+    }
+
     fn unblock(&self, execution: ExecutionId, question: &str) {
         let mut state = self.inner.state();
         if !state.pending.remove(&(execution, question.to_owned())) {
@@ -151,13 +183,23 @@ impl StallWatchdog {
 /// The running monitor. Stop it after the run; dropping it aborts the task.
 pub struct WatchdogTask {
     stop: CancellationToken,
-    task: JoinHandle<()>,
+    task: Option<JoinHandle<()>>,
 }
 
 impl WatchdogTask {
-    pub async fn stop(self) {
+    pub async fn stop(mut self) {
         self.stop.cancel();
-        let _ = self.task.await;
+        if let Some(task) = self.task.take() {
+            let _ = task.await;
+        }
+    }
+}
+
+impl Drop for WatchdogTask {
+    fn drop(&mut self) {
+        if let Some(task) = &self.task {
+            task.abort();
+        }
     }
 }
 
@@ -165,10 +207,7 @@ async fn monitor(inner: Arc<Inner>, stop: CancellationToken, cancel: impl Fn(Sta
     loop {
         let (deadline, blocked) = {
             let state = inner.state();
-            (
-                state.last_activity + inner.timeout,
-                !state.pending.is_empty(),
-            )
+            (state.last_activity + inner.timeout, state.parked())
         };
         tokio::select! {
             biased;
@@ -176,7 +215,7 @@ async fn monitor(inner: Arc<Inner>, stop: CancellationToken, cancel: impl Fn(Sta
             () = inner.changed.notified() => {}
             () = sleep_until(deadline), if !blocked => {
                 let mut state = inner.state();
-                if !state.pending.is_empty() {
+                if state.parked() {
                     continue;
                 }
                 let idle = state.last_activity.elapsed();
@@ -254,8 +293,21 @@ impl ExecutionObserver for StallWatchdog {
         }
     }
 
-    fn on_lifecycle(&self, _record: &CoordinatorRecord) {
+    fn on_lifecycle(&self, record: &CoordinatorRecord) {
         self.touch();
+        match record.body {
+            CoordinatorEvent::RunPaused => self.set_paused(true),
+            CoordinatorEvent::RunUnpaused => self.set_paused(false),
+            _ => {}
+        }
+    }
+
+    /// A run resumed paused starts parked, as the control service starts it
+    /// held.
+    fn on_resumed(&self, state: &CoordinatorState) {
+        if state.paused {
+            self.set_paused(true);
+        }
     }
 }
 
@@ -337,6 +389,29 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
+    async fn a_pause_parks_the_clock_and_an_unpause_restarts_it_in_full() {
+        let watchdog = StallWatchdog::new(Duration::from_secs(60));
+        let fired = Arc::new(AtomicUsize::new(0));
+        let task = run_monitor(watchdog.inner.clone(), watchdog.stop.clone(), fired.clone());
+        advance(Duration::from_secs(30)).await;
+        watchdog.set_paused(true);
+        advance(Duration::from_secs(600)).await;
+        yield_now().await;
+        assert_eq!(fired.load(Ordering::SeqCst), 0, "paused runs never stall");
+        watchdog.set_paused(false);
+        advance(Duration::from_secs(59)).await;
+        yield_now().await;
+        assert_eq!(
+            fired.load(Ordering::SeqCst),
+            0,
+            "a full budget after the unpause"
+        );
+        advance(Duration::from_secs(2)).await;
+        task.await.expect("fires");
+        assert_eq!(fired.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test(start_paused = true)]
     async fn two_pending_questions_unblock_only_when_both_are_answered() {
         let watchdog = StallWatchdog::new(Duration::from_secs(60));
         let fired = Arc::new(AtomicUsize::new(0));
@@ -364,6 +439,28 @@ mod tests {
         watchdog.stop.cancel();
         task.await.expect("stopped");
         advance(Duration::from_secs(600)).await;
+        assert_eq!(fired.load(Ordering::SeqCst), 0);
+        assert!(watchdog.tripped().is_none());
+    }
+
+    /// A monitor whose task handle is dropped (a crashed host) ends with
+    /// it: it never fires into a run it no longer watches.
+    #[tokio::test(start_paused = true)]
+    async fn dropping_the_task_ends_the_monitor() {
+        let watchdog = StallWatchdog::new(Duration::from_secs(60));
+        let fired = Arc::new(AtomicUsize::new(0));
+        let task = WatchdogTask {
+            stop: watchdog.stop.clone(),
+            task: Some(run_monitor(
+                watchdog.inner.clone(),
+                watchdog.stop.clone(),
+                fired.clone(),
+            )),
+        };
+        yield_now().await;
+        drop(task);
+        advance(Duration::from_secs(600)).await;
+        yield_now().await;
         assert_eq!(fired.load(Ordering::SeqCst), 0);
         assert!(watchdog.tripped().is_none());
     }

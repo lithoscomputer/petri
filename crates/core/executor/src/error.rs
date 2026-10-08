@@ -51,6 +51,12 @@ pub enum EnvError {
     Gone,
     #[error("this sandbox cannot reach services on Petri's machine")]
     HostUnreachable,
+    /// The run's own store failed a write the environment needed, such as a
+    /// sandbox lease record. It is not the environment's failure: the driver
+    /// stops without recording one, and the host resumes the run from what
+    /// the store holds.
+    #[error("the run's store failed: {message}")]
+    Store { message: String },
 }
 
 impl EnvError {
@@ -75,6 +81,7 @@ impl EnvError {
             Self::FenceLeaked { .. } => "fence_leaked",
             Self::Gone => "gone",
             Self::HostUnreachable => "host_unreachable",
+            Self::Store { .. } => "store",
         }
     }
 

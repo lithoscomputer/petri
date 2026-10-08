@@ -3,9 +3,8 @@
 //! launch inputs, the twin scenarios it consumed, its observations, final
 //! context, assertions, and cleanup; a failed scenario keeps its whole case
 //! directory; the coverage report (`scripts/fabro-coverage-report.py`)
-//! counts only passed cells; the pin check (`scripts/check-pins.py`) rejects
-//! a record that cites another revision; and a required asset fails instead
-//! of skipping when CI asks for it.
+//! counts only passed cells; and a required asset fails instead of skipping
+//! when CI asks for it.
 
 mod support;
 
@@ -186,9 +185,9 @@ async fn a_host_scenario_writes_a_complete_evidence_record() {
     assert!(!bundle.join("case").exists());
     assert!(record["bundle"]["case"].is_null());
 
-    // The pin check accepts the record and the coverage report passes the
-    // run, checked on a private copy of this one record so other scenarios
-    // recording into the same run cannot change the counts.
+    // The coverage report passes the run, checked on a private copy of this one
+    // record so other scenarios recording into the same run cannot change the
+    // counts.
     let evidence = case.root.join("evidence");
     fs::create_dir_all(evidence.join("records")).expect("evidence copy");
     fs::copy(
@@ -198,15 +197,6 @@ async fn a_host_scenario_writes_a_complete_evidence_record() {
             .join(path.file_name().expect("name")),
     )
     .expect("copy the record");
-    let pins = script("check-pins.py", &[
-        "--evidence",
-        evidence.to_str().expect("utf-8"),
-    ]);
-    assert!(
-        pins.status.success(),
-        "{}",
-        String::from_utf8_lossy(&pins.stderr)
-    );
     let coverage = script("fabro-coverage-report.py", &[
         "--evidence",
         evidence.to_str().expect("utf-8"),
@@ -644,27 +634,6 @@ fn an_empty_evidence_run_is_not_a_passing_gate() {
     assert!(stderr.contains("no evidence records"), "{stderr}");
     let report = read_json(&evidence.join("coverage.json"));
     assert_eq!(report["ok"], json!(false));
-    let _ = fs::remove_dir_all(&evidence);
-}
-
-#[test]
-fn the_pin_check_rejects_a_record_citing_another_revision() {
-    let evidence = env::temp_dir().join(format!(
-        "petri-evidence-pins-{}-{}",
-        process::id(),
-        testkit::unique_id()
-    ));
-    let path = Recorder::start_in(&evidence, "pins", Backend::Host, "t::pins").finish();
-    let mut record = read_json(&path);
-    record["pins"]["pebble"] = json!("deadbeefdeadbeefdeadbeefdeadbeefdeadbeef");
-    fs::write(&path, serde_json::to_vec_pretty(&record).expect("record")).expect("rewrite");
-    let output = script("check-pins.py", &[
-        "--evidence",
-        evidence.to_str().expect("utf-8"),
-    ]);
-    assert_eq!(output.status.code(), Some(1));
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(stderr.contains("pebble cites deadbeef"), "{stderr}");
     let _ = fs::remove_dir_all(&evidence);
 }
 

@@ -8,14 +8,16 @@
 //!
 //! This is how a bundle that declares no model, such as the pinned
 //! interview workflow, gets one: the operator's settings name it, as they
-//! do for a Fabro server. Below every file layer sits the launch itself
-//! ([`LaunchModel`]): `petri run --model` and `--provider`, as `fabro run`
-//! takes them.
+//! do for a Fabro server. The launch itself ([`LaunchModel`]) sits on both
+//! sides of the files: what `petri run --model` and `--provider` ask for
+//! overrides them, as `fabro run` takes the flags, and a host's default sits
+//! below every file layer.
 
 use frontend::{
-    CompileInputs, Diagnostics, FileSource, LAUNCH_MODEL_VAR, LAUNCH_PROVIDER_VAR, Span,
+    CompileInputs, DEFAULT_MODEL_VAR, DEFAULT_PROVIDER_VAR, Diagnostics, FileSource,
+    LAUNCH_MODEL_VAR, LAUNCH_PROVIDER_VAR, Span,
 };
-use frontend_attractor::ModelDefaults;
+use frontend_attractor::{ModelDefaults, ModelOverride};
 use serde_json::Value;
 
 use crate::fallbacks;
@@ -37,20 +39,27 @@ pub(crate) fn apply(
     }
 }
 
-/// The launch-level model default the host bound (`petri run --model`,
-/// `--provider`). It fills the model name and provider the file layers
-/// left unset, and the launch parameter records it as given, so the
-/// persisted graph says what the run was launched with. A provider alone
-/// leaves the name unset: the runner picks the provider's default model
+/// The model the host bound for the launch. `model` and `provider` are what
+/// the launch asked for (`petri run --model`, `--provider`, bound as the
+/// `petri.launch_*` variables): they override the file layers and the
+/// graph's defaults, below a model a node names itself. `default_model` and
+/// `default_provider` are the host's last default (`petri.default_*`), such as
+/// a server's catalog default: they fill only what nothing else set. The
+/// launch parameter records all four as given, so the persisted graph says
+/// what the run was launched with. A provider alone, where nothing names a
+/// model, leaves the name unset: the runner picks the provider's default model
 /// from its catalog, as Fabro's `--provider` does.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct LaunchModel {
-    pub model:    Option<String>,
-    pub provider: Option<String>,
+    pub model:            Option<String>,
+    pub provider:         Option<String>,
+    pub default_model:    Option<String>,
+    pub default_provider: Option<String>,
 }
 
 impl LaunchModel {
-    /// What the host bound, read from the compile variables.
+    /// What the host bound, read from the compile variables. A blank value
+    /// counts as unset.
     pub fn from_inputs(inputs: &CompileInputs) -> Self {
         let text = |name: &str| {
             inputs
@@ -61,18 +70,29 @@ impl LaunchModel {
                 .map(str::to_owned)
         };
         Self {
-            model:    text(LAUNCH_MODEL_VAR),
-            provider: text(LAUNCH_PROVIDER_VAR),
+            model:            text(LAUNCH_MODEL_VAR),
+            provider:         text(LAUNCH_PROVIDER_VAR),
+            default_model:    text(DEFAULT_MODEL_VAR),
+            default_provider: text(DEFAULT_PROVIDER_VAR),
         }
     }
 
-    /// Fill `model`'s unset name and provider from the launch.
-    pub fn fill(&self, model: &mut ModelDefaults) {
+    /// What the launch asked for, for the lowering to apply over the
+    /// defaults.
+    pub fn model_override(&self) -> ModelOverride {
+        ModelOverride {
+            provider: self.provider.clone(),
+            name:     self.model.clone(),
+        }
+    }
+
+    /// Fill `model`'s unset name and provider from the host's default.
+    pub fn fill_defaults(&self, model: &mut ModelDefaults) {
         if model.name.is_none() {
-            model.name.clone_from(&self.model);
+            model.name.clone_from(&self.default_model);
         }
         if model.provider.is_none() {
-            model.provider.clone_from(&self.provider);
+            model.provider.clone_from(&self.default_provider);
         }
     }
 }

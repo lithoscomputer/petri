@@ -79,6 +79,9 @@ pub(crate) fn registry() -> Kinds {
 pub(crate) const NOOP: StepKindId = StepKindId::new_static("noop");
 
 type Responder = Box<dyn FnMut(&StartInfo) -> Outcome>;
+type Observer = Box<dyn FnMut(&EngineState, &[Command])>;
+/// Answers a decision itself, or leaves it to the default answer.
+type Decider = Box<dyn FnMut(&Command, &EngineState) -> Option<Event>>;
 
 pub(crate) struct Harness {
     pub state:             EngineState,
@@ -95,6 +98,14 @@ pub(crate) struct Harness {
     /// Every `ScheduleRetry` the core issued, in order.
     pub scheduled_retries: Vec<(FiringId, Attempt, Duration)>,
     pub status:            Option<RunStatus>,
+    /// Called after every `apply` with the new state and the commands it
+    /// produced.
+    observer:              Option<Observer>,
+    /// Leave each `Admit` and `ResolveRouting` in `commands` for the test to
+    /// answer, instead of answering it at once.
+    hold_decisions:        bool,
+    /// Answers decisions instead of the default, when it chooses to.
+    decider:               Option<Decider>,
 }
 
 impl Harness {
@@ -108,7 +119,34 @@ impl Harness {
             max_concurrent:    0,
             scheduled_retries: Vec::new(),
             status:            None,
+            observer:          None,
+            hold_decisions:    false,
+            decider:           None,
         }
+    }
+
+    /// Let `decide` answer each decision: the event it returns is fed as the
+    /// answer, and `None` leaves the default answer.
+    pub(crate) fn deciding(
+        mut self,
+        decide: impl FnMut(&Command, &EngineState) -> Option<Event> + 'static,
+    ) -> Self {
+        self.decider = Some(Box::new(decide));
+        self
+    }
+
+    /// Leave every decision the core asks for open: the test answers each
+    /// one with [`Self::answer`], when it chooses.
+    pub(crate) fn holding_decisions(mut self) -> Self {
+        self.hold_decisions = true;
+        self
+    }
+
+    /// Watch the run as it goes: every `apply`'s new state and the commands
+    /// it produced.
+    pub(crate) fn observe(mut self, f: impl FnMut(&EngineState, &[Command]) + 'static) -> Self {
+        self.observer = Some(Box::new(f));
+        self
     }
 
     /// Decide each step's result from the request.
@@ -227,6 +265,9 @@ impl Harness {
         let state = mem::replace(&mut self.state, EngineState::new(Graph::new()));
         let (state, commands) = apply(state, event);
         self.state = state;
+        if let Some(observer) = self.observer.as_mut() {
+            observer(&self.state, &commands);
+        }
         for command in &commands {
             if let Command::FinishExecution {
                 exit: EngineExit::Terminal { status },
@@ -236,43 +277,59 @@ impl Harness {
             }
         }
         self.commands.extend(commands.iter().cloned());
-        for command in commands {
-            match &command {
-                Command::Admit { decision_id } => {
-                    let event = Event::AdmissionDecided {
-                        decision_id: *decision_id,
-                        decision:    Admission::Admit,
-                        trace:       Vec::new(),
-                    };
-                    self.feed(event);
-                }
-                Command::ResolveRouting {
-                    decision_id,
-                    restart_allowed,
-                    groups,
-                } => {
-                    let decisions = groups
-                        .iter()
-                        .map(|proposal| {
-                            let (decision, draw) = resolve_group(proposal);
-                            let decision =
-                                engine::enforce_restart_limit(*restart_allowed, proposal, decision);
-                            GroupDecision {
-                                group: proposal.group,
-                                draw,
-                                trace: Vec::new(),
-                                decision,
-                            }
-                        })
-                        .collect();
-                    let event = Event::RoutingResolved {
-                        decision_id: *decision_id,
-                        groups:      decisions,
-                    };
-                    self.feed(event);
-                }
-                _ => {}
+        if self.hold_decisions {
+            return;
+        }
+        for command in &commands {
+            self.answer(command);
+        }
+    }
+
+    /// Answer a decision the core asked for, as the host does: admit the
+    /// attempt, or resolve each routing group. Any other command is no
+    /// decision, and is left alone.
+    pub(crate) fn answer(&mut self, command: &Command) {
+        if let Some(decide) = self.decider.as_mut()
+            && let Some(event) = decide(command, &self.state)
+        {
+            self.feed(event);
+            return;
+        }
+        match command {
+            Command::Admit { decision_id } => {
+                let event = Event::AdmissionDecided {
+                    decision_id: *decision_id,
+                    decision:    Admission::Admit,
+                    trace:       Vec::new(),
+                };
+                self.feed(event);
             }
+            Command::ResolveRouting {
+                decision_id,
+                restart_allowed,
+                groups,
+            } => {
+                let decisions = groups
+                    .iter()
+                    .map(|proposal| {
+                        let (decision, draw) = resolve_group(proposal);
+                        let decision =
+                            engine::enforce_restart_limit(*restart_allowed, proposal, decision);
+                        GroupDecision {
+                            group: proposal.group,
+                            draw,
+                            trace: Vec::new(),
+                            decision,
+                        }
+                    })
+                    .collect();
+                let event = Event::RoutingResolved {
+                    decision_id: *decision_id,
+                    groups:      decisions,
+                };
+                self.feed(event);
+            }
+            _ => {}
         }
     }
 
@@ -383,7 +440,9 @@ impl Harness {
 /// The engine's own deterministic pick, with a fixed roll of zero for weighted
 /// tiers — the host would roll randomly; a test walks the same cursor with a
 /// known draw.
-fn resolve_group(proposal: &engine::RoutingProposal) -> (RouteDecision, Option<WeightedDraw>) {
+pub(crate) fn resolve_group(
+    proposal: &engine::RoutingProposal,
+) -> (RouteDecision, Option<WeightedDraw>) {
     let draw = (proposal.pick == Some(ir::PickPolicy::WeightedRandom)
         && !proposal.candidates.is_empty())
     .then(|| WeightedDraw {

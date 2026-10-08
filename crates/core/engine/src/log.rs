@@ -57,7 +57,13 @@ use crate::event::Event;
 /// sandbox, the workspace, the lease, the acquisition time) or why it could
 /// not be acquired. The core applies neither. Standing policy, no migrator:
 /// a v10 log is rejected cleanly.
-pub const LOG_VERSION: u32 = 11;
+///
+/// v11 → v12: a partial success keeps the failure it was converted from
+/// whole: `underlying` holds an `UnderlyingFailure` (a failure with its info,
+/// or a timeout) instead of a bare `FailureInfo`, so an exhausted timeout
+/// accepted as partial no longer loses the timeout (§3.1 rule 3). Standing
+/// policy, no migrator: a v11 log is rejected cleanly.
+pub const LOG_VERSION: u32 = 12;
 
 /// Where an event came from.
 ///

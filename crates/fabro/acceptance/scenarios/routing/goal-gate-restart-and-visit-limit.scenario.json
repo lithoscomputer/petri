@@ -2,7 +2,7 @@
   "schema_version": 1,
   "id": "routing/goal-gate-restart-and-visit-limit",
   "family": "routing",
-  "title": "A goal gate sends the run back to its retry target until the deterministic check passes: the check runs twice, the repair once, the visit totals survive the jump, and the run leaves through the gate with the repaired state.",
+  "title": "A goal gate sends the run back to its retry target until the deterministic check passes: the check runs twice, the repair once, the visit totals survive the return to the retry target, and the run leaves through the gate with the repaired state.",
   "obligation": "routing/goal-gates-and-visit-limits",
   "bundle": {
     "inline": "graphs/goal-gate-loop.fabro"

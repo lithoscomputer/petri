@@ -131,10 +131,6 @@ run = "zizmor .github/workflows"
 description = "Verify the vendored Fabro bundles against bundles.lock.json, digest by digest"
 run = "scripts/corpus-fetch-fabro-bundles.sh"
 
-[tasks."check:pins"]
-description = "Check internal git dependency refs, and that Cargo.lock, CONTRACT.md, and the latest evidence records agree"
-run = "python3 scripts/check-pins.py"
-
 [tasks."check:whitespace"]
 description = "Check tracked and untracked patches for whitespace errors"
 run = ["git diff --check", "git diff --cached --check"]
@@ -152,7 +148,6 @@ depends = [
   "check:release-build",
   "check:actions",
   "check:bundles",
-  "check:pins",
   "check:whitespace",
   "test:remote",
 ]
@@ -163,12 +158,21 @@ depends = ["plugins:build"]
 env = { CARGO_PROFILE_TEST_DEBUG = "0", PETRI_SANDBOX_DOCKER_PLUGIN = "{{config_root}}/target/plugins/bin/sandbox-driver-docker", PETRI_SANDBOX_HOST_PLUGIN = "{{config_root}}/target/plugins/bin/sandbox-driver-host" }
 run = "cargo nextest run --locked -p petri-execution --test admission --run-ignored ignored-only --no-tests=fail"
 
+[tasks."test:dst"]
+description = "Run the simulations deep: the driver's over 50,000 seeds and the execution layer's over 20,000, 2,000 of them twice to compare logs; the routine gate runs 128 and 64"
+env = { CARGO_PROFILE_TEST_DEBUG = "0" }
+run = [
+  "PETRI_DST_SEEDS=50000 cargo nextest run --locked -p petri-driver --test simulation -E 'test(seeded_worlds)' --no-tests=fail",
+  "PETRI_DST_SEEDS=20000 cargo nextest run --locked -p petri-execution --test simulation -E 'test(seeded_runs) | test(replays_byte_for_byte)' --no-tests=fail",
+]
+
 [tasks."check:nightly"]
 description = "Run the extended nightly verification gate"
 depends = ["check"]
 run = [
   "mise run check:msrv",
   "mise run test:long",
+  "mise run test:dst",
   "mise run test:fabro:blackbox:repeat",
   "mise run test:fabro:differential",
   "cargo clean --profile dev",

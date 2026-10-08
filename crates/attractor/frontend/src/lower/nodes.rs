@@ -321,6 +321,22 @@ impl Ctx<'_> {
                 config.insert(key.into(), Value::String(value));
             }
         }
+        // The launch's model choice, below the node (its attributes and
+        // stylesheet rules) and above the graph and run defaults. A node that
+        // names its own model leaves its provider to the node and the
+        // defaults, so the launch's provider never pairs with a model the
+        // node chose.
+        if !config.contains_key("model") {
+            let launch = &self.settings.model_override;
+            if let Some(model) = &launch.name {
+                config.insert("model".into(), Value::String(model.clone()));
+            }
+            if !config.contains_key("provider")
+                && let Some(provider) = &launch.provider
+            {
+                config.insert("provider".into(), Value::String(provider.clone()));
+            }
+        }
         // The graph's defaults, then the run settings' model defaults.
         if !config.contains_key("model")
             && let Some(model) = workflow
@@ -395,6 +411,14 @@ impl Ctx<'_> {
             }
         } else {
             self.acp(node, workflow, &mut config, acp_backend);
+        }
+        // An agent's processes, on either backend, see the workflow's secrets:
+        // the ACP agent itself, and a native session's tool shells.
+        if !is_prompt {
+            let env = self.workflow_secret_env();
+            if !env.is_empty() {
+                config.insert("env".into(), Value::Object(env));
+            }
         }
         let nodes = self.b.exprs().var("nodes");
         config.insert("nodes".into(), placeholder(nodes));
@@ -476,6 +500,21 @@ impl Ctx<'_> {
         }
     }
 
+    /// The workflow environment's secret references, for a step that starts
+    /// processes. Literal values reach every process through the scope's
+    /// env; secret values stay references until the step spawns.
+    fn workflow_secret_env(&self) -> Map<String, Value> {
+        let mut env = Map::new();
+        if let Some(environment) = &self.settings.environment {
+            for (key, value) in &environment.env {
+                if let EnvValue::Secret(_) = value {
+                    env.insert(key.clone(), value.to_json());
+                }
+            }
+        }
+        env
+    }
+
     fn command_config(
         &mut self,
         node: &NodeDecl,
@@ -524,14 +563,7 @@ impl Ctx<'_> {
                 format!("command node `{}` needs a `script`", node.id),
             ),
         }
-        let mut env = Map::new();
-        if let Some(environment) = &self.settings.environment {
-            for (key, value) in &environment.env {
-                if let EnvValue::Secret(_) = value {
-                    env.insert(key.clone(), value.to_json());
-                }
-            }
-        }
+        let mut env = self.workflow_secret_env();
         if let Some(prepare_env) = self.prepare_envs.get(&node.id) {
             for (key, value) in prepare_env {
                 env.insert(key.clone(), value.to_json());

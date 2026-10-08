@@ -87,6 +87,14 @@ impl CoordinatorHandle {
     /// never releases before the unpause is durable. A redundant request
     /// (the state already says so) records nothing. Completes at once when
     /// the coordinator is gone: nothing is left to record against.
+    /// Ask for a pause or unpause to be recorded, without waiting: the
+    /// request joins the coordinator's queue now, so requests are recorded
+    /// in the order they were made.
+    pub fn request_paused(&self, paused: bool) {
+        let (reply, _recorded) = oneshot::channel();
+        let _ = self.pause.send(PauseRequest { paused, reply });
+    }
+
     pub async fn set_paused(&self, paused: bool) {
         let (reply, recorded) = oneshot::channel();
         if self.pause.send(PauseRequest { paused, reply }).is_err() {

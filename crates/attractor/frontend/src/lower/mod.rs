@@ -45,8 +45,8 @@ pub use promotion::ROUTES_KEY;
 pub use routing::{FailurePolicy, Policy};
 use serde_json::{Value, json};
 pub use settings::{
-    CloneSettings, EnvValue, Environment, ModelDefaults, PREPARE_NODE_PREFIX, PrepareStep,
-    RunSettings,
+    CloneSettings, EnvValue, Environment, ModelDefaults, ModelOverride, PREPARE_NODE_PREFIX,
+    PrepareStep, RunSettings,
 };
 pub use skills::SkillSettings;
 use smol_str::SmolStr;

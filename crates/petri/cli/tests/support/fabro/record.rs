@@ -7,8 +7,7 @@
 //! scenarios, the raw and normalized observations, the final context, the
 //! artifacts, the process output, the assertions, the compatibility
 //! decisions, and the cleanup result. `scripts/fabro-coverage-report.py`
-//! folds the records into the coverage report and `scripts/check-pins.py`
-//! checks the pins they cite against `Cargo.lock`.
+//! folds the records into the coverage report.
 //!
 //! Layout under the evidence directory:
 //!

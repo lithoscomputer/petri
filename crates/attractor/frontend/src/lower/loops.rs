@@ -14,7 +14,7 @@ use crate::model::{NodeDecl, Workflow};
 
 impl Ctx<'_> {
     /// The `goal_check` node in front of `exit`, when any node is a goal
-    /// gate: every gate must have a success-like record, or the run jumps
+    /// gate: every gate must have a success-like record, or the run routes
     /// back to the gate's retry target — the first that exists of the node's
     /// `retry_target`, its `fallback_retry_target`, the graph's, and the
     /// graph's fallback — and a gate with no target ends the run failed.

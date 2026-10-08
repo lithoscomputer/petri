@@ -92,7 +92,9 @@ tags. Run statuses are `success`, `failed`, `cancelled`. Node statuses are
 | `run_key` | The run's identity in its store and on its sandbox providers: the run id every sandbox of the run is labelled with. |
 | `forked_from` | Where the run was forked from, or `null` on a run that started fresh: `source` (the source run's key), `execution` and `firing` (the position the source's records were kept up to), `rerun_last` (whether the position's firing runs again). See `FORK.md`. Additive in format version 3. |
 | `complete` | `true` only when `incomplete` is empty. |
-| `status` | The recorded run status, or `null` until the run finished. |
+| `status` | The committed overall run status, or `null` until execution, required finalization, and cleanup finish. |
+| `required_finalization` | Whether the host declared required completion work. Additive in inspection version 3. |
+| `finalization_failure` | The committed host-defined `{code, message}`, or `null`. Root invocation and engine outcomes still describe workflow execution. Additive in inspection version 3. |
 | `incomplete` | Every reason `complete` is `false`, in the order found. |
 | `paused` | Whether the last recorded run control was a pause (`RunPaused` with no later `RunUnpaused`). A `petri resume` of such a run holds admission until an unpause. Additive in format version 1. |
 | `notes` | Every run-level note, in record order, from the coordinator log's `run.note.recorded` records: `execution` (whose driver ran the point), `kind`, `payload`. A `hook` note is a run-level hook report (`payload.point` is `run_finished` or `scope_released`), the same shape as a firing's `hook` note. The summary prints their count. Additive in format version 1. |
@@ -170,9 +172,9 @@ final attempt of the latest generation to complete.
 show up here and nowhere else: a non-final attempt has `final: false`, and
 its `context_updates` never reached `kv`.
 
-`routes` entries have `seq`, `firing`, `node`, `kind` (`edge`, `jump`,
-`none`), `group`, `edge`, and `target` (the node the route led to). Together
-with `history` they show routing across repeated visits to one node.
+`routes` entries have `seq`, `firing`, `node`, `kind` (`edge` or `none`),
+`group`, `edge`, and `target` (the node the route led to). Together with
+`history` they show routing across repeated visits to one node.
 
 `deliveries` entries have `seq`, `firing`, `node`, `kind` (`deliver`,
 `cancel`, `kill`, `other`), and `payload` (the delivered value, for `deliver`).

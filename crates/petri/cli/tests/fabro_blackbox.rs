@@ -22,6 +22,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::{Duration, Instant};
 
+use petri::execution::RECEIPT_VERSION;
 use petri::execution::events::{ViewEvent, replay_run_dir};
 use serde_json::{Value, json};
 use support::fabro::interview;
@@ -1005,7 +1006,7 @@ async fn milestone_a_smoke_run_without_fabro_on_path() {
         json!("APPENDED: notes.txt now ends with reviewed.")
     );
     let receipt = &document["interviews"];
-    assert_eq!(receipt["version"], json!(1), "{receipt}");
+    assert_eq!(receipt["version"], json!(RECEIPT_VERSION), "{receipt}");
     assert_eq!(receipt["errors"], json!([]), "{receipt}");
     assert_eq!(receipt["questions"][0]["node"], json!("gate"));
     assert_eq!(receipt["questions"][0]["reply"]["choice"], json!("N"));
@@ -2836,12 +2837,12 @@ async fn nested_joins_report_the_inner_results_inside_the_outer_envelope() {
     finished.assert_no_leaked_processes().await;
 }
 
-/// The pinned interview bundle names no model, and Fabro runs it with a
-/// launch-level default (`fabro run --provider openai` picks the provider's
+/// The pinned interview bundle names no model, and Fabro runs it with the
+/// launch's provider (`fabro run --provider openai` picks the provider's
 /// default model). `petri run --provider openai` does the same through the
 /// runner's catalog: the `summarize` prompt runs on `gpt-5.6-sol`, and the
 /// persisted root graph's `fabro.launch` parameter records the launch. With
-/// no launch default the prompt node fails and names the options.
+/// no launch model the prompt node fails and names the options.
 #[tokio::test]
 async fn the_unchanged_interview_bundle_runs_with_a_launch_provider() {
     use support::fabro::bundle::Scenario;

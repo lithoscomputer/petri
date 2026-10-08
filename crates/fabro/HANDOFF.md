@@ -34,18 +34,12 @@ one Petri revision by tag. `petri::build_llm_client` is the exception: it
 lives in the distribution crate, so a host on the six packages builds its
 `lithos_llm::Client` itself.
 
-The libraries the two repositories share are pinned to one revision each,
-the rows of `crates/fabro/acceptance/CONTRACT.md` "Pinned revisions", which
-`mise run check:pins` holds equal to the manifests and the evidence records.
-Fabro's `main` holds the same three (its pull requests #873 to #875 and
-#883): Pebble `67c9f486dd28f15c04e8d590a91e6f5563f7605d`, lithos-llm
-`43a42ac28e9d9bcf40a91abc02be4f12ca274ebb`, sandbox-driver
-`64c14b89d078a4b34d1555092ad01d41541f7a7d`. Each is a descendant of the
-revision Fabro pinned when the integration plan was written (Pebble
-`6996942`, lithos-llm `a1e3fd3`, sandbox-driver `ddb32e1`), so the two
-repositories link one copy of each library; the readiness suite
-(`mise run check:fabro:readiness`) is the gate after either repository
-moves a pin.
+Petri names the libraries the two repositories share by `branch = "main"`.
+A Fabro build that names the same sources links one copy of each, and
+Fabro's `Cargo.lock` chooses the commit that ships. Petri's `Cargo.lock` only
+decides what Petri's own CI builds.
+The readiness suite (`mise run check:fabro:readiness`) is the gate after
+either repository moves its lock.
 
 ## What a host implements
 
@@ -241,7 +235,13 @@ acknowledgement gates the next step of the run:
   recorded and the run continues, a `TransitionError` blocks every route
   (Fabro's fatal Git commit failure and best-effort metadata writes model
   onto these two).
-- `run_finished` runs at the run's terminal exit before any environment is
+- Required host work uses `requires_run_finalization` and `finalize_run`,
+  awaited on terminal root execution before run-end observations and release.
+  Its generic failure code and message travel into the immutable overall
+  `run.finished` result; the root invocation result remains execution evidence.
+  Wrappers forward both methods. See `crates/core/execution/HOOKS.md` for
+  cancellation and interruption limits.
+- Observational `run_finished` runs at workflow terminal exit before any environment is
   released; `scope_released` runs before each scope's own environment is
   released. Fabro's `run_complete`/`run_failed` (by final status, neither on a
   cancelled run) and `sandbox_cleanup` map onto them.
@@ -275,12 +275,12 @@ acknowledgement gates the next step of the run:
 
 | Version | Where | Rule |
 |---|---|---|
-| `EVENT_CONTRACT_VERSION` (4) | `execution::events` | additive within a version; a host checks it before projecting. Version 3 names every event after its record, carries the stored line under `record` and the derived values under `derived`; the version 2 presentation names are gone. Version 4 adds the scope records (`scope.acquired`, `scope.failed`, `scope.released`) and, additively, `forked_from` on `run.started` |
+| `EVENT_CONTRACT_VERSION` (5) | `execution::events` | additive within a version; a host checks it before projecting. Version 5 carries a partial success's whole underlying failure (`{"failure": {...}}` or `"timed_out"`). Version 3 names every event after its record, carries the stored line under `record` and the derived values under `derived`; the version 2 presentation names are gone. Version 4 adds the scope records (`scope.acquired`, `scope.failed`, `scope.released`) and, additively, `forked_from` on `run.started` |
 | `INSPECT_FORMAT_VERSION` (3) | `execution::inspect` | the `petri inspect` document's field contract; version 3 reads the run through its store (`locator`, `run_key`; no log `path` or `torn`) and, additively, reports `forked_from` |
-| the run format (7) on the run declaration, and the coordinator record version (`{seq, origin, recorded_at, body}` lines, `body` tagged by `event` with `<subject>.<verb>` names; the declaration carries the run `key`; version 6 adds `scope.released` and pins engine log v11; version 7 lets the declaration carry `forked_from`) | `execution::store` | a run written by a newer or older format is refused, never migrated; the check reads the first stored record before any other is decoded |
-| the engine log version (v11: `{seq, origin, recorded_at, body}` records, `body` tagged by `event` with `<subject>.<verb>` names; v11 adds `scope.acquired` and `scope.failed`), pinned by the run format | `engine::log` | a log whose version the runner does not speak is refused; replay must reproduce the log byte for byte or inspection reports corruption |
+| the run format (8) on the run declaration, and the coordinator record version (`{seq, origin, recorded_at, body}` lines, `body` tagged by `event` with `<subject>.<verb>` names; the declaration carries the run `key`; version 6 adds `scope.released` and pins engine log v11; version 7 lets the declaration carry `forked_from`; version 8 pins engine log v12) | `execution::store` | a run written by a newer or older format is refused, never migrated; the check reads the first stored record before any other is decoded |
+| the engine log version (v12: `{seq, origin, recorded_at, body}` records, `body` tagged by `event` with `<subject>.<verb>` names; v11 adds `scope.acquired` and `scope.failed`; v12 keeps a partial success's whole underlying failure), pinned by the run format | `engine::log` | a log whose version the runner does not speak is refused; replay must reproduce the log byte for byte or inspection reports corruption |
 | `inspect_format_version`, `event_contract_version` | in the documents themselves | |
-| Library pins (Pebble, lithos-llm, sandbox-driver, twins, the Fabro reference, the runner image) | `CONTRACT.md` "Pinned revisions", `scripts/check-pins.py` | moved together with the manifests and the evidence records |
+| Library pins (Pebble, lithos-llm, sandbox-driver, twins, the Fabro reference, the runner image) | `Cargo.lock`, `crates/fabro/corpus-pin.txt`, `RUNNER_PIN`; `CONTRACT.md` "Pinned revisions" names each home | evidence records cite the locked commits |
 
 **Strict rejection of incompatible logs.** Petri never migrates a stored
 run: a run whose format version, coordinator record version, or engine log
@@ -343,11 +343,20 @@ against.
    in `RunOptions::run_key`, or the run directory) and reacquires held
    sandboxes, reconciling every lease with the provider by label before any
    create; Fabro restores what it owns (a Git-backed workspace, pending
-   questions in its UI) from the identities above, then resumes. Known limits: a retained
+   questions in its UI) from the identities above, then resumes. A run whose
+   creation a crash cut short (stored, with no root invocation declared) is
+   refused as `HostError::NotStarted`; start it again with
+   `host::run_configured` under the same key, which finishes the creation.
+   Fabro's liveness signal must end a run's store lease only when the
+   worker that holds it is gone: a live worker whose lease was released
+   keeps acting (processes, hooks, provider calls it began) until its next
+   write fails, beside the new owner.
+   Known limits: a retained
    thread is not durable across resume (the node starts a fresh session with
-   Fabro's discarded-session rule), a pause does not survive resume (a
-   resumed run starts unpaused), a model request in flight at the crash may
-   be sent again, and an external effect is at least once.
+   Fabro's discarded-session rule), a model request in flight at the crash
+   may be sent again, and an external effect is at least once. A pause
+   survives resume: a run whose last recorded control was a pause resumes
+   held at admission until an unpause.
 5. **Choose compatible runners.** Pin the Petri runner per run; check
    `EVENT_CONTRACT_VERSION`, `INSPECT_FORMAT_VERSION` and the store versions
    before resuming; keep an old runner for old runs as long as Fabro's

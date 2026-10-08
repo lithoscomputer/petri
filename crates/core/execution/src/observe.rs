@@ -2,7 +2,7 @@
 //! records reach the run's store, and how a host observer sees them.
 
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex, PoisonError, Weak};
+use std::sync::{Arc, Mutex, OnceLock, PoisonError, Weak};
 use std::{fmt, fs, io};
 
 use driver::{EventObserver, ObserveError};
@@ -11,7 +11,7 @@ use serde::de::Error as _;
 use serde::{Deserialize, Serialize};
 use store::jsonl::clean_lines;
 use store::{LogId, Record, RunLogs};
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::{Notify, mpsc, oneshot};
 use tokio::task::JoinHandle;
 
 use crate::{CoordinatorRecord, CoordinatorState, ExecutionId};
@@ -310,6 +310,43 @@ pub fn read_engine_log(path: &Path) -> Result<DecodedEngineFile, EngineLogError>
     })
 }
 
+/// The first write the run's store failed in this lifetime. Every writer of
+/// the run trips it: the engine logs' [`StoreWriter`] and the resource
+/// store. The coordinator ends the lifetime when it trips, and the next
+/// lifetime resumes from what the store holds.
+#[derive(Debug, Default)]
+pub(crate) struct StoreFailure {
+    first:   OnceLock<String>,
+    tripped: Notify,
+}
+
+impl StoreFailure {
+    /// Record a failed write; only the first is kept.
+    pub(crate) fn trip(&self, message: String) {
+        if self.first.set(message).is_ok() {
+            self.tripped.notify_waiters();
+        }
+    }
+
+    /// The first failed write, once there is one.
+    pub(crate) fn get(&self) -> Option<&str> {
+        self.first.get().map(String::as_str)
+    }
+
+    /// Resolve once a write has failed.
+    pub(crate) async fn wait(&self) -> &str {
+        loop {
+            let tripped = self.tripped.notified();
+            tokio::pin!(tripped);
+            tripped.as_mut().enable();
+            if let Some(first) = self.get() {
+                return first;
+            }
+            tripped.await;
+        }
+    }
+}
+
 enum WriterMessage {
     Records(LogId, Vec<Record>),
     /// Answer once every record queued before this message is stored: the
@@ -337,6 +374,7 @@ pub struct StoreWriter {
     locator: String,
     tx:      mpsc::UnboundedSender<WriterMessage>,
     task:    Mutex<Option<JoinHandle<()>>>,
+    failure: Arc<StoreFailure>,
 }
 
 impl fmt::Debug for StoreWriter {
@@ -353,12 +391,24 @@ impl StoreWriter {
     pub fn start(logs: &Arc<dyn RunLogs>) -> Arc<Self> {
         let (tx, rx) = mpsc::unbounded_channel();
         let locator = logs.locator();
-        let task = tokio::spawn(write_records(Arc::downgrade(logs), rx));
+        let failure = Arc::new(StoreFailure::default());
+        let task = tokio::spawn(write_records(
+            Arc::downgrade(logs),
+            rx,
+            Arc::clone(&failure),
+        ));
         Arc::new(Self {
             locator,
             tx,
             task: Mutex::new(Some(task)),
+            failure,
         })
+    }
+
+    /// The run's store failure this writer trips, for the run's other
+    /// writers to share.
+    pub(crate) fn failure(&self) -> Arc<StoreFailure> {
+        Arc::clone(&self.failure)
     }
 
     /// Queue records for one log. Never waits.
@@ -415,7 +465,11 @@ impl Drop for StoreWriter {
 
 /// The writer task: drain what is queued, append per log in order, answer
 /// each marker once everything before it is stored.
-async fn write_records(logs: Weak<dyn RunLogs>, mut rx: mpsc::UnboundedReceiver<WriterMessage>) {
+async fn write_records(
+    logs: Weak<dyn RunLogs>,
+    mut rx: mpsc::UnboundedReceiver<WriterMessage>,
+    tripped: Arc<StoreFailure>,
+) {
     let mut failure: Option<String> = None;
     let mut pending: Vec<(LogId, Vec<Record>)> = Vec::new();
     while let Some(first) = rx.recv().await {
@@ -435,7 +489,7 @@ async fn write_records(logs: Weak<dyn RunLogs>, mut rx: mpsc::UnboundedReceiver<
                     }
                 }
                 WriterMessage::Durable(reply) => {
-                    append_pending(&logs, &mut pending, &mut failure).await;
+                    append_pending(&logs, &mut pending, &mut failure, &tripped).await;
                     let _ = reply.send(match &failure {
                         Some(message) => Err(ObserveError::new("run store", message.clone())),
                         None => Ok(()),
@@ -443,7 +497,7 @@ async fn write_records(logs: Weak<dyn RunLogs>, mut rx: mpsc::UnboundedReceiver<
                 }
             }
         }
-        append_pending(&logs, &mut pending, &mut failure).await;
+        append_pending(&logs, &mut pending, &mut failure, &tripped).await;
     }
 }
 
@@ -451,6 +505,7 @@ async fn append_pending(
     logs: &Weak<dyn RunLogs>,
     pending: &mut Vec<(LogId, Vec<Record>)>,
     failure: &mut Option<String>,
+    tripped: &StoreFailure,
 ) {
     for (log, records) in pending.drain(..) {
         if failure.is_some() {
@@ -461,7 +516,9 @@ async fn append_pending(
             break;
         };
         if let Err(error) = logs.append(&log, &records).await {
-            *failure = Some(format!("could not append to the {log} log: {error}"));
+            let message = format!("could not append to the {log} log: {error}");
+            tripped.trip(message.clone());
+            *failure = Some(message);
         }
     }
 }

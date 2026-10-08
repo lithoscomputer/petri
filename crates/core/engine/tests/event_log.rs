@@ -324,7 +324,8 @@ fn an_old_log_version_is_rejected() {
     // v6: `Outcome.splices` and `Node.splice_policy`; v7: durable admission and
     // routing decisions; v8: cancellation groups; v9: a recording time beside
     // every persisted record; v10: `<subject>.<verb>` record names; v11: the
-    // scope records), so an old log is rejected cleanly rather than replayed
+    // scope records; v12: a partial success's whole underlying failure), so an
+    // old log is rejected cleanly rather than replayed
     // under rules it was not written for.
     for old in 1..LOG_VERSION {
         let downgraded = encoded.replacen(&current, &format!("\"version\":{old}"), 1);

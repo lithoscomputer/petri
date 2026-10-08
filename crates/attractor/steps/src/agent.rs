@@ -40,7 +40,7 @@ use serde_json::json;
 use smol_str::SmolStr;
 use steps::{Step, StepCtx};
 
-use crate::acp::AgentCommand;
+use crate::acp::{AgentCommand, EnvValue};
 use crate::blobs::{self, OutputStore};
 use crate::compaction;
 use crate::contract::{Contract, Parsed, repair_message, validate};
@@ -133,6 +133,10 @@ pub struct AgentConfig {
     pub output_retries:       u64,
     #[serde(default)]
     pub acp:                  Option<Value>,
+    /// The workflow environment's secret references, resolved when the agent
+    /// starts, for the ACP agent and a native session's tool shells.
+    #[serde(default)]
+    pub env:                  BTreeMap<String, EnvValue>,
     /// The run's `[run.agent.mcps]` servers a native session connects to.
     #[serde(default)]
     pub mcps:                 Vec<McpServer>,
@@ -179,6 +183,16 @@ pub struct AgentStep;
 
 impl AgentConfig {
     fn command(&self) -> Result<AgentCommand, String> {
+        self.command_or(env::var(DEFAULT_COMMAND_ENV).ok().as_deref())
+    }
+
+    /// The node's agent, else `default` (the `PETRI_ACP_COMMAND` line), with
+    /// the workflow's secrets beneath its own env whichever names it.
+    fn command_or(&self, default: Option<&str>) -> Result<AgentCommand, String> {
+        Ok(self.named_command(default)?.with_workflow_env(&self.env))
+    }
+
+    fn named_command(&self, default: Option<&str>) -> Result<AgentCommand, String> {
         if let Some(acp) = &self.acp {
             if let Some(line) = acp.get("command").and_then(Value::as_str) {
                 return AgentCommand::from_command_line(line);
@@ -187,8 +201,8 @@ impl AgentConfig {
                 return AgentCommand::from_config(config);
             }
         }
-        match env::var(DEFAULT_COMMAND_ENV) {
-            Ok(line) if !line.trim().is_empty() => AgentCommand::from_command_line(&line),
+        match default {
+            Some(line) if !line.trim().is_empty() => AgentCommand::from_command_line(line),
             _ => Err(format!(
                 "node `{}` names no ACP agent: set `acp.command` or `acp.config` on the node or \
                  the graph, or {DEFAULT_COMMAND_ENV} in the environment",
@@ -578,4 +592,27 @@ async fn run_session(
         Parsed::Plain => {}
     }
     Ok(stage)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_default_command_gets_the_workflow_secrets() {
+        let config: AgentConfig = serde_json::from_value(json!({
+            "label": "a",
+            "node": "a",
+            "backend": "acp",
+            "env": {"TOKEN": {"$secret": "REVIEW_TOKEN"}},
+        }))
+        .expect("config");
+        let command = config.command_or(Some("agent --acp")).expect("command");
+        assert_eq!(command.program, "agent");
+        assert_eq!(
+            command.env,
+            BTreeMap::from([("TOKEN".into(), EnvValue::Secret("REVIEW_TOKEN".into()))])
+        );
+        assert!(config.command_or(None).is_err());
+    }
 }

@@ -182,6 +182,7 @@ impl Ctx<'_> {
             self.stack.clone(),
             RunSettings {
                 model: self.settings.model.clone(),
+                model_override: self.settings.model_override.clone(),
                 mcps: self.settings.mcps.clone(),
                 ..RunSettings::default()
             },

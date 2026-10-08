@@ -8,7 +8,7 @@ use smol_str::SmolStr;
 use crate::host::ForkOrigin;
 use crate::{
     AttemptAdmission, CancelReason, CoordinatorEvent, CoordinatorRecord, ExecutionId, GraphDigest,
-    InvocationId, InvocationResult, ParentCallKey, SandboxBinding, SecretBindings,
+    InvocationId, InvocationResult, ParentCallKey, SandboxBinding, SandboxLeaseId, SecretBindings,
 };
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -86,7 +86,7 @@ pub enum StateError {
     DuplicateRunFinish,
     #[error("the run cannot finish before its root invocation")]
     RootNotFinished,
-    #[error("RunFinished status differs from the root invocation result")]
+    #[error("RunFinished status does not match execution and required finalization")]
     RunStatusMismatch,
     #[error("coordinator record at index {index} has sequence {found}")]
     Sequence { index: usize, found: u64 },
@@ -97,25 +97,32 @@ pub enum StateError {
 /// The replayed invocation tree.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct CoordinatorState {
-    pub root:             Option<InvocationId>,
-    pub middleware_chain: Vec<MiddlewareKey>,
+    pub root:                  Option<InvocationId>,
+    pub middleware_chain:      Vec<MiddlewareKey>,
     /// Where the run was forked from, when it was seeded from another run's
     /// records (`FORK.md`). Additive in format version 7.
     #[serde(default)]
-    pub forked_from:      Option<ForkOrigin>,
-    pub graphs:           BTreeSet<GraphDigest>,
-    pub invocations:      BTreeMap<InvocationId, InvocationState>,
-    pub executions:       BTreeMap<ExecutionId, ExecutionState>,
-    pub calls:            BTreeMap<ParentCallKey, InvocationId>,
-    pub run_status:       Option<RunStatus>,
+    pub forked_from:           Option<ForkOrigin>,
+    pub graphs:                BTreeSet<GraphDigest>,
+    pub invocations:           BTreeMap<InvocationId, InvocationState>,
+    pub executions:            BTreeMap<ExecutionId, ExecutionState>,
+    pub calls:                 BTreeMap<ParentCallKey, InvocationId>,
+    pub run_status:            Option<RunStatus>,
+    #[serde(default)]
+    pub required_finalization: bool,
+    #[serde(default)]
+    pub finalization_failure:  Option<ir::FinalizationFailure>,
     /// Whether the last recorded run control was a pause. A resume starts
     /// with admission held when it is.
     #[serde(default)]
-    pub paused:           bool,
+    pub paused:                bool,
     /// Every run-level note, in record order: the reports of hook points
     /// that belong to no firing.
     #[serde(default)]
-    pub run_notes:        Vec<RunNote>,
+    pub run_notes:             Vec<RunNote>,
+    /// The leases whose release is recorded (`scope.released`).
+    #[serde(default)]
+    pub released:              BTreeSet<SandboxLeaseId>,
 }
 
 /// A run-level note as recorded: a hook report from a point with no firing
@@ -201,6 +208,7 @@ impl CoordinatorState {
                 key: _,
                 root,
                 middleware_chain: _,
+                required_finalization: _,
                 forked_from: _,
             } => {
                 if self.root.is_some() {
@@ -333,7 +341,10 @@ impl CoordinatorState {
             | CoordinatorEvent::RunUnpaused
             | CoordinatorEvent::RunNoteRecorded { .. }
             | CoordinatorEvent::ScopeReleased { .. } => {}
-            CoordinatorEvent::RunFinished { status } => {
+            CoordinatorEvent::RunFinished {
+                status,
+                finalization_failure,
+            } => {
                 if self.run_status.is_some() {
                     return Err(StateError::DuplicateRunFinish);
                 }
@@ -343,7 +354,9 @@ impl CoordinatorState {
                     .get(&root)
                     .and_then(|invocation| invocation.result.as_ref())
                     .ok_or(StateError::RootNotFinished)?;
-                if result.status != *status {
+                if (!self.required_finalization && finalization_failure.is_some())
+                    || ir::finalized_status(result.status, finalization_failure.as_ref()) != *status
+                {
                     return Err(StateError::RunStatusMismatch);
                 }
             }
@@ -369,9 +382,11 @@ impl CoordinatorState {
                 key: _,
                 root,
                 middleware_chain,
+                required_finalization,
                 forked_from,
             } => {
                 self.root = Some(*root);
+                self.required_finalization = *required_finalization;
                 self.middleware_chain.clone_from(middleware_chain);
                 self.forked_from.clone_from(forked_from);
             }
@@ -461,9 +476,15 @@ impl CoordinatorState {
                 kind:      kind.clone(),
                 payload:   payload.clone(),
             }),
-            CoordinatorEvent::ScopeReleased { .. } => {}
-            CoordinatorEvent::RunFinished { status } => {
+            CoordinatorEvent::ScopeReleased { lease, .. } => {
+                self.released.insert(*lease);
+            }
+            CoordinatorEvent::RunFinished {
+                status,
+                finalization_failure,
+            } => {
                 self.run_status = Some(*status);
+                self.finalization_failure.clone_from(finalization_failure);
             }
         }
     }

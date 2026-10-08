@@ -12,7 +12,7 @@ mod support;
 use std::cell::RefCell;
 use std::rc::Rc;
 
-use engine::{Command, Event};
+use engine::{Admission, Command, DecisionId, EngineExit, EngineState, Event, apply, resume};
 use ir::{
     Attempt, CancelScopeId, Control, ExpandTarget, FiringId, GraphBuilder, JoinPolicy, Outcome,
     RetryPolicy, RunStatus, Status, Value, collector_exprs, parallel_for_each, validate,
@@ -521,8 +521,9 @@ fn a_cancelled_expansion_never_splices() {
 }
 
 /// §5 test 4: an `Always`-guarded back edge through a cancelled region
-/// terminates by budget, exactly as the `Skipped` cascade does — same envelope,
-/// no new machinery. The test finishing is the termination proof.
+/// terminates by budget, as the `Skipped` cascade does — same envelope, no new
+/// machinery. The test finishing is the termination proof. The refusal is
+/// quiet: nothing would have run, so it is no engine error.
 #[test]
 fn a_back_edge_through_a_cancelled_region_stops_at_its_budget() {
     let mut b = GraphBuilder::new();
@@ -560,11 +561,63 @@ fn a_back_edge_through_a_cancelled_region_stops_at_its_budget() {
         spins, 4,
         "one synthesized Cancelled per generation, then the cap"
     );
-    assert!(matches!(
-        h.state.errors().first(),
-        Some(engine::RunError::BudgetExceeded { max_firings: 4, .. })
-    ));
+    assert_eq!(h.state.errors(), [], "a cancelled loop stops quietly");
     assert_eq!(h.status, Some(RunStatus::Cancelled));
+    h.verify_replay();
+}
+
+/// The same loop in a cancel group: a group cancel stops it quietly at its
+/// budget, and the rest of the run keeps its own status. A `BudgetExceeded`
+/// here would fail the run although nothing failed.
+#[test]
+fn a_group_cancelled_loop_stops_quietly_at_its_budget() {
+    let mut b = GraphBuilder::new();
+    let scope = ir::ScopeId::new(0);
+    let start = b.add_step("start", scope, NOOP);
+    let spin = b.add_step("spin", scope, NOOP);
+    let sibling = b.add_step("sibling", scope, NOOP);
+    let never = b.add_step("never", scope, NOOP);
+    b.fan_out(start, &[spin, sibling]);
+    b.node_mut(spin).cancel_group = Some(spin);
+    b.set_join(spin, JoinPolicy::Any);
+    b.set_budget(spin, ir::Budget::looped(4));
+    let always_loop = b.exprs().lit(true);
+    b.select(spin, vec![
+        ir::Arm::when(spin, always_loop).with_back(),
+        ir::Arm::always(never),
+    ]);
+    let graph = b.build();
+    validate(&graph).expect("valid");
+
+    let mut h = Harness::new(graph);
+    h.feed(Event::ExecutionStarted {
+        start: engine::EngineStart::default(),
+    });
+    let start = h.take_starts()[0].0;
+    h.finish(start, Outcome::success(Value::Null));
+    let running = h.take_starts();
+    h.feed(Event::cancel_group(spin));
+    for (firing, name) in running {
+        h.finish(
+            firing,
+            if name == "spin" {
+                Outcome::cancelled()
+            } else {
+                Outcome::success(Value::Null)
+            },
+        );
+    }
+
+    let spins: Vec<(String, String)> = h
+        .statuses()
+        .into_iter()
+        .filter(|(name, _)| name == "spin")
+        .collect();
+    assert_eq!(spins.len(), 4, "the cancelled run, then three completions");
+    assert!(spins.iter().all(|(_, status)| status == "cancelled"));
+    assert_eq!(h.status_of("sibling").as_deref(), Some("success"));
+    assert_eq!(h.state.errors(), [], "a cancelled loop stops quietly");
+    assert_eq!(h.status, Some(RunStatus::Success));
     h.verify_replay();
 }
 
@@ -737,6 +790,128 @@ fn kill_settles_an_awaiting_retry_firing_without_routing() {
     assert_eq!(h.status_of("a").as_deref(), Some("cancelled"));
     assert_eq!(h.take_starts(), vec![], "nothing is admitted");
     assert_eq!(h.status, Some(RunStatus::Cancelled));
+    h.verify_replay();
+}
+
+/// A firing still waiting for its admission has no step to stop either. A
+/// root kill withdraws the decision and records the firing `Cancelled`, and the
+/// run ends: the firing must not look started, waiting on a step that never
+/// ran. The harness answers every admission at once, so this drives the core
+/// by hand.
+#[test]
+fn kill_settles_a_firing_awaiting_admission() {
+    let graph = retry_then_cleanup_graph();
+    let decide = |state, decision_id| {
+        apply(state, Event::AdmissionDecided {
+            decision_id,
+            decision: Admission::Admit,
+            trace: Vec::new(),
+        })
+    };
+    let (state, _) = apply(EngineState::new(graph.clone()), Event::ExecutionStarted {
+        start: engine::EngineStart::default(),
+    });
+    let (state, commands) = decide(state, DecisionId::ExecutionStart);
+    let Some(DecisionId::AttemptStart { firing, .. }) = commands.iter().find_map(|c| match c {
+        Command::Admit { decision_id } => Some(*decision_id),
+        _ => None,
+    }) else {
+        panic!("the entry asks for its admission: {commands:?}");
+    };
+    assert!(state.is_awaiting_admission(firing));
+
+    let (state, commands) = apply(state, Event::KillRequested {
+        scope: CancelScopeId::ROOT,
+    });
+    assert!(state.firing(firing).is_none(), "settled, not left live");
+    assert_eq!(
+        state.pending_admissions().count(),
+        0,
+        "the decision is withdrawn"
+    );
+    assert!(
+        !commands
+            .iter()
+            .any(|c| matches!(c, Command::DeliverControl { .. } | Command::StartStep(_))),
+        "nothing to signal and nothing admitted: {commands:?}"
+    );
+    assert!(
+        commands
+            .iter()
+            .any(|c| matches!(c, Command::FinishExecution {
+                exit: EngineExit::Terminal {
+                    status: RunStatus::Cancelled,
+                },
+            })),
+        "the run ends: {commands:?}"
+    );
+    let point = resume(graph, &state.log).expect("the log resumes");
+    assert!(
+        point.pending.is_empty(),
+        "nothing is owed: {:?}",
+        point.pending
+    );
+}
+
+/// A group kill withdraws the routing still open for an outcome recorded
+/// inside the group before it, as a root kill does: nothing routes out of a
+/// killed closure, however long the host took to decide.
+#[test]
+fn a_group_kill_withdraws_an_open_routing() {
+    let mut b = GraphBuilder::new();
+    let scope = ir::ScopeId::new(0);
+    let a = b.add_step("a", scope, NOOP);
+    let after = b.add_step("after", scope, NOOP);
+    b.link(a, after);
+    b.node_mut(a).cancel_group = Some(a);
+    let graph = b.build();
+    validate(&graph).expect("valid");
+
+    let mut h = Harness::new(graph).holding_decisions();
+    h.feed(Event::ExecutionStarted {
+        start: engine::EngineStart::default(),
+    });
+    while let Some(at) = h
+        .commands
+        .iter()
+        .position(|c| matches!(c, Command::Admit { .. }))
+    {
+        let admission = h.commands.remove(at);
+        h.answer(&admission);
+    }
+    let (firing, _) = h.take_starts()[0];
+    h.finish(firing, Outcome::success(Value::Null));
+    let routing = DecisionId::route(firing, Attempt::FIRST);
+    assert!(
+        h.state.has_pending_routing(routing),
+        "a waits on its routing"
+    );
+
+    let group = h
+        .state
+        .cancel_scope(CancelScopeId::ROOT)
+        .into_iter()
+        .flat_map(|root| root.children.iter().copied())
+        .find(|child| {
+            h.state
+                .cancel_scope(*child)
+                .is_some_and(|scope| scope.nodes.contains(&a))
+        })
+        .expect("a's group has its own scope");
+    h.feed(Event::KillRequested { scope: group });
+    assert!(
+        !h.state.has_pending_routing(routing),
+        "the kill withdrew the routing"
+    );
+    assert!(
+        !h.state
+            .log
+            .events()
+            .any(|event| matches!(event, Event::TokenEmitted { token } if token.from == firing)),
+        "nothing routed out of the killed group"
+    );
+    assert_eq!(h.start_count("after"), 0);
+    assert!(h.status.is_some(), "the run ends");
     h.verify_replay();
 }
 

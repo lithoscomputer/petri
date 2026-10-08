@@ -2,7 +2,8 @@
 //! settings select a Daytona or Docker environment succeeds with an empty
 //! `PATH` and no `PETRI_SANDBOX_*` variable, its scope records name the
 //! `simulated` provider, and every corpus bundle that lowers reaches exit
-//! the same way.
+//! the same way. A dry run also persists the graph the launch lowered, which
+//! is where `--model` and `--provider` land.
 
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
@@ -128,6 +129,74 @@ fn a_dry_run_of_a_daytona_bundle_needs_no_plugin() {
 #[test]
 fn a_dry_run_of_a_docker_bundle_needs_no_plugin() {
     assert_simulated_dry_run("dry-run-docker", "docker", Some("alpine:3.20"));
+}
+
+/// `petri run --model` and `--provider` on a bare DOT file, with no settings
+/// files: the launch's choice beats the graph's `default_model` and
+/// `default_provider` on a node that names no model, a node that names its
+/// own model keeps it with the graph's provider, and the persisted graph's
+/// `fabro.launch` records the launch.
+#[test]
+fn the_launch_model_beats_the_graph_default_in_a_bare_dot_file() {
+    let dir = RunDir::new("dry-run-launch-model");
+    let workflow = dir.path().join("plain.dot");
+    fs::write(
+        &workflow,
+        r#"digraph Plain {
+            graph [default_model="graph-model", default_provider="graph-provider"]
+            start [shape=Mdiamond]
+            exit [shape=Msquare]
+            plan [prompt="Plan"]
+            named [prompt="Review", model="node-model"]
+            start -> plan -> named -> exit
+        }"#,
+    )
+    .expect("write the workflow");
+    let run_dir = dir.path().join("run");
+    let ran = petri_without_plugins(&dir)
+        .args(["run", "--quiet", "--dry-run", "--run-dir"])
+        .arg(&run_dir)
+        .args(["--model", "cli-model", "--provider", "cli-provider"])
+        .arg(&workflow)
+        .output()
+        .expect("petri runs");
+    assert!(
+        ran.status.success(),
+        "{}",
+        String::from_utf8_lossy(&ran.stderr)
+    );
+
+    let graphs = fs::read_dir(run_dir.join("graphs"))
+        .expect("the persisted graphs")
+        .flatten()
+        .map(|entry| {
+            let text = fs::read_to_string(entry.path()).expect("read a graph");
+            serde_json::from_str::<serde_json::Value>(&text).expect("a graph is JSON")
+        })
+        .collect::<Vec<_>>();
+    let root = graphs
+        .iter()
+        .find(|graph| graph["params"].get("fabro.launch").is_some())
+        .expect("the root graph carries the launch");
+    let config = |prompt: &str| {
+        root["nodes"]
+            .as_array()
+            .expect("nodes")
+            .iter()
+            .map(|node| &node["step"]["config"])
+            .find(|config| config["prompt"] == prompt)
+            .unwrap_or_else(|| panic!("a node prompting {prompt:?}"))
+            .clone()
+    };
+    let plan = config("Plan");
+    assert_eq!(plan["model"], "cli-model");
+    assert_eq!(plan["provider"], "cli-provider");
+    let named = config("Review");
+    assert_eq!(named["model"], "node-model");
+    assert_eq!(named["provider"], "graph-provider");
+    let launch = &root["params"]["fabro.launch"];
+    assert_eq!(launch["model"], "cli-model");
+    assert_eq!(launch["provider"], "cli-provider");
 }
 
 /// The corpus checkout `scripts/corpus-fetch-fabro.sh` makes.

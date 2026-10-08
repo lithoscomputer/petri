@@ -33,6 +33,9 @@ pub struct RunSettings {
     pub goal:               Option<String>,
     /// Model defaults for LLM nodes (`[run.model]`, every layer applied).
     pub model:              ModelDefaults,
+    /// The model the launch asks for, over [`Self::model`] and the graph's
+    /// defaults, below a model a node names itself.
+    pub model_override:     ModelOverride,
     /// The resolved execution environment, when the run names one
     /// (`[run.environment]`).
     pub environment:        Option<Environment>,
@@ -82,6 +85,16 @@ pub struct ModelDefaults {
     /// `fallbacks`: the model-keyed chains as written, references in their
     /// canonical spelling ([`super::fallbacks`]).
     pub fallbacks:        BTreeMap<String, Vec<String>>,
+}
+
+/// The model a launch asks for. Each field applies on its own, to an LLM node
+/// that names no model of its own: a node that names one keeps its provider
+/// to the node and the defaults, so the launch's provider never pairs with a
+/// model the node chose.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct ModelOverride {
+    pub provider: Option<String>,
+    pub name:     Option<String>,
 }
 
 /// One environment value: a literal, or a secret name to resolve at spawn.

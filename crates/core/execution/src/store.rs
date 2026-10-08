@@ -12,6 +12,7 @@ use std::collections::BTreeMap;
 use std::path::Path;
 use std::sync::Arc;
 
+use driver::RecordingClock;
 use ir::Graph;
 use serde::de::Error as _;
 use serde_json::Value;
@@ -72,6 +73,8 @@ pub struct CoordinatorStore {
     graphs:   BTreeMap<GraphDigest, Arc<Graph>>,
     /// The records `create` appended before an observer could attach.
     opening:  Vec<CoordinatorRecord>,
+    /// What each record's `recorded_at` reads.
+    clock:    RecordingClock,
 }
 
 impl CoordinatorStore {
@@ -81,6 +84,24 @@ impl CoordinatorStore {
         key: RunKey,
         middleware_chain: Vec<engine::MiddlewareKey>,
     ) -> Result<Self, StoreError> {
+        Self::create_with_clock(
+            logs,
+            key,
+            middleware_chain,
+            RecordingClock::default(),
+            false,
+        )
+        .await
+    }
+
+    /// [`CoordinatorStore::create`], stamping every record with `clock`.
+    pub async fn create_with_clock(
+        logs: Arc<dyn RunLogs>,
+        key: RunKey,
+        middleware_chain: Vec<engine::MiddlewareKey>,
+        clock: RecordingClock,
+        required_finalization: bool,
+    ) -> Result<Self, StoreError> {
         let mut store = Self {
             logs,
             key: key.clone(),
@@ -88,6 +109,7 @@ impl CoordinatorStore {
             next_seq: 0,
             graphs: BTreeMap::new(),
             opening: Vec::new(),
+            clock,
         };
         let started = store
             .append(CoordinatorEvent::RunStarted {
@@ -95,6 +117,7 @@ impl CoordinatorStore {
                 key,
                 root: InvocationId::ROOT,
                 middleware_chain,
+                required_finalization,
                 forked_from: None,
             })
             .await?;
@@ -119,7 +142,15 @@ impl CoordinatorStore {
             next_seq,
             graphs,
             opening: Vec::new(),
+            clock: RecordingClock::default(),
         })
+    }
+
+    /// Stamp every record appended from now on with `clock`.
+    #[must_use]
+    pub fn with_clock(mut self, clock: RecordingClock) -> Self {
+        self.clock = clock;
+        self
     }
 
     /// The store handle the log lives in.
@@ -156,7 +187,7 @@ impl CoordinatorStore {
         event: CoordinatorEvent,
     ) -> Result<CoordinatorRecord, StoreError> {
         self.state.check(&event)?;
-        let record = CoordinatorRecord::external(self.next_seq, driver::recorded_now(), event);
+        let record = CoordinatorRecord::external(self.next_seq, self.clock.now(), event);
         let stored = encode_record(&record)?;
         self.logs.append(&LogId::Coordinator, &[stored]).await?;
         // Nothing touched the state since `check` accepted the event.

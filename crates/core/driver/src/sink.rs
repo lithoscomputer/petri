@@ -4,18 +4,67 @@
 //! is no window in which a secret is on disk.
 
 use std::collections::HashMap;
-use std::io;
 use std::path::{Path, PathBuf};
-use std::sync::{Mutex, PoisonError};
+use std::sync::{Arc, Mutex, PoisonError};
+use std::{fmt, io};
 
 use executor::Masker;
 use ir::{LogStream, Value};
 use tokio::fs::{self, OpenOptions};
 use tokio::io::AsyncWriteExt as _;
 
-/// Writes step output to the run directory, and optionally echoes it.
+/// Where the driver persists step output: one append-only log per firing,
+/// named `<node>-<firing>.log`. The run directory's `logs/` by default
+/// ([`StepLogDir`]); a simulation keeps them in memory.
+#[async_trait::async_trait]
+pub trait StepLogStore: fmt::Debug + Send + Sync {
+    /// Append one masked line from `stream` to the log `name`.
+    async fn append(&self, name: &str, stream: LogStream, line: &str) -> io::Result<()>;
+
+    /// Where the log `name` is, for a person reading a terminal.
+    fn locate(&self, name: &str) -> String {
+        name.to_owned()
+    }
+}
+
+/// Step logs as files in a directory, each line tagged `[out]` or `[err]`.
+#[derive(Debug)]
+pub struct StepLogDir {
+    dir: PathBuf,
+}
+
+impl StepLogDir {
+    pub fn new(dir: impl Into<PathBuf>) -> Self {
+        Self { dir: dir.into() }
+    }
+}
+
+#[async_trait::async_trait]
+impl StepLogStore for StepLogDir {
+    /// The write itself. Its result is the sink's only failure signal: without
+    /// it a full disk loses the whole step log while the run reports success.
+    async fn append(&self, name: &str, stream: LogStream, line: &str) -> io::Result<()> {
+        fs::create_dir_all(&self.dir).await?;
+        let mut file = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(self.dir.join(name))
+            .await?;
+        let tag = match stream {
+            LogStream::Stdout => "out",
+            LogStream::Stderr => "err",
+        };
+        file.write_all(format!("[{tag}] {line}\n").as_bytes()).await
+    }
+
+    fn locate(&self, name: &str) -> String {
+        self.dir.join(name).display().to_string()
+    }
+}
+
+/// Writes step output to its store, and optionally echoes it.
 pub(crate) struct LogSink {
-    dir:    PathBuf,
+    store:  Arc<dyn StepLogStore>,
     masker: Masker,
     echo:   bool,
     /// The prefix an echoed tag carries before the node: the invocation a
@@ -27,9 +76,17 @@ pub(crate) struct LogSink {
 }
 
 impl LogSink {
-    pub(crate) fn new(run_dir: &Path, masker: Masker) -> Self {
+    /// A sink over `store`, or over the run directory's `logs/` without one.
+    pub(crate) fn new(
+        run_dir: &Path,
+        store: Option<&Arc<dyn StepLogStore>>,
+        masker: Masker,
+    ) -> Self {
         Self {
-            dir: run_dir.join("logs"),
+            store: store.map_or_else(
+                || Arc::new(StepLogDir::new(run_dir.join("logs"))) as Arc<dyn StepLogStore>,
+                Arc::clone,
+            ),
             masker,
             echo: false,
             label: String::new(),
@@ -95,10 +152,10 @@ impl LogSink {
         line: &str,
     ) -> String {
         let masked = self.masker.mask(line);
-        let path = self.dir.join(format!("{}-{firing}.log", sanitize(node)));
-        if let Err(err) = self.append(&path, stream, &masked).await {
+        let name = format!("{}-{firing}.log", sanitize(node));
+        if let Err(err) = self.store.append(&name, stream, &masked).await {
             tracing::warn!(
-                path = %path.display(),
+                log = %self.store.locate(&name),
                 node,
                 firing,
                 error = ?err,
@@ -111,7 +168,7 @@ impl LogSink {
                 Charge::Crossed => eprintln!(
                     "[{}] … [echo truncated after {ECHO_STAGE_LIMIT} bytes; the full log is {}]",
                     self.tag(node, firing),
-                    path.display()
+                    self.store.locate(&name)
                 ),
                 Charge::Exceeded => {}
             }
@@ -134,24 +191,6 @@ impl LogSink {
         } else {
             Charge::Within
         }
-    }
-
-    /// The write itself. Its result is the sink's only failure signal: without
-    /// it a full disk loses the whole step log while the run reports success.
-    /// The line never leaves this function.
-    async fn append(&self, path: &Path, stream: LogStream, masked: &str) -> io::Result<()> {
-        fs::create_dir_all(&self.dir).await?;
-        let mut file = OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(path)
-            .await?;
-        let tag = match stream {
-            LogStream::Stdout => "out",
-            LogStream::Stderr => "err",
-        };
-        file.write_all(format!("[{tag}] {masked}\n").as_bytes())
-            .await
     }
 
     /// Mask every string in an outcome's data before the finish record is

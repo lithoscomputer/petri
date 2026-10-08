@@ -82,8 +82,8 @@ pub const ENVIRONMENT_PARAM: &str = "fabro.environment";
 pub struct Settings {
     /// What the Attractor lowering applies.
     pub run:          RunSettings,
-    /// The launch-level model default the host bound, as given; already
-    /// folded into `run.model` below the file layers.
+    /// The launch's model choice and the host's default, as given; already
+    /// folded into `run.model_override` and `run.model`.
     pub launch:       LaunchModel,
     /// `[run.execution]`.
     pub dry_run:      bool,
@@ -104,6 +104,8 @@ impl Settings {
             "auto_approve": self.auto_approve,
             "model": self.launch.model,
             "provider": self.launch.provider,
+            "default_model": self.launch.default_model,
+            "default_provider": self.launch.default_provider,
             "clone": {
                 "enabled": self.run.clone.enabled,
                 "depth": self.run.clone.depth,

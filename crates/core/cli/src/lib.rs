@@ -143,19 +143,21 @@ impl FileArgs {
 }
 
 /// `--model`, `--provider` and `--environment`: the launch-level settings a
-/// format's run configuration reads. A format whose LLM nodes may name no
-/// model reads the model default below its own defaults (the node, the
-/// graph, the run configuration); a format with named environments reads
-/// the environment selection over its files, as Fabro's own environment
-/// option does. A format without either ignores them.
+/// format's run configuration reads. A format whose LLM nodes name models
+/// reads the model choice over its defaults (the graph's, the run
+/// configuration's) but below a model a node names itself; a format with
+/// named environments reads the environment selection over its files. Both
+/// follow Fabro's own options. A format without either ignores them.
 #[derive(Args, Default)]
 struct ModelArgs {
-    /// The model a prompt or agent node runs on when neither it, the graph
-    /// nor the workflow's run configuration names one.
+    /// The model every prompt or agent node runs on, over the graph's and the
+    /// workflow's run configuration's defaults. A node that names its own
+    /// model keeps it.
     #[arg(long)]
     model:       Option<String>,
-    /// The provider of that model. Alone, the provider's default model in
-    /// the runner's catalog.
+    /// The provider for a node that names no model of its own, over the same
+    /// defaults. Alone, where nothing names a model, the provider's default
+    /// model in the runner's catalog.
     #[arg(long)]
     provider:    Option<String>,
     /// The execution environment to run in, by the id the workflow's run
@@ -329,7 +331,7 @@ enum Command {
         target: FileArgs,
         /// The `events.json` a run wrote.
         log:    PathBuf,
-        /// The launch default the original run was given, so the graph
+        /// The launch settings the original run was given, so the graph
         /// lowers the same.
         #[command(flatten)]
         model:  ModelArgs,

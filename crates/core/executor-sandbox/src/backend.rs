@@ -7,7 +7,7 @@ use std::str::FromStr;
 
 use executor::EnvError;
 use ir::RuntimeSpec;
-use sandbox_driver::{Resources, SandboxKind};
+use sandbox_driver::{NetworkPolicy, Resources, SandboxKind};
 
 const RUNNER_PIN: &str = "f8bbbfd81934";
 const DEFAULT_LABEL: &str = "ubuntu-24.04";
@@ -67,6 +67,10 @@ pub enum LostSandbox {
 #[derive(Clone, Debug, Default)]
 pub struct SandboxOptions {
     pub backend:           SandboxBackend,
+    /// Network policy for every sandbox created by this run. Providers reject
+    /// policies they cannot enforce. Blocked runs also verify attached
+    /// sandboxes.
+    pub network:           NetworkPolicy,
     /// What to do when a lease's recorded sandbox is gone from the provider.
     pub lost_sandbox:      LostSandbox,
     /// Label-to-image overrides. Daytona images must include Docker,

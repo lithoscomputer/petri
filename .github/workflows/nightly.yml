@@ -131,8 +131,9 @@ jobs:
         run: mise run plugins:build
 
       # check:nightly adds to the routine gate: the compiler floor, the long
-      # tests, three repeated black box runs under different schedules, the
-      # pinned Fabro comparison matrix, and the release-mode suite.
+      # tests, the driver and execution simulations over many more seeds,
+      # three repeated black box runs under different schedules, the pinned
+      # Fabro comparison matrix, and the release-mode suite.
       - name: Verify extended checks
         id: verify
         run: mise run check:nightly

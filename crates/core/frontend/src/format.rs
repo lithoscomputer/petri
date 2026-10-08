@@ -24,15 +24,23 @@ use crate::files::FileSource;
 /// it at load; a host that lowers in memory leaves it unset.
 pub const REPOSITORY_VAR: &str = "petri.repository";
 
-/// The compile variables `petri run --model` and `--provider` bind: a
-/// launch-level default for a format whose LLM nodes may name no model. A
-/// format that has such nodes reads them below its own defaults (a node's
-/// attribute, the graph's default, the run configuration) and records them
-/// in its launch parameter, so the persisted graph carries the launch. A
-/// provider alone means the provider's default model in the runner's
+/// The compile variables `petri run --model` and `--provider` bind: the
+/// model the launch asks for, as `fabro run --model` and `--provider` do. A
+/// format whose LLM nodes may name a model reads them over its run
+/// configuration and the file's own defaults, but below a model a node names
+/// itself, and records them in its launch parameter, so the persisted graph
+/// carries the launch. Each applies on its own. A provider alone, where
+/// nothing names a model, means the provider's default model in the runner's
 /// catalog. Unset when the launch named none.
 pub const LAUNCH_MODEL_VAR: &str = "petri.launch_model";
 pub const LAUNCH_PROVIDER_VAR: &str = "petri.launch_provider";
+
+/// The compile variables a host binds to the model a run falls back to,
+/// such as a server's catalog default: the last default, below everything
+/// the file and its run configuration name. `petri run` binds neither.
+/// Unset when the host has no default.
+pub const DEFAULT_MODEL_VAR: &str = "petri.default_model";
+pub const DEFAULT_PROVIDER_VAR: &str = "petri.default_provider";
 
 /// The compile variable `petri run --environment` binds: the execution
 /// environment the launch selects, by the id a format's run configuration

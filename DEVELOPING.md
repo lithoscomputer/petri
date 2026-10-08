@@ -32,7 +32,7 @@ exactly `branch = "main"`: not `rev`, and not an omitted ref, which Cargo
 treats as a different source. Pick up a newer commit with
 `cargo update -p <crate>` and let CI decide; whoever breaks an API another
 Lithos repository uses fixes that repository promptly. Fabro's `Cargo.lock`
-decides what ships. `mise run check:pins` enforces the form.
+decides what ships.
 
 All of these repositories are public. `Cargo.toml` names them over HTTPS, so
 a build needs no SSH key and no credential, locally or in CI.
@@ -81,7 +81,6 @@ bounded output capture, and the Pebble environment contract on Host and Docker.
 | `mise run test:lean` | Check the engine core against the Lean model, with the model required |
 | `mise run check` | Run the complete routine verification gate |
 | `mise run check:bundles` | Verify the vendored Fabro bundles against `bundles.lock.json`, digest by digest |
-| `mise run check:pins` | Check that internal Git dependencies track `main`, and that `Cargo.lock`, `CONTRACT.md`, and the latest evidence records cite the same revisions |
 | `mise run test:fabro:blackbox` | Run the required Fabro black box scenarios and write their evidence records and coverage report |
 | `mise run test:fabro:blackbox:repeat` | The same set three times, each in fresh processes under a different schedule |
 | `mise run test:fabro:differential` | Compare the shipped binary with the pinned `fabro` binary (built from the corpus on first use, about three minutes) |
@@ -102,6 +101,53 @@ skips the comparison; `mise run test:lean` builds the model and requires it,
 as the `lean model` CI job does. A new Lean or elan version must be at least
 a day old, like every other tool here.
 
+## Simulations
+
+`crates/core/driver/tests/simulation.rs` is deterministic simulation testing
+of the driver. Each seed builds a workflow, host stops and crashes, and a host
+that answers questions, delays and fails hooks and decisions, and shares the
+attempt slot with a sibling execution. It runs the real driver against a
+simulated sandbox world (`testkit::sim`) on a paused, single-threaded
+runtime; every choice comes from the seed, so a seed always runs the same
+way.
+
+`crates/core/execution/tests/simulation.rs` does the same for the execution
+layer. Each seed builds a root graph and child graphs with invoke steps
+(single calls and forks, their own sandbox or the caller's, some through a
+fork gate) and restart arms, sometimes turns on the circuit breaker or a low
+invocation limit, plans host cancels and up to three crashes (at a time,
+right after a chosen coordinator or resource record, at a sandbox provider
+call, or at a store fault: a failed append, a lost reply, a store that stays
+down), and runs the coordinator through the host wrappers over one
+in-memory store, resuming after each crash. Some crashes leave a zombie
+that runs on beside its successor after the store released its lease. The runtime's own lease router
+reaches the world as a Docker-kind provider (`testkit::sim::WorldFactory`),
+so lease records, reconcile, fencing, retention and release all run, and the
+world checks each provider call against the lease's recorded intent. The host
+services run as a CLI or Fabro host runs them, one set per lifetime: the
+control service pauses and unpauses the run, the stall watchdog watches it,
+the interview dispatcher carries questions to an interviewer that answers or
+lets them expire, and run-level hooks note the run's end and each release.
+
+`mise run test` runs 128 and 64 seeds, each in a few seconds at most, and
+`mise run test:dst`, part of the nightly gate, runs 50,000 and 20,000. The
+execution layer also runs a tenth of its seeds, at least 128, twice, and
+compares their logs byte for byte. To run another number, or to replay a
+failing seed with a trace of what it did:
+
+```sh
+PETRI_DST_SEEDS=2000 cargo nextest run -p petri-driver --test simulation
+PETRI_DST_SEED=1234 PETRI_DST_TRACE=1 cargo nextest run -p petri-execution \
+  --test simulation --no-capture
+```
+
+Keep the simulations deterministic: every `select!` they, the driver or the
+coordinator run is `biased;`, maps they iterate are ordered, time comes from
+the runtime's clock, and the runtime's `recording_clock`, `step_logs` and
+`decision_seed` take the rest. `a_seeded_world_replays_byte_for_byte`,
+`a_seeded_run_replays_byte_for_byte` and the two `determinism.rs` tests check
+it.
+
 ## Diagnostics
 
 Set `PETRI_LOG` to see tracing output on stderr. The default is `warn`. Use
@@ -118,11 +164,9 @@ secrets, step output, and environment values are never captured.
 ## Library and repository gates
 
 The MCP client is Pebble's dependency. A change to Pebble or `lithos-llm`
-runs that repository's required checks first; only then does Petri move its lock,
-update the "Pinned revisions" table in
-`crates/fabro/acceptance/CONTRACT.md`, and rerun the affected black box
-scenarios. `mise run check:pins` fails while the citations disagree. A library
-test pass never replaces a required Petri scenario. The pending library batch
+runs that repository's required checks first; only then does Petri move its lock
+and rerun the affected black box scenarios. `Cargo.lock` is the only copy of
+the locked commits. A library test pass never replaces a required Petri scenario. The pending library batch
 is listed in `README.md` under "Library and repository gates".
 
 ## Rust policy

@@ -110,8 +110,8 @@ async fn retries_and_exhaustion_follow_fabro() {
 }
 
 #[tokio::test]
-async fn goal_gates_jump_to_their_retry_target_or_fail_the_run() {
-    let r = run_named("goal_gate_unsatisfied_jumps_to_retry_target_then_passes").await;
+async fn goal_gates_send_the_run_back_to_their_retry_target_or_fail_it() {
+    let r = run_named("goal_gate_unsatisfied_returns_to_retry_target_then_passes").await;
     assert_path(&r, "success", &[
         "start", "work", "verify", "work", "verify", "exit",
     ]);

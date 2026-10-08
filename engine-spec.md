@@ -25,6 +25,14 @@ fabro_core). Root cancellation and engine `RunError`s outrank both. The
 failed history), under every policy — deliberately not the folded status,
 which under `TerminalNode` would read `Failed` until the exit record exists.
 
+This quiescence result describes workflow execution. An embedding host may
+declare required run finalization through `ExecutionHooks`. The IO driver
+awaits it before environment release; the coordinator then commits the
+overall run result. Required finalization can fail successful execution,
+never upgrade failed execution, and never replace cancellation. Execution
+results remain distinct. The committed terminal result and finalization
+failure detail are immutable (`crates/core/execution/HOOKS.md`).
+
 All coordination lives in a pure, sans-IO core: `apply(state, event) ->
 (state, commands)` — deterministic, no clocks, no RNG, no filesystem. All side
 effects live behind traits (`Executor`, `StepKind`, `LogSink`,
@@ -130,9 +138,14 @@ pub enum Completion {               // Graph.completion: how run status folds (�
 ```rust
 pub enum Status {
     Success,
-    PartialSuccess { underlying: Option<FailureInfo> },  // success-like; carries the real failure
+    PartialSuccess { underlying: Option<UnderlyingFailure> },  // success-like; carries the real failure
     Failure(FailureInfo),                                // FailureInfo.class: SmolStr (§13)
     Skipped, Cancelled, TimedOut,
+}
+
+pub enum UnderlyingFailure {       // exactly the statuses `is_failure` names
+    Failure(FailureInfo),
+    TimedOut,
 }
 ```
 
@@ -144,7 +157,9 @@ Rules (violations are review-blockers):
    (`is_success()` and `FailureInfo.retryable` were deleted for violating this;
    do not reintroduce.)
 3. **Log truth** — converting a failure to `PartialSuccess` must preserve the
-   real failure in `underlying`. All conversion paths: process `soft_fail`
+   real failure in `underlying`: the failure it was converted from, whole — a
+   `Failure` with its info, or a `TimedOut` (which has no info to keep). It is
+   not a cause; a policy made the conversion. All conversion paths: process `soft_fail`
    config; `Exhaustion::AcceptPartial` (fires whenever a retryable status hits
    exhaustion, including `max_attempts: 1`; `RetryPolicy::finalize`, applied
    by the driver to every returned attempt before a host prepares the result,
@@ -165,6 +180,19 @@ Rules (violations are review-blockers):
 `StartStep`. Token generation on emit = source generation, +1 per back edge.
 `Cancelled` joins the statuses that flow through routing (§5);
 `is_success_like` is untouched — it remains `Success | PartialSuccess`.
+
+**Budget refusal.** A key the budget refuses (`firing_count >= max_firings`)
+records `RunError::BudgetExceeded`, which fails the run; it takes the key's
+tokens and marks the key fired, and it records and routes nothing, so work
+downstream of it waits. Routing nothing is what makes the budget a
+termination guarantee: a routed outcome could take a back edge, be refused
+again in the next generation, and route again, forever. (A mutation that
+routes a failure instead overflows the stack in the flow property test.)
+Only a key that would run is an error. A key that would only complete
+`Cancelled` without running (§5) stops quietly: it takes its tokens and is
+marked fired, but records no error. Nothing would have run, so a cancelled
+loop whose back arm is `always` ends at its budget without failing the run;
+after a group cancel, the rest of the run keeps its own status.
 
 **Retries.** Each firing starts at `Attempt(1)`; counters reset per firing (a
 later generation retries fresh). On a matching non-final failure the core emits
@@ -213,7 +241,7 @@ for external item resolution but is never emitted today.
 sees them; `EdgeId::SEED` is rejected in routing groups). Join counting is
 uniform: `All` over one seed edge = one seed token. The one exception is a
 `for_each` clone's entry: the template's join already admitted the expansion,
-so the clone's seed forces entry for its generation, as a restart or a jump
+so the clone's seed forces entry for its generation, as a restart's entry
 does, and the join is not applied twice. Without that, a `Quorum { n >= 2 }`
 on the `for_each` node would admit the template and then start no clone.
 
@@ -260,6 +288,8 @@ the request by node name and is available as a driver-provided step capability.
      completes `Cancelled` unless it is marked. This is what keeps a
      `fail_fast` splice's un-marked collector — outside the cancelled scope —
      from starting, while a marked one fires and gathers partial results.
+   - A completion without running counts against the budget, and the budget
+     refuses it quietly (§4, "Budget refusal").
 3. A firing **awaiting a retry backoff** has no work in flight and no driver
    task to deliver to, so the core settles it at once instead of waiting out
    the backoff: it records a `Cancelled` outcome and routes it (under Kill:
@@ -268,14 +298,20 @@ the request by node name and is available as a driver-provided step capability.
    recalled, and replay must stay clean. Every other invalid `RetryElapsed` —
    unknown firing, not awaiting, duplicate after the tombstone is consumed —
    still raises `UnknownFiring` / `UnexpectedRetry`; the no-op is
-   cancellation-specific, never a blanket swallow of malformed input.
+   cancellation-specific, never a blanket swallow of malformed input. A
+   firing **awaiting its admission** has no step either, and settles the same
+   way: its pending decision is withdrawn, and the driver drops the late
+   answer. A kill of `ROOT` settles these firings before it drops the run's
+   other pending decisions.
 
 **Kill** (`Event::KillRequested { scope }`) stops the scope: the forced tier,
 scope-addressed like `CancelRequested` (a kill of `ROOT` kills the run).
 Killing marks the scope closure killed (killed implies cancelled), drops its
 pending and deferred tokens, swallows tokens aimed inside it, records live
 firings' outcomes **without routing**, and admits nothing — `run_on_cancel`
-included. Delivery is `Control::Kill`, sent to **every** live firing in the
+included. It also withdraws the routing decisions still open for outcomes
+recorded inside it before the kill, so nothing routes out of a killed closure,
+however long the host took to decide; the driver drops the late answers. Delivery is `Control::Kill`, sent to **every** live firing in the
 closure, already-cancelling ones included; a step kind receiving it goes
 straight to `SIGKILL`, no ladder. No new `Status` or `RunStatus` variant: how a
 firing was stopped is a mode, not an outcome — a killed firing records
@@ -443,9 +479,10 @@ object unchanged. Commands: `StartStep(ResolvedFiring)`,
 `DeliverControl`, `ScheduleRetry`, `ExpandNode` (reserved), `AcquireScope`,
 `ReleaseScope`, `Admit`, `ResolveRouting`, `FinishExecution`.
 
-Event log version 10 is the one-vocabulary form above, with snake-case tags on
-every enum inside a record. Earlier log versions are rejected; there is no
-migration.
+Event log version 12 is the one-vocabulary form above, with snake-case tags on
+every enum inside a record, the scope records (v11), and a partial success
+that keeps its whole underlying failure (v12). Earlier log versions are
+rejected; there is no migration.
 
 Every execution start and attempt start uses `Admit` → `AdmissionDecided`. Every final
 firing outcome, including a terminal node with no groups, uses one
@@ -563,6 +600,22 @@ pinned by the run format version, checked on the run declaration. The
 layout is the standalone petri host's own and is documented with it, not
 here.
 
+**A failed write ends the lifetime.** When a write to the run's store fails,
+in any of its logs, the coordinator's lifetime ends at once, and the next
+lifetime resumes from what the store holds. A write can land and still
+report a failure, so memory may no longer match the log: every writer of the
+run refuses from then on, the lease layer answers no lookup and so calls no
+provider, and the driver stops without recording anything more
+(`ExecutionReport::store_failure`). No firing fails for the store, and no
+hook runs after the failure; the coordinator returns
+`CoordinatorError::StoreFailed`. A run-directory handle refuses every write
+after its first failed append, and the next writer truncates a partial line
+and counts one that landed. Before any attempt starts in a scope, and before
+a scope is released, the driver waits for the run log to hold the scope's
+`scope.acquired`, so the `scope_released` point of a scope an earlier
+lifetime acquired is always found again on resume
+(`Driver::observe_run_log`).
+
 **Resume.** `engine::resume(graph, &log)` rebuilds a crashed run by replay and
 reconciles what is still owed. The loaded log must be a **byte-prefix** of the
 regenerated one — not equal: a crash can land between an External append and
@@ -656,6 +709,17 @@ renders the join unsatisfiable). The suppression's `!back` filter is
 unreachable given invariant 8 and is kept as documented defense. Remaining
 positives are a labelled over-approximation; the warning names the re-entry
 node and the fix.
+
+**Lint (warning, not error):** a join across generations
+(`lint.join_across_generations`) — an `All` join, or a `Quorum` that needs
+both sides, over an edge from a node a loop reaches and an edge from a node
+no loop reaches. A token keeps the generation its loop gave it (§4), so the
+join fires only when the loop exits in generation 0; after one iteration it
+waits forever, and under `AnyFailure` the run still succeeds. A warning, not
+an error, because the graph works for a loop that does not iterate and
+nothing else can express the wait yet (§14). Not exact: it also fires for a
+loop that never iterates, and it misses a join between two loops that exit in
+different generations.
 
 **Firing-time errors are node failures, routable, never run aborts:**
 `UnresolvedConfig`, `secret_misplaced`, `bad_output_file`, `env_acquire`.
@@ -811,6 +875,30 @@ are notified after every apply, and the driver awaits every observer's
 fatal-sink semantics watches its own observer and cancels via `RunHandle`).
 The stock petri host persists a post-mask run dir through an observer battery;
 details live with that host, not here.
+
+**Determinism.** Under a simulated clock the driver is a function of its
+inputs, so a seeded simulation replays a run exactly. Its `select!`s are
+biased: the main loop takes abandoned scope handles, then background task
+exits, both bounded, then signals; a firing's log forwarder closes before it
+receives, and closing still hands back every queued event. Its state maps are
+ordered. Every duration it records, such as `scope.acquired`'s
+`duration_ms`, reads the runtime's clock, and the time it stamps on observed
+records comes from `RunConfig.recording_clock`, the wall clock by default. Its
+one draw, for a weighted routing tier, comes from the operating system in
+`DefaultDecisionResolver` and from a seed in `SeededDecisionResolver`; the
+draw is in the log either way, so replay never needs it. Step output goes
+to `RunConfig.step_logs`, a `StepLogStore`: the run directory's `logs/` by
+default, memory in a simulation.
+
+The coordinator above it is a function of its inputs the same way. Its loop
+is biased too: the host's commands (cancel, pause, control), then finished
+drivers and lease releases, then fork admissions, then start requests, so new
+work comes last. The runtime passes one recording clock to every driver of a
+run and to the coordinator and resource logs (`Runtime::recording_clock`),
+one step-log store per execution directory (`Runtime::step_logs`), and a seed
+for every execution's weighted draws (`Runtime::decision_seed`, mixed with
+the execution's id). With a fixed `RunOptions::run_key`, a seeded run stores
+the same logs byte for byte.
 
 **Timeout accounting.** `Budget.timeout_policy` says who enforces the
 per-attempt timeout. `ExecutorEnforced` (the default): the driver arms the
@@ -1072,6 +1160,15 @@ opaque labels (D3). `Control::Pause` (enum is `#[non_exhaustive]`); `Steer` and
 `Approve` shipped as `Control::Deliver` (§6, §10). Strict expression mode. Encoded-secret masking. Content
 caching (`StepKind::fingerprint` defaults `None`). JS action host; action
 shims are package 04. Windows; service containers; resource limits.
+
+**Joining after a loop (open design question).** Nothing resets a generation:
+a token leaving a loop keeps the loop's generation, and a join matches one
+generation, so no graph can wait for a loop and a path that skips it once the
+loop has iterated (`lint.join_across_generations`, §8). Closing the gap needs
+a way to leave a loop at a known generation — for example an exit edge that
+resets the generation, or a join that matches its inputs across generations —
+and either changes the core's token rules. Undecided. As of the lint's
+introduction, no Fabro or GitHub Actions corpus workflow has the shape.
 
 ## 15. Testing notes (institutional memory)
 

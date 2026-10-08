@@ -78,6 +78,14 @@ pub enum HostError {
     Store(#[from] store::StoreError),
     #[error("the coordinator finished the root invocation without a final execution report")]
     MissingExecutionReport,
+    /// The run's creation was cut short: it is stored, but its root
+    /// invocation was never declared, so there is nothing to resume. Start
+    /// it again under the same key: the start finishes the creation.
+    #[error(
+        "the run was stored but never started: its root invocation was never declared; start \
+         it again"
+    )]
+    NotStarted,
     /// A fork position the source run cannot be forked at.
     #[error(transparent)]
     Fork(#[from] ForkError),
@@ -200,6 +208,11 @@ pub async fn run_with_handle(
 /// handle plus the run's secret provider handed to `with_handle` before the
 /// run starts — the provider is how an answerer registers a dynamic secret
 /// (`answer:<id>`) before delivering its reference into a live firing.
+///
+/// A run whose creation was cut short under the same key
+/// ([`HostError::NotStarted`] on resume) is started again: its stored prefix is
+/// taken over and the creation finished. A run that declared an invocation
+/// already started, and is refused as existing.
 pub async fn run_configured(
     rt: &Runtime,
     run: HostRun,
@@ -207,13 +220,22 @@ pub async fn run_configured(
 ) -> Result<ExecutionReport, HostError> {
     let run_dir = rt.run_options().run_dir.clone();
     let run_runtime = rt.prepare_run(&run_dir);
-    let secrets = run_runtime.secret_provider();
+    let mut secrets = run_runtime.secret_provider();
     let mut chain = policy_middleware(&run.graph);
     chain.extend(run.middleware);
     let options = coordinator_options(&run.graph)?;
     // The coordinator is a large value held across every await below; one
     // allocation keeps a host's own future small.
-    let mut coordinator = Box::pin(Coordinator::create(run_runtime, chain, options)).await?;
+    let mut coordinator =
+        match Box::pin(Coordinator::create(run_runtime, chain.clone(), options)).await {
+            Err(exists @ CoordinatorError::Open(store::StoreError::Exists { .. })) => {
+                let (coordinator, provider) =
+                    Box::pin(start_again(rt, &run_dir, chain, options, exists)).await?;
+                secrets = provider;
+                coordinator
+            }
+            created => created?,
+        };
     for observer in run.observers {
         coordinator = coordinator.observe(observer);
     }
@@ -223,6 +245,31 @@ pub async fn run_configured(
     }
     with_handle(coordinator.handle(), secrets);
     Box::pin(finish_root(rt, coordinator, digest, run.graph)).await
+}
+
+/// Take over a run whose creation was cut short: its stored log holds
+/// `run.started` and graphs, and no invocation. The stored state is read
+/// without the lease first, so a run that started is refused with
+/// `exists` and never touched.
+async fn start_again(
+    rt: &Runtime,
+    run_dir: &Path,
+    chain: Vec<Arc<dyn Middleware>>,
+    options: CoordinatorOptions,
+    exists: CoordinatorError,
+) -> Result<(Coordinator, Arc<dyn SecretProvider>), HostError> {
+    let run_runtime = rt.prepare_run(run_dir);
+    let started = {
+        let logs = run_runtime.open(RunAccess::Read).await?;
+        !stored_state(&*logs).await?.invocations.is_empty()
+    };
+    if started {
+        run_runtime.finish().await;
+        return Err(exists.into());
+    }
+    let secrets = run_runtime.secret_provider();
+    let coordinator = Box::pin(Coordinator::resume(run_runtime, chain, options)).await?;
+    Ok((coordinator, secrets))
 }
 
 /// The coordinator options a root graph's run policy asks for: its
@@ -277,14 +324,13 @@ pub async fn resume_configured(
         let logs = run_runtime.open(RunAccess::Read).await?;
         stored_root_graph(&*logs).await?
     };
-    let mut chain = root_graph
-        .as_ref()
-        .map(policy_middleware)
-        .unwrap_or_default();
+    let Some(root_graph) = root_graph else {
+        run_runtime.finish().await;
+        return Err(HostError::NotStarted);
+    };
+    let mut chain = policy_middleware(&root_graph);
     chain.extend(middleware);
-    let options = root_graph
-        .as_ref()
-        .map_or(Ok(CoordinatorOptions::default()), coordinator_options)?;
+    let options = coordinator_options(&root_graph)?;
     let secrets = run_runtime.secret_provider();
     let mut coordinator = Box::pin(Coordinator::resume(run_runtime, chain, options)).await?;
     for observer in observers {
@@ -311,8 +357,17 @@ pub async fn stored_state(logs: &dyn RunLogs) -> Result<CoordinatorState, HostEr
 }
 
 /// The root invocation's registered graph, read without taking the run
-/// lease. `None` when the log has no root invocation yet.
+/// lease. `None` when the log has no root invocation yet, or no record at
+/// all: a crash can cut a run's creation short before `run.started`.
 pub async fn stored_root_graph(logs: &dyn RunLogs) -> Result<Option<Graph>, HostError> {
+    if logs
+        .read(&store::LogId::Coordinator)
+        .await
+        .map_err(CoordinatorError::from)?
+        .is_empty()
+    {
+        return Ok(None);
+    }
     let state = stored_state(logs).await?;
     let Some(root) = state.invocations.get(&InvocationId::ROOT) else {
         return Ok(None);

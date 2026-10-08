@@ -86,13 +86,20 @@ impl ScopeLeaseAllocator for InvocationLeaseAllocator {
         let error = |error: &dyn fmt::Display| {
             executor::EnvError::backend("coordinator", "reserve lease", error.to_string())
         };
+        // A write the store failed is the run's failure, not the scope's.
+        let store_failed = |error: &dyn fmt::Display| executor::EnvError::Store {
+            message: error.to_string(),
+        };
         let introduced_by =
             matches!(identity, engine::ScopeIdentity::Spliced(_)).then_some(self.execution);
         // The scope's introducing outcome must be durable before its lease.
         // This queues a marker behind all records already observed by the
         // driver.
         if introduced_by.is_some() {
-            self.writer.flush().await.map_err(|source| error(&source))?;
+            self.writer
+                .flush()
+                .await
+                .map_err(|source| store_failed(&source))?;
         }
         let provider = self
             .router
@@ -115,7 +122,10 @@ impl ScopeLeaseAllocator for InvocationLeaseAllocator {
             let record = resources
                 .reserve_scope(allocation, &provider, runtime, introduced_by)
                 .await
-                .map_err(|source| error(&source))?;
+                .map_err(|source| match source {
+                    ResourceError::Store(_) => store_failed(&source),
+                    other => error(&other),
+                })?;
             if record.state == crate::LeaseState::Deleted {
                 return Err(error(&ResourceError::DeletedLease(record.lease)));
             }
@@ -224,6 +234,44 @@ impl Coordinator {
         })
         .await?;
         Ok(())
+    }
+
+    /// Record the releases a crash cut off: a lease its release settled
+    /// (stopped and kept, or deleted) whose `scope.released` the crash beat
+    /// to the log. Its record says how the release ended; the outcome is
+    /// its owner's, or `status` for an owner with none.
+    pub(super) async fn record_cut_off_releases(&mut self, status: RunStatus) {
+        let unrecorded: Vec<_> = self
+            .resources()
+            .await
+            .records()
+            .filter(|record| {
+                matches!(
+                    record.state,
+                    crate::LeaseState::Stopped | crate::LeaseState::Deleted
+                ) && !self.store.state().released.contains(&record.lease)
+            })
+            .map(|record| {
+                let owner_status = self
+                    .store
+                    .state()
+                    .invocations
+                    .get(&record.allocation.invocation)
+                    .and_then(|invocation| invocation.result.as_ref())
+                    .map_or(status, |result| result.status);
+                (record.lease, record.allocation.invocation, owner_status)
+            })
+            .collect();
+        for (lease, invocation, owner_status) in unrecorded {
+            let release = LeaseRelease {
+                lease,
+                outcome: scope_outcome(owner_status),
+                report: executor::ReleaseReport::default(),
+            };
+            if let Err(error) = self.append_scope_released(invocation, release).await {
+                tracing::warn!(%error, lease = lease.raw(), "the scope's release was not recorded");
+            }
+        }
     }
 
     /// Release the leases `invocation` allocated, now that it has finished.

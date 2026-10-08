@@ -367,13 +367,17 @@ fn try_fire(
     }
 
     // The budget bounds synthesized outcomes too: an `Always`-guarded back edge
-    // cycling through a cancelled region terminates here, exactly as a `Skipped`
-    // cascade does.
+    // cycling through a cancelled region terminates here, as a `Skipped` cascade
+    // does. Only a key that would run is an error. One that would only complete
+    // `Cancelled` stops quietly: nothing would have run, so a cancelled group's
+    // loop ends without failing the rest of the run (§4, "Budget refusal").
     if state.firing_count(node_id) >= node.budget.max_firings {
-        state.push_error(RunError::BudgetExceeded {
-            node:        node_id,
-            max_firings: node.budget.max_firings,
-        });
+        if admitted {
+            state.push_error(RunError::BudgetExceeded {
+                node:        node_id,
+                max_firings: node.budget.max_firings,
+            });
+        }
         state.take_tokens(key);
         state.mark_fired(key);
         return;
@@ -1118,32 +1122,21 @@ fn on_routing_resolved(
             return;
         }
     };
-    // A jump replaces the whole prepared list with itself, so it is only ever
-    // the sole element. The applied records carry ids alone; the payloads stay
-    // in the stored routes, uncloned.
-    if let Some(PreparedRoute::Jump { target, .. }) = prepared.front() {
-        queue.push_back(Event::RouteApplied {
-            applied: RouteApplied::Jump {
+    // The applied records carry ids alone; the payloads stay in the stored
+    // routes, uncloned.
+    for route in &prepared {
+        let applied = match route {
+            PreparedRoute::Edge { group, edge, .. } => RouteApplied::Edge {
                 firing,
-                target: *target,
+                group: *group,
+                edge: *edge,
             },
-        });
-    } else {
-        for route in &prepared {
-            let applied = match route {
-                PreparedRoute::Edge { group, edge, .. } => RouteApplied::Edge {
-                    firing,
-                    group: *group,
-                    edge: *edge,
-                },
-                PreparedRoute::None { group } => RouteApplied::None {
-                    firing,
-                    group: *group,
-                },
-                PreparedRoute::Jump { .. } => continue,
-            };
-            queue.push_back(Event::RouteApplied { applied });
-        }
+            PreparedRoute::None { group } => RouteApplied::None {
+                firing,
+                group: *group,
+            },
+        };
+        queue.push_back(Event::RouteApplied { applied });
     }
     state.set_prepared_routes(firing, prepared);
 }
@@ -1171,7 +1164,7 @@ fn validate_and_prepare_routes(
             .groups
             .get(index)
             .ok_or_else(|| SmolStr::new("the proposal names an unknown routing group"))?;
-        validate_trace(state, pending, group, resolved)?;
+        validate_trace(group, resolved)?;
         let expected = deterministic_pick(proposal, resolved.draw.as_ref())?;
         match &resolved.decision {
             RouteDecision::Emit(edge) => {
@@ -1240,19 +1233,6 @@ fn validate_and_prepare_routes(
                     transition: arm.transition,
                 });
             }
-            RouteDecision::Jump(target) => {
-                if pending.node.routing.groups.len() != 1 || state.graph.node(*target).is_none() {
-                    return Err(SmolStr::new(
-                        "the jump target or source routing shape is invalid",
-                    ));
-                }
-                prepared.clear();
-                prepared.push_back(PreparedRoute::Jump {
-                    target:     *target,
-                    generation: pending.generation,
-                });
-                break;
-            }
             RouteDecision::None => {
                 if expected.is_some() {
                     return Err(SmolStr::new("the host returned None for an eligible route"));
@@ -1277,24 +1257,12 @@ fn validate_and_prepare_routes(
     Ok(prepared)
 }
 
-fn validate_trace(
-    state: &EngineState,
-    pending: &PendingRouting,
-    group: &ir::RoutingGroup,
-    resolved: &GroupDecision,
-) -> Result<(), SmolStr> {
+fn validate_trace(group: &ir::RoutingGroup, resolved: &GroupDecision) -> Result<(), SmolStr> {
     for intervention in &resolved.trace {
         match intervention {
             Intervention::Override { edge, .. } => {
                 if !group.arms.iter().any(|arm| arm.id == *edge) {
                     return Err(SmolStr::new("an override names an undeclared group edge"));
-                }
-            }
-            Intervention::Jump { target, .. } => {
-                if pending.node.routing.groups.len() != 1 || state.graph.node(*target).is_none() {
-                    return Err(SmolStr::new(
-                        "a jump names an undeclared node or ambiguous source",
-                    ));
                 }
             }
             Intervention::Block { .. } => {}
@@ -1446,12 +1414,6 @@ fn on_route_applied(
                 ..
             },
         ) => group == expected_group && edge == expected_edge,
-        (
-            RouteApplied::Jump { target, .. },
-            PreparedRoute::Jump {
-                target: expected, ..
-            },
-        ) => target == expected,
         (RouteApplied::None { group, .. }, PreparedRoute::None { group: expected }) => {
             group == expected
         }
@@ -1490,14 +1452,6 @@ fn on_route_applied(
                 source: firing,
             });
             begin_restart_shutdown(state, cmds);
-        }
-        PreparedRoute::Jump { target, generation } => {
-            let edge = state.next_edge_id();
-            state.register_seed_edge(edge, target);
-            state.force_entry(target, generation);
-            queue.push_back(Event::TokenEmitted {
-                token: Token::new(edge, generation, Value::Null, firing),
-            });
         }
         PreparedRoute::None { .. } => {}
     }
@@ -1774,13 +1728,21 @@ fn on_cancel(state: &mut EngineState, scope: CancelScopeId, cmds: &mut Vec<Comma
 /// The forced tier: the pre-v3 cancel behavior, kept under its own event.
 /// Tokens drop, nothing routes, nothing is admitted — `run_on_cancel` included
 /// — and `Control::Kill` reaches every live firing, already-cancelling ones
-/// too.
+/// too. An outcome recorded before the kill whose routing is still open does
+/// not route either.
 fn on_kill(state: &mut EngineState, scope: CancelScopeId, cmds: &mut Vec<Command>) {
     if scope == CancelScopeId::ROOT {
         state.clear_restart();
-        state.clear_pending_decisions();
     }
     stop_scope(state, scope, true, true, cmds);
+    // After the stop: a firing awaiting admission is settled by its pending
+    // decision. Cleared first, it would look started and wait for a step that
+    // never ran.
+    if scope == CancelScopeId::ROOT {
+        state.clear_pending_decisions();
+    } else {
+        state.withdraw_killed_routings();
+    }
 }
 
 fn begin_restart_shutdown(state: &mut EngineState, cmds: &mut Vec<Command>) {

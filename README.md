@@ -98,7 +98,8 @@ crates/core/engine/tests/partial_success.rs  handoff §4 soft failure, is_succes
 crates/core/engine/tests/seeding.rs          seed edges for entry nodes and clone entries
 crates/core/engine/tests/resolved_firing.rs  the executor boundary: no unresolved ExprId crosses it
 crates/core/engine/tests/event_log.rs        §5 logging, determinism, serde round-trip, §8 seams
-crates/core/engine/tests/flow_properties.rs  §3/§4 over random acyclic flows: joins sound and complete, one firing per key, replay
+crates/core/engine/tests/flow_properties.rs  §3–§5 over random flows: joins, generations, budgets, retries, cancel and kill, replay
+crates/core/engine/tests/resume_properties.rs  §6 resume over random flows: a log cut anywhere resumes to the live state, owes what was outstanding, and goes on to the same log
 crates/core/engine/tests/lean_model.rs       the core against the Lean model in `lean/`: flows and `deterministic_pick` (`mise run test:lean`)
 crates/core/ir/tests/validation.rs           §7, invariant by invariant
 crates/core/ir/tests/expressions.rs          the expression language
@@ -111,6 +112,8 @@ crates/core/driver/tests/timeout.rs       exec §7 6: timeouts, and the race und
 crates/core/driver/tests/environments.rs  exec §7 7,10: acquire failure and retention
 crates/core/driver/tests/secrets.rs       exec §7 8: masking, and what reaches the log
 crates/core/driver/tests/docker.rs        exec §7 3,10 Docker halves; skipped without a daemon
+crates/core/driver/tests/determinism.rs   §10 determinism: a seeded run on a simulated clock replays byte for byte
+crates/core/driver/tests/simulation.rs    §10 simulation: seeded crashes, stops and faults against a simulated sandbox world
 crates/core/executor-sandbox/tests/docker_backend.rs   the sandbox executor over the Docker plugin: the workspace in the sandbox, exit codes and signals, files over the wire, the crash fence, retention, services, one-shot actions
 crates/core/executor-sandbox/tests/daytona_backend.rs  the same executor over the Daytona plugin, live (`mise run test:daytona`, `PETRI_REQUIRE_DAYTONA`): the runner VM, a nested container job, files, the fence, retention, output after idle and under a burst, a preview URL, the failure modes; `DAYTONA.md` maps Fabro's former live suite onto it
 crates/petri/lib/tests/daytona.rs             the standalone host on `--backend daytona`, live: retention and `prune` with the tombstone, `resume` fencing the crashed VM
@@ -144,6 +147,8 @@ crates/petri/cli/tests/inspect_cli.rs        black box phase 2: `petri inspect` 
 crates/petri/lib/tests/fork.rs               `host::fork_from` through the embedding boundary: a three-stage run forked after its first stage, a fork at the last position with and without `rerun_last`, a fork after a parallel fan-in and before it, a position inside a branch refused, a fork at a failed firing on its failure route, and a fork in a host's own store
 crates/petri/cli/tests/fabro_resume_blackbox.rs  `petri resume` through the binary: a run killed with SIGKILL continues without repeating finished work, a paused run stays paused across the resume until an unpause, a waiting gate asks again, `inspect` reports `paused`, and the refusals (finished, leased, missing, corrupt)
 crates/core/execution/tests/inspect.rs      black box phase 2: `inspect_run` reconstruction, retries, children, torn and corrupt logs
+crates/core/execution/tests/determinism.rs  §10 determinism: a seeded coordinator run stores the same logs byte for byte, every record stamped from the simulated clock
+crates/core/execution/tests/simulation.rs   §10 simulation: seeded invocation trees, forks, gates, restarts, cancels, the breaker and crashes, resumed over one store
 crates/petri/cli/tests/fabro_blackbox.rs     the Fabro black box battery: the shipped binary against provider twins on loopback, scripted interviews, retention, the readiness milestone A smoke run with no `fabro` on PATH (`milestone_a_smoke_run_without_fabro_on_path`); every read of a finished run goes through `petri inspect --json`
 crates/petri/cli/tests/fabro_scenarios_blackbox.rs black box phase 4: every required (scenario, backend, agent) cell of `crates/fabro/acceptance/scenarios/matrix.json`, each a scenario file in the versioned format `scenarios/SCHEMA.md` documents, run through the shipped binary with provider twins, a fixture repository with real local Git remotes, and a scripted interviewer; `scripts/fabro-coverage-report.py` merges the per-cell records into `coverage.json`
 crates/petri/cli/tests/fabro_differential.rs black box phase 5: every scenario through the shipped binary and the pinned Fabro binary, independent expectations per engine, the committed reference, and the comparison under `tests/support/fabro/compare.rs` with decision records (`crates/fabro/acceptance/decisions/`)
@@ -155,7 +160,7 @@ crates/core/driver/tests/interview_budget.rs readiness item 6 on a controlled cl
 crates/petri/lib/tests/embedding.rs          readiness item 7: a Fabro workflow without adapters, then with fake adapters (pause, skip, block, prepared results, route override, fatal and best-effort transitions, a hook service); the timeline reconstructed from public events; slow, failing and recovering consumers
 crates/attractor/steps/tests/steps.rs            Fabro plan §5.2, §6: command, wait, human answered through deliver; Fabro's failure promotion; output references above 100 KiB; a long line stored whole, or its loss counted on the outcome
 crates/attractor/steps/tests/agent.rs            Fabro plan §7 6: the agent step against Fabro's fake ACP agent
-crates/attractor/steps/tests/acp.rs              follow-up C3: the ACP client against Petri's scripted agent (`tests/testdata/scripted_acp_agent.py`): every `session/update` variant as the `acp` envelope, the permission policy without a hook, the session usage extension in the stage's metrics, `authenticate` before `session/new`, product credentials and `$secret` references in the agent's environment, masked
+crates/attractor/steps/tests/acp.rs              follow-up C3: the ACP client against Petri's scripted agent (`tests/testdata/scripted_acp_agent.py`): every `session/update` variant as the `acp` envelope, the permission policy without a hook, the session usage extension in the stage's metrics, `authenticate` before `session/new`, only the named `$secret` references in the agent's environment, masked
 crates/petri/lib/tests/acp_products.rs       follow-up C3, live (`--ignored`): Claude Code (`claude-code-acp`) and Gemini CLI (`gemini --acp`) through the ACP step, on the host and in a container the test builds, creating a file, the session's tool calls and usage on the stream, a `[[run.hooks]]` block honoured; each cell skips itself without the product's binary and credential
 crates/fabro/frontend/tests/hooks.rs         readiness item 5: `[[run.hooks]]` at every phase with Fabro's payload and order, decisions, placement, timeouts, HTTP, prompt and agent hooks, native tool hooks, threads and fidelity, project memory, `speed` and `max_tokens`, the ACP hook mapping (a block rejects the permission request, the post-tool hooks run on reported tool calls, allow once under a hook)
 crates/fabro/frontend/tests/mcp.rs           readiness item 9b: `[run.agent.mcps]` against the scripted `mcp_server.py`: a stdio server's tool writes into the workspace, hooks block MCP tools, error results, timeouts, a crashed server, cancellation, a retained thread, start failures, the http and sandbox transports over streamable HTTP and SSE, every fact read from Pebble's own events
@@ -176,7 +181,7 @@ crates/petri/cli/tests/fabro_terminal_blackbox.rs  readiness item 2 through the 
 crates/petri/cli/tests/fabro_milestone_blackbox.rs  readiness item 8 through the binary: one workflow with `run.prepare`, commands, a native agent editing a file under a tool hook, a retained thread, project memory, a scripted decision, a bounded fan-out consumed downstream, run-end hooks and file checks; success, failure and cancellation
 crates/petri/cli/tests/fabro_readiness_blackbox.rs  readiness item 10 (milestone D) through the binary: the item 8 workflow with every item 9 facility in one run (a skill-guided plan, a hooked MCP write, a hooked sub-agent, a fan-out, a compaction and a later node on the compacted thread with an MCP call, a second thread failing over to the Anthropic twin), no platform Git operation in the repository the run prepared, every family on the public stream; an exhausted chain and an interrupt inside a child's tool as separate cases
 crates/petri/lib/tests/embedding_readiness.rs  readiness item 10 through the embedding boundary: the same combined execution run in-process by a host with its own hooks, interviewer and sink against the twins; the same files and scripts, the run rebuilt from public events, replay equal to the live stream
-crates/petri/cli/tests/fabro_evidence_blackbox.rs  the readiness gate's evidence: a scenario through the binary leaves a complete record with every pin, a failed scenario keeps its case directory, the coverage report counts only passed cells, the pin check rejects a record citing another revision, a required asset fails instead of skipping
+crates/petri/cli/tests/fabro_evidence_blackbox.rs  the readiness gate's evidence: a scenario through the binary leaves a complete record with every pin, a failed scenario keeps its case directory, the coverage report counts only passed cells, a required asset fails instead of skipping
 crates/petri/lib/tests/fabro_dependencies.rs  readiness item 1: no Fabro crate anywhere in Petri's dependency graph
 crates/petri/cli/tests/standalone.rs          readiness item 1: the binary runs a Fabro workflow with no `fabro` on PATH
 ```
@@ -288,23 +293,19 @@ record. A pinned-Fabro assertion that a decision record lists under
 `known_defects` is expected and counts as passed with a note naming the
 record; any other failed assertion fails the cell. CI writes the report into the job summary
 and keeps the full bundles of a failed run and the compact records of a passed
-run as job artifacts. `mise run check:pins` (`scripts/check-pins.py`) fails
-when `Cargo.lock`, the "Pinned revisions" table in
-`crates/fabro/acceptance/CONTRACT.md`, and the latest records cite different
-revisions. The readiness checklist with each item's evidence source is the
+run as job artifacts. The readiness checklist with each item's evidence source is the
 "Readiness gate checklist" section of that contract.
 
 #### Library and repository gates
 
 Pebble owns the agent loop, coding-agent behavior, and the MCP client;
 `lithos-llm` owns provider transport and request retries. A change to either runs the owning repository's required checks
-before Petri moves its lock; then `Cargo.lock`, the contract's pin table, and
-the affected evidence records move together, and the relevant Petri scenarios
-run again through the shipped binary. A library test pass never replaces a
-required Petri scenario. The current locked commits are in the contract's
-"Pinned revisions" table (Pebble `ba2928d`, lithos-llm `f40391a`, sandbox-driver
-`236196ed`, twins `ca45f0e`, Fabro `05ebd0f`, the runner image
-`f8bbbfd81934`); `mise run check:pins` keeps every citation in agreement.
+before Petri moves its lock; then the relevant Petri scenarios run again
+through the shipped binary, and their evidence records cite the new commits.
+A library test pass never replaces a required Petri scenario. The locked
+commits live only in `Cargo.lock`; the contract's "Pinned revisions" table
+names where each revision lives, the Fabro reference and the runner image
+included.
 See [git dependencies](DEVELOPING.md#git-dependencies) for how they are
 named and updated.
 The library batch the readiness work asked for landed on
@@ -1214,7 +1215,11 @@ edge taken by anything but a transient failure. See `crates/attractor/FORMAT.md`
 "Watchdog and circuit breaker".
 
 **The receipt.** Every run with an interviewer writes
-`<run-dir>/interviews.json` (`execution::InterviewReceipt`, version 1): one
+`<run-dir>/interviews.json` (`execution::InterviewReceipt`, version 2) each
+time a question's outcome is recorded, so a crash loses only the questions
+still waiting, which the resumed run asks again. A resumed run continues the
+receipt it finds: the receipt's `lifetime` counts the processes that wrote
+it, and each record carries the `lifetime` that asked it. One
 record per question with its invocation, execution, firing, attempt, node,
 occurrence, ask, question id, kind, text, offered option keys, the review
 `reference` and `timeout_ms` when the question had them, the reply
@@ -1228,20 +1233,27 @@ and how it left (`delivered`, `not_live`, `late`, `shutdown`, `withheld`,
 invocation path, then invocation, execution, firing, occurrence, and ask
 (the root's questions first, then each nested invocation's in path order;
 within an invocation, the order the run asked them), whatever order the
-answers arrived in, so a re-asked question follows its original ask. A sensitive answer appears only as its
+answers arrived in, so a re-asked question follows its original ask, and a
+question asked again after a resume follows the earlier process's. A
+sensitive answer appears only as its
 `{"$secret": "answer:<id>"}` reference. A non-empty `errors` list is exit
 code 4, whatever the engine status; the persisted run is not rewritten.
 
-**Model default.** `petri run --provider <id>` and `--model <name>` supply the
-model for a prompt or agent node that names none, in a graph with no
-`default_model`, in a run whose `workflow.toml` (and the project and settings
-layers) names none. `--provider` alone runs the provider's default model from
-the runner's catalog (`openai` is `gpt-5.6-sol`), as `fabro run --provider`
-does; the pinned interview bundle relies on this. The launch lands in the
-persisted root graph's `fabro.launch` parameter (`model`, `provider`, as
-given), so `petri inspect` and a replay see it; `petri replay` takes the same
-options so the graph lowers the same. `petri resume` needs nothing: the
-stored graph already carries the default.
+**Model selection.** `petri run --model <name>` and `--provider <id>` choose
+the model for every prompt or agent node that names none of its own, over the
+graph's `default_model`/`default_provider` and `[run.model]` in `workflow.toml`
+(and the project and settings layers), as `fabro run --model` and `--provider`
+do. Each applies on its own. A node that names its own model, by attribute or
+stylesheet rule, keeps it, and keeps its provider to the node and the defaults.
+`--provider` alone, where nothing names a model, runs the provider's default
+model from the runner's catalog (`openai` is `gpt-5.6-sol`); the pinned
+interview bundle relies on this. A host can also bind its own last-resort
+default (`petri.default_model`, `petri.default_provider`), below every file
+layer. The launch lands in the persisted root graph's `fabro.launch` parameter
+(`model`, `provider`, `default_model`, `default_provider`, as given), so
+`petri inspect` and a replay see it; `petri replay` takes the same options so
+the graph lowers the same. `petri resume` needs nothing: the stored graph
+already carries the choice.
 
 **Environment selection.** `petri run --environment <id>` selects the
 `[environments.<id>]` table the run executes in over what any settings layer's

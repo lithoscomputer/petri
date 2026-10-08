@@ -296,6 +296,36 @@ fn exhausted_retries_can_accept_a_partial_success() {
     assert_eq!(underlying.class, "exit_status:7");
 }
 
+/// §3.1 rule 3 holds for a timeout too: an exhausted timeout accepted as a
+/// partial success keeps the timeout, though it has no failure info. Before
+/// log v12 the record said `partial_success` with nothing underneath.
+#[test]
+fn an_exhausted_timeout_accepted_as_partial_keeps_the_timeout() {
+    let mut b = GraphBuilder::new();
+    let scope = ir::ScopeId::new(0);
+    let node = b.add_step("step", scope, NOOP);
+    let after = b.add_step("after", scope, NOOP);
+    b.link(node, after);
+    b.node_mut(node).retry = RetryPolicy::attempts(2).accepting_partial();
+    let graph = b.build();
+
+    let mut h = Harness::new(graph).respond_with(|info| {
+        if info.base == "step" {
+            Outcome::new(ir::Status::TimedOut, Value::Null)
+        } else {
+            Outcome::success(Value::Null)
+        }
+    });
+    assert_eq!(h.run(), RunStatus::Success);
+    assert_eq!(h.start_count("step"), 2, "the timeout was retried once");
+
+    let record = h.state.history().iter().find(|r| r.name == "step").unwrap();
+    assert_eq!(record.outcome.status, ir::Status::PartialSuccess {
+        underlying: Some(ir::UnderlyingFailure::TimedOut),
+    });
+    h.verify_replay();
+}
+
 /// A cancelled firing is never retried: cancelling means stop, not start again.
 #[test]
 fn a_cancelled_firing_is_not_retried() {

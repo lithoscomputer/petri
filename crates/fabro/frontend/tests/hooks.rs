@@ -9,7 +9,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
-use std::{env, fs};
+use std::{env, fs, process};
 
 use attractor_steps::acp::ENVELOPE_KIND;
 use attractor_steps::agent::THREAD_EVENT;
@@ -1411,7 +1411,9 @@ fn hook_activity_of(event: &RunEvent) -> Option<&HookActivity> {
 /// plugin's sentinel wrapper, which carries the same command in its own
 /// argument list and lives until the scope is released, does not match. The
 /// first character of the id goes into a bracket class so the command line
-/// carrying the pattern itself does not match either.
+/// carrying the pattern itself does not match either. The id starts with the
+/// process id: nextest runs each test in its own process, where the counter
+/// starts again, and another test's tool must not match.
 fn tool_process_pattern(marker: &str) -> String {
     let (prefix, rest) = marker.split_at("hooks-leak-".len());
     let mut chars = rest.chars();
@@ -1452,7 +1454,7 @@ fn ticking_tool(marker: &str) -> Value {
 #[tokio::test]
 async fn an_agent_hook_timeout_stops_its_tool_before_failing_open() {
     let dir = RunDir::new("hooks-agent-timeout");
-    let marker = format!("hooks-leak-{}", testkit::unique_id());
+    let marker = format!("hooks-leak-{}-{}", process::id(), testkit::unique_id());
     let (client, _provider) = scripted(
         vec![
             ScriptedCall::response(tool_call_response("shell", "slow", ticking_tool(&marker))),
@@ -1548,7 +1550,7 @@ timeout = "1500ms"
 #[tokio::test]
 async fn a_cancelled_run_stops_an_agent_hooks_running_tool() {
     let dir = RunDir::new("hooks-agent-cancel");
-    let marker = format!("hooks-leak-{}", testkit::unique_id());
+    let marker = format!("hooks-leak-{}-{}", process::id(), testkit::unique_id());
     let (client, _provider) = scripted(
         vec![
             ScriptedCall::response(tool_call_response("shell", "slow", ticking_tool(&marker))),

@@ -21,6 +21,7 @@ pub mod lines;
 mod progress;
 mod scope;
 mod secrets;
+mod spawn_env;
 
 pub use container::{CONTAINER_RUNTIME_CLASS, ContainerImage, ContainerRunner, OneShotContainer};
 pub use env::{
@@ -34,3 +35,4 @@ pub use scope::{
     ScopeOutcome, ScopeSpec, ServiceSpec, Teardown, WorkspaceId,
 };
 pub use secrets::{MapSecrets, Masker, SECRET_REF_KEY, Secret, SecretError, SecretProvider};
+pub use spawn_env::{SpawnEnv, SpawnTarget, layer_exec};

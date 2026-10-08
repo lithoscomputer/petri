@@ -2,8 +2,8 @@
 //! including a provider create that completes after its caller is gone.
 
 use std::collections::BTreeMap;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use async_trait::async_trait;
@@ -11,9 +11,9 @@ use executor::{
     AcquireContext, EnvError, EnvHandle, Executor, Retention, SandboxLeaseId, ScopeSpec,
 };
 use sandbox_driver::{
-    Capabilities, Capability, Error, EventContext, Exec, Filesystem, Isolation, PlatformInfo,
-    ProviderKind, Sandbox, SandboxFilter, SandboxId, SandboxProvider, SandboxSpec, SandboxState,
-    SandboxStatus,
+    Capabilities, Capability, Error, EventContext, Exec, Filesystem, Isolation, NetworkPolicy,
+    PlatformInfo, ProviderKind, Sandbox, SandboxFilter, SandboxId, SandboxProvider, SandboxSpec,
+    SandboxState, SandboxStatus,
 };
 use testkit::RunDir;
 use tokio::sync::Notify;
@@ -34,6 +34,7 @@ struct FakeSandbox {
     id:                  SandboxId,
     capabilities:        Capabilities,
     environment:         EnvironmentBehavior,
+    network:             Mutex<Option<NetworkPolicy>>,
     environment_started: Notify,
     allow_environment:   Notify,
     created:             AtomicUsize,
@@ -57,7 +58,9 @@ impl Sandbox for FakeSandbox {
         } else {
             SandboxState::Deleted
         };
-        Ok(SandboxStatus::new(self.id.clone(), state))
+        let mut status = SandboxStatus::new(self.id.clone(), state);
+        status.network = self.network.lock().unwrap().clone();
+        Ok(status)
     }
 
     fn working_directory(&self) -> &str {
@@ -105,6 +108,7 @@ impl Sandbox for FakeSandbox {
 
 struct FakeProvider {
     kind:              ProviderKind,
+    requests:          Mutex<Vec<SandboxSpec>>,
     sandbox:           Arc<FakeSandbox>,
     create_started:    Notify,
     allow_create:      Notify,
@@ -123,9 +127,10 @@ impl SandboxProvider for FakeProvider {
 
     async fn create(
         &self,
-        _spec: &SandboxSpec,
+        spec: &SandboxSpec,
         _events: Option<EventContext>,
     ) -> sandbox_driver::Result<Arc<dyn Sandbox>> {
+        self.requests.lock().unwrap().push(spec.clone());
         self.create_started.notify_one();
         self.allow_create.notified().await;
         self.sandbox.created.fetch_add(1, Ordering::SeqCst);
@@ -168,12 +173,14 @@ impl Fixture {
     fn new(environment: EnvironmentBehavior) -> Self {
         let dir = RunDir::new("sandbox-acquire-cancel");
         let provider = Arc::new(FakeProvider {
+            requests:          Mutex::new(Vec::new()),
             kind:              ProviderKind::try_new("fake")
                 .expect("the test provider kind is valid"),
             sandbox:           Arc::new(FakeSandbox {
                 id: SandboxId::try_new("sandbox-1").expect("the test sandbox id is valid"),
                 capabilities: Capabilities::minimal(Isolation::Container),
                 environment,
+                network: Mutex::new(None),
                 environment_started: Notify::new(),
                 allow_environment: Notify::new(),
                 created: AtomicUsize::new(0),
@@ -298,5 +305,74 @@ async fn a_lost_create_reply_deletes_the_standalone_sandbox() {
     fixture.provider.allow_create.notify_one();
     let result = fixture.acquire().await.expect("acquisition task");
     assert!(result.is_err());
+    fixture.assert_deleted().await;
+}
+
+#[tokio::test]
+async fn network_policy_reaches_creation_and_block_requires_provider_confirmation() {
+    for (requested, reported, reaches_environment) in [
+        (NetworkPolicy::ProviderDefault, None, true),
+        (NetworkPolicy::AllowAll, Some(NetworkPolicy::AllowAll), true),
+        (NetworkPolicy::Block, Some(NetworkPolicy::Block), true),
+        (NetworkPolicy::Block, Some(NetworkPolicy::AllowAll), false),
+        (NetworkPolicy::Block, None, false),
+    ] {
+        let mut fixture = Fixture::new(EnvironmentBehavior::Fail);
+        Arc::get_mut(&mut fixture.executor).unwrap().options.network = requested.clone();
+        *fixture.provider.sandbox.network.lock().unwrap() = reported;
+        fixture.provider.allow_create.notify_one();
+        let error = fixture
+            .acquire()
+            .await
+            .unwrap()
+            .expect_err("acquisition stops at the scripted boundary");
+        assert_eq!(
+            fixture.provider.requests.lock().unwrap()[0].network,
+            requested
+        );
+        let message = error.to_string();
+        assert!(
+            message.contains(if reaches_environment {
+                "environment could not be read"
+            } else {
+                "does not report blocked networking"
+            }),
+            "{message}"
+        );
+        fixture.assert_deleted().await;
+    }
+}
+
+#[tokio::test]
+async fn a_reused_sandbox_cannot_bypass_the_block_policy() {
+    let mut fixture = Fixture::new(EnvironmentBehavior::Wait);
+    Arc::get_mut(&mut fixture.executor).unwrap().options.network = NetworkPolicy::Block;
+    *fixture.provider.sandbox.network.lock().unwrap() = Some(NetworkPolicy::Block);
+    fixture.provider.allow_create.notify_one();
+    fixture.provider.sandbox.allow_environment.notify_one();
+    let scope = ScopeSpec::new(ir::ScopeId::new(0), "scope-0")
+        .with_runtime(ir::RuntimeSpec::container("test-image"));
+    let ctx = AcquireContext::bare().with_lease(LEASE);
+    let handle = fixture.executor.acquire(&scope, &ctx).await.unwrap();
+    fixture
+        .executor
+        .release(handle, executor::ScopeOutcome::Succeeded)
+        .await;
+
+    // Reacquisition returns the cached sandbox without calling create or
+    // rebuilding its spec. It must still confirm that networking is blocked.
+    *fixture.provider.sandbox.network.lock().unwrap() = Some(NetworkPolicy::AllowAll);
+    let error = fixture.executor.acquire(&scope, &ctx).await.unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("does not report blocked networking")
+    );
+    assert_eq!(fixture.provider.requests.lock().unwrap().len(), 1);
+    fixture
+        .executor
+        .manager()
+        .release_lease(LEASE, Retention::Never, executor::ScopeOutcome::Failed)
+        .await;
     fixture.assert_deleted().await;
 }

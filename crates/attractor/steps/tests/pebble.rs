@@ -22,7 +22,7 @@ use runtime::driver::{
 };
 use runtime::engine::{EngineState, Event, EventRecord, ReplayMismatch};
 use runtime::executor::sandbox::HostExecutor;
-use runtime::executor::{AcquireContext, Executor, Retention, ScopeOutcome, ScopeSpec};
+use runtime::executor::{AcquireContext, Executor, MapSecrets, Retention, ScopeOutcome, ScopeSpec};
 use runtime::frontend::{CompileInputs, NoFiles};
 use runtime::steps::{Answer, Question};
 use runtime::{RunOptions, Runtime};
@@ -145,6 +145,68 @@ async fn native_tools_edit_and_verify_in_the_scope() {
     assert!(requests.contains("verified"), "{requests}");
     assert_eq!(metrics(&report)["pebble.usage"]["tokens"]["input"], 30);
     assert_eq!(metrics(&report)["pebble.usage"]["tokens"]["output"], 15);
+}
+
+/// The node's step config, as the lowering wrote it.
+fn node_config<'a>(graph: &'a mut Graph, name: &str) -> &'a mut Value {
+    &mut graph
+        .body
+        .nodes
+        .iter_mut()
+        .find(|n| n.name == name)
+        .unwrap_or_else(|| panic!("node `{name}`"))
+        .step
+        .config
+}
+
+#[tokio::test]
+async fn tool_shells_see_workflow_secrets_beneath_their_own_env() {
+    let dir = RunDir::new("pebble-workflow-secrets");
+    let (client, provider) = scripted_client(vec![
+        ScriptedCall::response(tool_call_response(
+            "shell",
+            "check",
+            json!({"command":"test \"$AGENT_KEY\" = workflow-secret-value && echo $((6 * 7))-seen"}),
+        )),
+        ScriptedCall::response(text_response("Checked.")),
+    ]);
+    let mut graph = graph("");
+    node_config(&mut graph, "a")["env"] = json!({"AGENT_KEY": {"$secret": "WORKFLOW_KEY"}});
+    let secrets = MapSecrets::from_pairs(&[("WORKFLOW_KEY", "workflow-secret-value")]);
+    let report = runtime(&dir, client)
+        .secrets(secrets)
+        .run(graph)
+        .await
+        .expect("replay");
+    assert_eq!(
+        report.status,
+        RunStatus::Success,
+        "{:?}",
+        report.state.errors()
+    );
+    let requests = serde_json::to_string(&provider.requests()).expect("requests");
+    assert!(requests.contains("42-seen"), "{requests}");
+}
+
+#[tokio::test]
+async fn a_workflow_secret_the_run_cannot_supply_fails_the_native_node() {
+    let dir = RunDir::new("pebble-missing-secret");
+    let (client, _provider) =
+        scripted_client(vec![ScriptedCall::response(text_response("Never asked."))]);
+    let mut graph = graph("");
+    node_config(&mut graph, "a")["env"] = json!({"AGENT_KEY": {"$secret": "NOT_THERE"}});
+    let report = runtime(&dir, client).run(graph).await.expect("replay");
+    // The node fails before the session opens; this graph routes the failure
+    // on, so the node's outcome is what says so.
+    let output = output_of(&report, "a");
+    assert_eq!(output["outcome"], json!("failed"));
+    assert_eq!(output["failure_class"], json!("secret_unavailable"));
+    assert!(
+        output["failure_reason"]
+            .as_str()
+            .is_some_and(|reason| reason.contains("NOT_THERE")),
+        "{output}"
+    );
 }
 
 #[tokio::test]

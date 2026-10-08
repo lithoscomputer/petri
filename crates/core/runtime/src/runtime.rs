@@ -12,8 +12,9 @@ use std::time::Duration;
 use std::{env, fs, io, mem, process};
 
 use driver::{
-    Driver, EventObserver, ExecutionHooks, ExecutionReport, HookContext, ResumeError, ResumeInfo,
-    RunConfig, RunGuard, SandboxAssignment,
+    DecisionRolls, Driver, EventObserver, ExecutionHooks, ExecutionReport, HookContext,
+    RecordingClock, ResumeError, ResumeInfo, RunConfig, RunGuard, SandboxAssignment,
+    SeededDecisionResolver, StepLogStore,
 };
 use engine::{EngineStart, EventLog, ReplayMismatch};
 use executor::{
@@ -145,27 +146,70 @@ pub trait AdmissionPass: Send + Sync {
     fn admit(&self, graph: &mut Graph, caps: &::steps::Capabilities) -> Vec<AdmissionProblem>;
 }
 
+type ExecutorLayer = Arc<dyn Fn(Arc<dyn Executor>) -> Arc<dyn Executor> + Send + Sync>;
+
 /// The assembled system: frontends, step kinds, executors, secrets, options.
 pub struct Runtime {
-    frontends:    Vec<Box<dyn Frontend>>,
-    steps:        ::steps::Registry,
-    executor:     Option<Arc<dyn Executor>>,
+    frontends:       Vec<Box<dyn Frontend>>,
+    steps:           ::steps::Registry,
+    executor:        Option<Arc<dyn Executor>>,
+    executor_layers: Vec<ExecutorLayer>,
     /// The store runs live in; `None` is the run directory under
     /// `RunOptions::run_dir`.
-    store:        Option<Arc<dyn RunStore>>,
-    secrets:      Arc<dyn SecretProvider>,
-    observers:    Vec<Arc<dyn EventObserver>>,
-    progress:     Option<Arc<dyn ProgressSink>>,
-    hooks:        Option<Arc<dyn ExecutionHooks>>,
-    caps:         ::steps::CapabilitiesBuilder,
-    provisioners: Vec<RunProvisioner>,
-    admissions:   Vec<Arc<dyn AdmissionPass>>,
-    options:      RunOptions,
+    store:           Option<Arc<dyn RunStore>>,
+    secrets:         Arc<dyn SecretProvider>,
+    observers:       Vec<Arc<dyn EventObserver>>,
+    progress:        Option<Arc<dyn ProgressSink>>,
+    hooks:           Option<Arc<dyn ExecutionHooks>>,
+    caps:            ::steps::CapabilitiesBuilder,
+    provisioners:    Vec<RunProvisioner>,
+    admissions:      Vec<Arc<dyn AdmissionPass>>,
+    options:         RunOptions,
     /// The standard router acquires every scope on the simulated provider:
     /// a dry run.
-    simulated:    bool,
+    simulated:       bool,
     /// Built-in providers the standard router reaches instead of plugins.
-    in_process:   Option<InProcessProviders>,
+    in_process:      Option<InProcessProviders>,
+    sources:         Sources,
+}
+
+/// Makes a store for the step output of the execution whose directory it is
+/// given.
+type StepLogs = Arc<dyn Fn(&Path) -> Arc<dyn StepLogStore> + Send + Sync>;
+
+/// Where a run's recording stamps, step output and weighted routing draws
+/// come from. The defaults are the wall clock, each execution directory's
+/// `logs/` and the operating system. A simulation passes a virtual clock,
+/// in-memory logs and a seed, so a run is a function of its inputs.
+#[derive(Clone, Default)]
+struct Sources {
+    clock:     Option<RecordingClock>,
+    step_logs: Option<StepLogs>,
+    seed:      Option<u64>,
+}
+
+impl Sources {
+    /// A driver's configuration with this run's clock and step logs.
+    fn configure(&self, mut config: RunConfig) -> RunConfig {
+        if let Some(clock) = &self.clock {
+            config = config.with_recording_clock(clock.clone());
+        }
+        if let Some(step_logs) = &self.step_logs {
+            let logs = step_logs(&config.run_dir);
+            config = config.with_step_logs(logs);
+        }
+        config
+    }
+
+    /// A standalone driver with this run's seeded draws, when it has a seed.
+    fn equip(&self, driver: Driver) -> Driver {
+        match self.seed {
+            Some(seed) => {
+                driver.with_decision_resolver(Arc::new(SeededDecisionResolver::new(seed)))
+            }
+            None => driver,
+        }
+    }
 }
 
 impl Runtime {
@@ -189,22 +233,24 @@ impl Runtime {
     )]
     pub fn standard() -> Self {
         Self {
-            frontends:    vec![Box::new(frontend_native::Native)],
-            steps:        crate::steps::standard(),
-            executor:     None,
-            store:        None,
-            secrets:      Arc::new(MapSecrets::empty()),
-            observers:    Vec::new(),
-            progress:     None,
-            hooks:        None,
-            caps:         ::steps::Capabilities::builder(),
-            provisioners: Vec::new(),
-            admissions:   Vec::new(),
-            options:      RunOptions::new(
+            frontends:       vec![Box::new(frontend_native::Native)],
+            steps:           crate::steps::standard(),
+            executor:        None,
+            executor_layers: Vec::new(),
+            store:           None,
+            secrets:         Arc::new(MapSecrets::empty()),
+            observers:       Vec::new(),
+            progress:        None,
+            hooks:           None,
+            caps:            ::steps::Capabilities::builder(),
+            provisioners:    Vec::new(),
+            admissions:      Vec::new(),
+            options:         RunOptions::new(
                 env::temp_dir().join(format!("petri-run-{}", process::id())),
             ),
-            simulated:    false,
-            in_process:   None,
+            simulated:       false,
+            in_process:      None,
+            sources:         Sources::default(),
         }
     }
 
@@ -212,23 +258,52 @@ impl Runtime {
     /// itself.
     pub fn bare() -> Self {
         Self {
-            frontends:    Vec::new(),
-            steps:        ::steps::Registry::new(),
-            executor:     None,
-            store:        None,
-            secrets:      Arc::new(MapSecrets::empty()),
-            observers:    Vec::new(),
-            progress:     None,
-            hooks:        None,
-            caps:         ::steps::Capabilities::builder(),
-            provisioners: Vec::new(),
-            admissions:   Vec::new(),
-            options:      RunOptions::new(
+            frontends:       Vec::new(),
+            steps:           ::steps::Registry::new(),
+            executor:        None,
+            executor_layers: Vec::new(),
+            store:           None,
+            secrets:         Arc::new(MapSecrets::empty()),
+            observers:       Vec::new(),
+            progress:        None,
+            hooks:           None,
+            caps:            ::steps::Capabilities::builder(),
+            provisioners:    Vec::new(),
+            admissions:      Vec::new(),
+            options:         RunOptions::new(
                 env::temp_dir().join(format!("petri-run-{}", process::id())),
             ),
-            simulated:    false,
-            in_process:   None,
+            simulated:       false,
+            in_process:      None,
+            sources:         Sources::default(),
         }
+    }
+
+    /// Stamp every record a run appends, its drivers' and its coordinator's,
+    /// with `clock` instead of the wall clock.
+    #[must_use]
+    pub fn recording_clock(mut self, clock: RecordingClock) -> Self {
+        self.sources.clock = Some(clock);
+        self
+    }
+
+    /// Keep each driver's step output in the store `logs` makes for its
+    /// execution directory, instead of that directory's `logs/`.
+    #[must_use]
+    pub fn step_logs(
+        mut self,
+        logs: impl Fn(&Path) -> Arc<dyn StepLogStore> + Send + Sync + 'static,
+    ) -> Self {
+        self.sources.step_logs = Some(Arc::new(logs));
+        self
+    }
+
+    /// Roll every weighted routing draw from `seed` instead of the operating
+    /// system. The draws are recorded either way.
+    #[must_use]
+    pub fn decision_seed(mut self, seed: u64) -> Self {
+        self.sources.seed = Some(seed);
+        self
     }
 
     /// Register a frontend. It goes to the front of the list, so a specific
@@ -258,6 +333,21 @@ impl Runtime {
     #[must_use]
     pub fn executor(mut self, executor: impl Executor + 'static) -> Self {
         self.executor = Some(Arc::new(executor));
+        self
+    }
+
+    /// Wrap the run's executor while retaining the standard router's lease
+    /// ledger, reconciliation and pruning. Layers are applied in registration
+    /// order; the last registered layer is outermost. Each layer must forward
+    /// acquisition and release to the executor it receives. A layer that adds
+    /// to every process's environment, such as credentials, applies
+    /// [`executor::EnvHandle::with_spawn_env`] to the handle it acquired.
+    #[must_use]
+    pub fn executor_layer(
+        mut self,
+        layer: impl Fn(Arc<dyn Executor>) -> Arc<dyn Executor> + Send + Sync + 'static,
+    ) -> Self {
+        self.executor_layers.push(Arc::new(layer));
         self
     }
 
@@ -396,6 +486,13 @@ impl Runtime {
     /// delegates every other point to these).
     pub fn installed_hooks(&self) -> Option<Arc<dyn ExecutionHooks>> {
         self.hooks.clone()
+    }
+
+    /// Whether the installed host declares required completion work.
+    pub fn requires_run_finalization(&self) -> bool {
+        self.hooks
+            .as_ref()
+            .is_some_and(|hooks| hooks.requires_run_finalization())
     }
 
     /// The step registry, for lookups (`type_known`-style lints, validation).
@@ -679,7 +776,7 @@ impl Runtime {
             self.secrets.clone(),
             self.run_config(),
         );
-        run.equip_standalone(driver)
+        run.equip_standalone(self.sources.equip(driver))
     }
 
     /// Prepare resources that are shared by every execution in one root run.
@@ -733,12 +830,17 @@ impl Runtime {
         // The standard router is kept by its own type too: the coordinator
         // hands it the lease ledger and releases leases through it. A
         // caller-supplied executor manages its own sandboxes.
-        if let Some(executor) = self.executor.clone() {
-            (executor, None)
-        } else {
-            let router = self.default_router_for(run_dir, key);
-            (router.clone(), Some(router))
+        let (mut executor, router): (Arc<dyn Executor>, _) =
+            if let Some(executor) = self.executor.clone() {
+                (executor, None)
+            } else {
+                let router = self.default_router_for(run_dir, key);
+                (router.clone(), Some(router))
+            };
+        for layer in &self.executor_layers {
+            executor = layer(executor);
         }
+        (executor, router)
     }
 
     fn provision_run(
@@ -764,6 +866,7 @@ impl Runtime {
             hooks: self.hooks.clone(),
             caps,
             guards,
+            sources: self.sources.clone(),
         }
     }
 
@@ -800,12 +903,14 @@ impl Runtime {
             self.run_config(),
         )?;
         let run = self.provision_run(self.options.run_dir.clone(), key, executor, router);
-        Ok((run.equip_standalone(driver), info))
+        Ok((run.equip_standalone(self.sources.equip(driver)), info))
     }
 
     fn run_config(&self) -> RunConfig {
-        base_run_config(&self.options, self.options.run_dir.clone())
-            .with_retention(self.options.retention)
+        self.sources.configure(
+            base_run_config(&self.options, self.options.run_dir.clone())
+                .with_retention(self.options.retention),
+        )
     }
 
     /// Run a graph to completion. With `verify_replay` on (the default), the
@@ -901,9 +1006,17 @@ pub struct RunRuntime {
     hooks:     Option<Arc<dyn ExecutionHooks>>,
     caps:      ::steps::Capabilities,
     guards:    Vec<RunServiceGuard>,
+    sources:   Sources,
 }
 
 impl RunRuntime {
+    /// Whether the installed host declares required completion work.
+    pub fn requires_run_finalization(&self) -> bool {
+        self.hooks
+            .as_ref()
+            .is_some_and(|hooks| hooks.requires_run_finalization())
+    }
+
     /// A standalone driver's completion owns this run's service teardown.
     /// It is the run's one execution: the root invocation's first.
     fn equip_standalone(self, driver: Driver) -> Driver {
@@ -1063,6 +1176,22 @@ impl RunRuntime {
         self.secrets.clone()
     }
 
+    /// The clock the run's records are stamped with.
+    pub fn recording_clock(&self) -> RecordingClock {
+        self.sources.clock.clone().unwrap_or_default()
+    }
+
+    /// Where an execution's weighted routing draws come from: the operating
+    /// system, or the run's seed mixed with the execution's id, so no two
+    /// executions draw the same sequence.
+    pub fn decision_rolls(&self, execution: ExecutionId) -> DecisionRolls {
+        self.sources
+            .seed
+            .map_or_else(DecisionRolls::default, |seed| {
+                DecisionRolls::seeded(seed ^ execution.raw().wrapping_mul(0xD1B5_4A32_D192_ED03))
+            })
+    }
+
     pub fn masker(&self) -> Masker {
         self.secrets.masker()
     }
@@ -1086,13 +1215,15 @@ impl RunRuntime {
         // An execution ends before its invocation can restart. Workspace
         // retention therefore belongs to the lease's release, not to an
         // individual driver release.
-        base_run_config(&self.options, execution_dir)
-            .with_retention(Retention::Always)
-            .with_scope_identities(
-                context.execution.environment_prefix(),
-                context.invocation.workspace_prefix(),
-            )
-            .with_sandbox_assignment(sandbox)
+        self.sources.configure(
+            base_run_config(&self.options, execution_dir)
+                .with_retention(Retention::Always)
+                .with_scope_identities(
+                    context.execution.environment_prefix(),
+                    context.invocation.workspace_prefix(),
+                )
+                .with_sandbox_assignment(sandbox),
+        )
     }
 }
 

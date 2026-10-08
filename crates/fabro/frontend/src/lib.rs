@@ -54,11 +54,12 @@ pub fn load(file: &str, text: &str, files: &dyn FileSource, inputs: &CompileInpu
     let mut template = Context::new(inputs);
     let mut settings = workflow_toml::read(file, files, inputs, &mut template, &mut diags);
     model_layers::apply(files, inputs, &mut settings.run.model, &mut diags);
-    // The launch itself, below every file layer: a node that names no model,
-    // in a graph with no default, in a run whose configuration names none,
-    // runs on what `petri run --model`/`--provider` gave.
+    // The launch itself: what `petri run --model`/`--provider` asked for
+    // overrides the files and the graph's defaults, and the host's default
+    // fills what nothing else set.
     settings.launch = LaunchModel::from_inputs(inputs);
-    settings.launch.fill(&mut settings.run.model);
+    settings.launch.fill_defaults(&mut settings.run.model);
+    settings.run.model_override = settings.launch.model_override();
     settings.run.hooks = hooks::load(files, inputs, settings.hooks_text.as_ref(), &mut diags);
     settings.run.mcps = mcps::load(
         files,

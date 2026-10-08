@@ -12,8 +12,9 @@ use std::time::Duration;
 use execution::events::{replay_run, verify_export};
 use execution::inspect::inspect_run;
 use execution::{
-    Access, ExecutionId, InvocationId, LeaseState, MemoryRunStore, ResourceStore, RunKey,
-    RunStore as _, SandboxAllocationKey, host, read_execution_log,
+    Access, Coordinator, CoordinatorError, CoordinatorEvent, CoordinatorOptions, ExecutionId,
+    InvocationId, LeaseState, MemoryRunStore, OwnerId, ResourceStore, RunKey, RunStore as _,
+    SandboxAllocationKey, host, read_coordinator_log, read_execution_log,
 };
 use executor::WorkspaceId;
 use ir::{GraphBuilder, Outcome, RunStatus, ScopeId, StepEvent};
@@ -325,4 +326,108 @@ async fn the_memory_store_passes_the_store_conformance() {
     let store = MemoryRunStore::new();
     stale_owner_conformance(&store, |key| store.release(key)).await;
     let _ = store.open(&RunKey::new("noop"), Access::Read).await;
+}
+
+/// A run whose creation a crash cut short: `run.started` and its graph are
+/// stored, and no invocation. A resume refuses it as never started;
+/// starting it again under the same key finishes the creation and runs it,
+/// once. A run that started is not started again.
+#[tokio::test]
+async fn a_run_cut_short_at_its_creation_is_started_again_under_its_key() {
+    let key = RunKey::new("cut-short");
+    let dir = RunDir::new("store-cut-short");
+    let memory = Arc::new(MemoryRunStore::new());
+    let mut options = RunOptions::new(dir.path());
+    options.run_key = Some(key.clone());
+    let rt = Runtime::standard().store(memory.clone()).options(options);
+    let mut coordinator = Coordinator::create(
+        rt.prepare_run(dir.path()),
+        Vec::new(),
+        CoordinatorOptions::default(),
+    )
+    .await
+    .expect("creates");
+    coordinator
+        .register_graph(&two_steps())
+        .await
+        .expect("registers");
+    drop(coordinator);
+
+    let resumed = host::resume(&rt).await;
+    assert!(
+        matches!(resumed, Err(host::HostError::NotStarted)),
+        "nothing to resume: {:?}",
+        resumed.map(|report| report.status)
+    );
+    let report = host::run(&rt, two_steps())
+        .await
+        .expect("starts again under its key");
+    assert_eq!(report.status, RunStatus::Success);
+
+    let logs = memory.open(&key, Access::Read).await.expect("reads");
+    let records = read_coordinator_log(&*logs).await.expect("decodes");
+    let count = |matches: fn(&CoordinatorEvent) -> bool| {
+        records
+            .iter()
+            .filter(|record| matches(&record.body))
+            .count()
+    };
+    assert_eq!(
+        count(|event| matches!(event, CoordinatorEvent::RunStarted { .. })),
+        1
+    );
+    assert_eq!(
+        count(
+            |event| matches!(event, CoordinatorEvent::InvocationDeclared { invocation, .. } if *invocation == InvocationId::ROOT)
+        ),
+        1
+    );
+    assert_eq!(
+        count(|event| matches!(event, CoordinatorEvent::RunFinished { .. })),
+        1
+    );
+
+    let again = host::run(&rt, two_steps()).await;
+    assert!(
+        matches!(
+            again,
+            Err(host::HostError::Coordinator(CoordinatorError::Open(
+                store::StoreError::Exists { .. }
+            )))
+        ),
+        "a run that started is not started again: {:?}",
+        again.map(|report| report.status)
+    );
+}
+
+/// A crash before `run.started` itself: the key is stored with an empty
+/// log. A resume refuses it as never started, and a start under the key
+/// takes it over.
+#[tokio::test]
+async fn a_run_cut_short_before_its_start_record_is_started_again() {
+    let key = RunKey::new("cut-before-start");
+    let dir = RunDir::new("store-cut-before-start");
+    let memory = Arc::new(MemoryRunStore::new());
+    drop(
+        memory
+            .open(&key, Access::Create {
+                owner: OwnerId::new("crashed"),
+            })
+            .await
+            .expect("creates the key"),
+    );
+    let mut options = RunOptions::new(dir.path());
+    options.run_key = Some(key.clone());
+    let rt = Runtime::standard().store(memory.clone()).options(options);
+
+    let resumed = host::resume(&rt).await;
+    assert!(
+        matches!(resumed, Err(host::HostError::NotStarted)),
+        "nothing to resume: {:?}",
+        resumed.map(|report| report.status)
+    );
+    let report = host::run(&rt, two_steps())
+        .await
+        .expect("starts under its key");
+    assert_eq!(report.status, RunStatus::Success);
 }
