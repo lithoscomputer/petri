@@ -32,6 +32,7 @@ mod outcome;
 pub mod parallel;
 pub mod pebble;
 pub mod prompt;
+pub mod route_usage;
 pub mod sessions;
 pub mod skills;
 pub mod stage;
