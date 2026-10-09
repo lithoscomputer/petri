@@ -145,6 +145,15 @@ async fn native_tools_edit_and_verify_in_the_scope() {
     assert!(requests.contains("verified"), "{requests}");
     assert_eq!(metrics(&report)["pebble.usage"]["tokens"]["input"], 30);
     assert_eq!(metrics(&report)["pebble.usage"]["tokens"]["output"], 15);
+    // One route, so one entry: all of the session's usage, on its route.
+    assert_eq!(
+        metrics(&report)["pebble.usage_by_model"],
+        json!([{
+            "provider": "test",
+            "model": "model",
+            "usage": metrics(&report)["pebble.usage"],
+        }])
+    );
 }
 
 /// The node's step config, as the lowering wrote it.

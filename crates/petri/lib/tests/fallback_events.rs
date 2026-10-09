@@ -6,8 +6,10 @@
 //! `agent_activity` stream: `SessionStarted` names each route, `RouteFailover`
 //! the move with the failed route's usage and the typed error,
 //! `RouteFailoverStopped` the stop and its reason, `AssistantMessage` each
-//! answer's usage. The stage is a real native agent on a scripted model
-//! client; the chain comes from `workflow.toml`.
+//! answer's usage. The finished step's metrics carry the stage's usage and
+//! its breakdown by route (`pebble.usage_by_model`). The stage is a real
+//! native agent on a scripted model client; the chain comes from
+//! `workflow.toml`.
 
 use std::collections::BTreeMap;
 use std::fs;
@@ -16,7 +18,7 @@ use std::time::Duration;
 
 use lithos_llm::types::ErrorKind;
 use pebble_coding_agent::test_support::{
-    ScriptedCall, ScriptedFailure, scripted_client, text_response,
+    ScriptedCall, ScriptedFailure, scripted_client, text_response, tool_call_response,
 };
 use petri::attractor::fallback::PLAN_EVENT;
 use petri::attractor::pebble::PebbleClient;
@@ -30,6 +32,7 @@ use petri::frontend::CompileInputs;
 use petri::frontend::fabro::Fabro;
 use petri::ir::{RunStatus, Value};
 use petri::{RunOptions, Runtime};
+use serde_json::json;
 use testkit::{RunDir, backend_event};
 
 const WORKFLOW: &str = r#"digraph Fallback {
@@ -60,6 +63,9 @@ struct Reconstructed {
     /// Answer usage summed per route, from `AssistantMessage`.
     usage:        BTreeMap<String, (u64, u64)>,
     attempt:      Option<String>,
+    /// The finished step's `pebble.usage` and `pebble.usage_by_model`.
+    stage_usage:  Value,
+    by_model:     Value,
     run_status:   Option<RunStatus>,
     node_attempt: Option<u64>,
 }
@@ -100,6 +106,15 @@ fn reconstruct(events: &[RunEvent]) -> Reconstructed {
         }
         if let Some(Event::StepFinished { outcome, .. }) = event.engine() {
             out.attempt = Some(outcome.status.tag().to_owned());
+            // The agent's step; `start` and `exit` finish with no usage.
+            let metrics = &outcome.metrics.custom;
+            if let Some(usage) = metrics.get("pebble.usage") {
+                out.stage_usage = usage.clone();
+                out.by_model = metrics
+                    .get("pebble.usage_by_model")
+                    .cloned()
+                    .unwrap_or_default();
+            }
         }
         let Some(value) = event.custom() else {
             continue;
@@ -247,6 +262,71 @@ async fn a_failover_is_reconstructed_from_public_events() {
     assert_eq!(facts.attempt.as_deref(), Some("success"));
     assert_eq!(facts.run_status, Some(RunStatus::Success));
     assert_eq!(facts.node_attempt, Some(1));
+    assert_eq!(
+        facts.by_model,
+        json!([{"provider": "test", "model": "small", "usage": facts.stage_usage}]),
+        "{facts:?}"
+    );
+}
+
+/// The primary answers once and then fails mid-prompt: the stage's usage is
+/// split between the route that spent it first and the route the prompt
+/// continued on, and the split sums to the stage's usage.
+#[tokio::test]
+async fn a_failover_mid_prompt_splits_the_stage_usage_by_route() {
+    let dir = RunDir::new("fallback-events-usage-split");
+    let (facts, requested) = run(&dir, vec![
+        ScriptedCall::response(tool_call_response(
+            "shell",
+            "work",
+            json!({"command": "true"}),
+        )),
+        ScriptedCall::Failure(ScriptedFailure::retryable(
+            ErrorKind::Server,
+            "primary down",
+        )),
+        ScriptedCall::response(text_response("Hello from small.")),
+    ])
+    .await;
+    assert_eq!(
+        requested,
+        ["test/model", "test/model", "test/small"],
+        "{facts:?}"
+    );
+    assert_eq!(facts.attempt.as_deref(), Some("success"), "{facts:?}");
+    let entries = facts.by_model.as_array().expect("the breakdown");
+    assert_eq!(entries.len(), 2, "{facts:?}");
+    assert_eq!(
+        (&entries[0]["provider"], &entries[0]["model"]),
+        (&json!("test"), &json!("model"))
+    );
+    assert_eq!(
+        (&entries[1]["provider"], &entries[1]["model"]),
+        (&json!("test"), &json!("small"))
+    );
+    // Each entry is what the events counted on its route, and the failed
+    // route's is what its failover reported.
+    for (entry, route) in entries.iter().zip(["test/model", "test/small"]) {
+        let (input, output) = facts.usage[route];
+        assert!(input > 0, "{facts:?}");
+        assert_eq!(entry["usage"]["tokens"]["input"], input, "{route}");
+        assert_eq!(entry["usage"]["tokens"]["output"], output, "{route}");
+    }
+    assert_eq!(facts.failed_usage, [facts.usage["test/model"]]);
+    // A breakdown of the stage's usage, not an addition to it.
+    let sum = |bucket: &str| -> u64 {
+        entries
+            .iter()
+            .map(|entry| entry["usage"]["tokens"][bucket].as_u64().unwrap_or(0))
+            .sum()
+    };
+    for bucket in ["input", "output", "reasoning", "cache_read", "cache_write"] {
+        assert_eq!(
+            Some(sum(bucket)),
+            facts.stage_usage["tokens"][bucket].as_u64(),
+            "{bucket}: {facts:?}"
+        );
+    }
 }
 
 /// Every route fails: the stop decision and the terminal outcome are in the

@@ -85,7 +85,7 @@ use crate::fallback::{self, Disposition, Plan};
 use crate::hooks::tools::ToolHooks;
 use crate::hooks::{self};
 use crate::subagents::{self, Ledger};
-use crate::{host_tools, skills};
+use crate::{host_tools, route_usage, skills};
 
 /// Host capability supplied by applications embedding the native backend.
 /// Construct the client with the application's catalog, credentials, and
@@ -120,6 +120,8 @@ pub(crate) struct NativeSession {
     steering:        SteeringBus<SmolStr>,
     /// What the session's own compactions cost, folded by the sink.
     compaction:      Arc<compaction::Accounting>,
+    /// What the session spent on each route, folded by the sink.
+    route_usage:     Arc<route_usage::Accounting>,
     cancel:          CancellationToken,
     kill:            CancellationToken,
     _cancel_on_drop: DropGuard,
@@ -254,16 +256,18 @@ impl NativeSession {
         // Pebble discovers and reports, the sink attributes.
         let (skill_discovery, skill_labels) = skills::for_node(config, ctx);
         let compaction_accounting = Arc::new(compaction::Accounting::default());
+        let route_usage = Arc::new(route_usage::Accounting::default());
         let events = Arc::new(PetriEvents {
-            sender:     ctx.logs.clone(),
-            masker:     ctx.secrets.masker(),
-            firing:     ctx.firing,
-            attempt:    ctx.attempt,
-            scope:      ctx.scope,
-            node:       ctx.node.clone(),
-            skills:     skill_labels,
-            compaction: compaction_accounting.clone(),
-            tools:      Mutex::new(Vec::new()),
+            sender:      ctx.logs.clone(),
+            masker:      ctx.secrets.masker(),
+            firing:      ctx.firing,
+            attempt:     ctx.attempt,
+            scope:       ctx.scope,
+            node:        ctx.node.clone(),
+            skills:      skill_labels,
+            compaction:  compaction_accounting.clone(),
+            route_usage: route_usage.clone(),
+            tools:       Mutex::new(Vec::new()),
         });
         // The plan's remaining routes, for Pebble to fail over to in order,
         // each with its own controls; an export starts with none of its own.
@@ -395,6 +399,7 @@ impl NativeSession {
         events.set_tools(session_tools);
         let mut session = Self {
             compaction: compaction_accounting,
+            route_usage,
             agent,
             events,
             plan,
@@ -522,6 +527,7 @@ impl NativeSession {
         let mut metrics = BTreeMap::from([
             ("pebble.prompts".into(), json!(self.prompts)),
             ("pebble.usage".into(), json!(self.usage)),
+            (route_usage::METRIC.into(), self.route_usage.metrics()),
             (
                 "pebble.inference_ms".into(),
                 json!(elapsed_ms(self.inference)),
@@ -671,19 +677,21 @@ impl Redactor for PetriRedactor {
 /// the terminal: a fallback move and a server that did not start
 /// ([`stderr_line`]).
 struct PetriEvents {
-    sender:     ProgressSender,
-    masker:     Masker,
-    firing:     FiringId,
-    attempt:    Attempt,
-    scope:      ScopeId,
-    node:       SmolStr,
+    sender:      ProgressSender,
+    masker:      Masker,
+    firing:      FiringId,
+    attempt:     Attempt,
+    scope:       ScopeId,
+    node:        SmolStr,
     /// What names the skill directories Pebble reports having searched.
-    skills:     skills::Labels,
+    skills:      skills::Labels,
     /// The session's own compactions, folded as Pebble reports them.
-    compaction: Arc<compaction::Accounting>,
+    compaction:  Arc<compaction::Accounting>,
+    /// The session's own usage by route, folded as Pebble reports it.
+    route_usage: Arc<route_usage::Accounting>,
     /// The node's session's tools, set once the agent is built; what each
     /// child session's list is derived from.
-    tools:      Mutex<Vec<tools::Tool>>,
+    tools:       Mutex<Vec<tools::Tool>>,
 }
 
 impl PetriEvents {
@@ -771,6 +779,9 @@ fn stderr_line(event: &CodingEvent) -> Option<String> {
 #[async_trait::async_trait]
 impl EventSink for PetriEvents {
     async fn record(&self, event: &CodingAgentEvent) -> Result<(), EventSinkError> {
+        // Counted before anything is sent, so a send that fails cannot
+        // leave the usage the session's report holds out of its breakdown.
+        self.route_usage.observe(event);
         let value = serde_json::to_value(event)
             .map_err(|e| EventSinkError::new("Could not encode Pebble event").with_source(e))?;
         self.sender

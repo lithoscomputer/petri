@@ -971,7 +971,20 @@ and `pebble.tool_ms`. They sum all settled prompt reports, including repair
 turns, failed prompts, and cancellation. These metrics exclude the model
 calls a tool makes. They include the compaction summary call, which Pebble
 bills to the prompt that compacted; `pebble.compactions` and
-`pebble.compaction_usage` break that share out (below, "Compaction"). An ACP
+`pebble.compaction_usage` break that share out (below, "Compaction").
+`pebble.usage_by_model` breaks `pebble.usage` out by the route that spent
+it: an array of `{ provider, model, usage }`, one entry per route the
+node's own session spent usage on, in the order the routes were first used.
+`provider` and `model` are named as a `pebble.subagents` session account
+names them, the provider ID and the model ID apart (a `provider/model`
+selector splits at its first `/`; `provider` is null when the stream never
+named it). Each committed answer counts on the route in effect when it
+landed, as `SessionStarted` (a fresh session or a resumed export) and
+`RouteFailover` set it, and each compaction's summary call on the route
+that ran it, so every entry is priced at its own route's model. The entries
+sum to `pebble.usage`; a route that spent nothing has no entry, and a
+session that used nothing reports `[]`. Descendant usage stays in
+`pebble.subagents`. An ACP
 node reports `acp.turns`, `acp.usage` (the session usage extension as
 lithos-llm's `Usage`, "ACP products" above) and, once the agent reported
 its context window, `acp.context` (`used`, `size`).
@@ -994,8 +1007,8 @@ used tokens. A present `cost` is therefore the whole value's cost, never a
 subtotal. `source` is `catalog` (priced from the client's catalog),
 `provider` (reported by the provider) or `application` (supplied by the
 caller, or a sum whose parts differ in source). Sums are
-`Usage::saturating_add`. The places that carry one: `pebble.usage`,
-`pebble.compaction_usage`, `pebble.subagents.usage` and each of its
+`Usage::saturating_add`. The places that carry one: `pebble.usage`, each
+`pebble.usage_by_model[*].usage`, `pebble.compaction_usage`, `pebble.subagents.usage` and each of its
 `sessions[*].usage`, `prompt.usage`, `fabro.prompt.completed.usage`,
 `fabro.compaction.usage`, a hook report's `hooks[].usage.usage`, and
 Pebble's own `AssistantMessage`, `CompactionCompleted`, `CompactionFailed`
@@ -1175,7 +1188,8 @@ fails with the primary's error; a cancelled prompt publishes none either);
 and `AssistantMessage` (`model`, `usage`) for each answer.
 The prompt report Pebble hands the session names the route the prompt ended
 on and its totals; the stage metrics carry Pebble's totals under
-`pebble.*` and nothing per route. A prompt node (`tab`) emits the plan alone
+`pebble.*` and one breakdown per route, `pebble.usage_by_model`, folded
+from those same events (above, "Attempt metrics"). A prompt node (`tab`) emits the plan alone
 and reports its own move on stderr. `crates/petri/lib/tests/fallback_events.rs`
 rebuilds a stage's outcome and per-route accounting from the public stream;
 decision `pebble-events-are-the-agent-contract` records the kinds this

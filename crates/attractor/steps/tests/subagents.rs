@@ -308,6 +308,16 @@ async fn a_child_changes_the_parents_workspace_and_the_stage_accounts_for_it() {
         custom["pebble.usage"]["tokens"]["input"], 30,
         "three parent messages"
     );
+    // The parent's usage by route is the parent's alone: the child's runs
+    // on the same model and still stays out of it.
+    assert_eq!(
+        custom["pebble.usage_by_model"],
+        json!([{
+            "provider": "test",
+            "model": "model",
+            "usage": custom["pebble.usage"],
+        }])
+    );
     let subagents = &custom[METRIC];
     assert_eq!(subagents["spawned"], 1);
     assert_eq!(subagents["completed"], 1);
