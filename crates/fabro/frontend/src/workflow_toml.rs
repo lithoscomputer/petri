@@ -1278,6 +1278,11 @@ const RUN_SECTIONS_IGNORED: &[(&str, &str)] = &[
         "interview routing is a Fabro platform facility; the host's interviewer answers",
     ),
     ("scm", "SCM metadata is a Fabro platform record"),
+    (
+        "children",
+        "child-run approval policy is a Fabro platform facility; the standalone runner mounts \
+         `stack.child_workflow` graphs in-process instead",
+    ),
 ];
 
 /// Fabro's rename hint for a top-level key its parser refuses.
