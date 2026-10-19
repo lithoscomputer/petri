@@ -266,14 +266,15 @@ offloads the `for_each` source list at any size and every other snapshot
 value above 4 KiB (`attractor_steps::blobs::FAN_OUT_OFFLOAD_THRESHOLD`) to the
 run's output store, so the snapshot holds `blob://sha256/<hex>` references
 in their place, one blob per value for the whole fork; the parent's own
-`kv` is not changed. The branch delegates receive `{ snapshot, nodes,
-occurrence }` as their input token and read their `kv` and `nodes` from it.
-A dynamic fork also records its hydrated source array as `items` in its
-output; expansion reads that record, and the outgoing edge leaves `items`
-out of the token copied to each clone. A branch child's request,
-its `InvocationDeclared`, `ExecutionDeclared` and `InvocationFinished`
-records, its own `ExecutionStarted` context and the parent's per-clone
-tokens are therefore bounded by the threshold, not by the item count. A
+`kv` is not changed. Its output is `{ snapshot, nodes, occurrence }`, and
+the branch delegates read their `kv` and `nodes` from it. A branch child's
+request, its `InvocationDeclared`, `ExecutionDeclared` and
+`InvocationFinished` records, its own `ExecutionStarted` context and the
+parent's per-clone tokens are therefore bounded by the threshold, not by the
+item count. A dynamic fork also records its hydrated source array as `items`
+in its output, the one record that grows with the item count (at most 1000
+items): the template's expansion reads the list from that record, and the
+fork's outgoing edge leaves `items` out of the token copied to each clone. A
 snapshot key a branch's own graph reads by expression (the source list of a
 `for_each` nested inside a static branch) is named in the fork's `inline`
 list and stays inline. With no output store the fork keeps every value
@@ -324,13 +325,13 @@ on a later command reads `get(kv, 'parallel.results')`; a command placed
 before any fan-in warns `upstream_fan_in`. The same publication and stripping
 happen in a prompted fan-in before its model call.
 
-`for_each="context.K"` names one template branch. The fork loads that context
-value from the output store when it is a managed artifact reference, then requires an array of at most 1000 items. Missing or
-invalid stored data, non-arrays, and lists over the cap fail the fork before
-any branch starts. The parent context keeps its original value. The template's
-expansion reads the hydrated `items` field from the fork's output record
-(`fail_fast: false`); the fork's outgoing edge omits that field from the
-snapshot token copied to each clone. Each clone carries one item as `item`.
+`for_each="context.K"` names one template branch. The fork reads `K` from
+the context, loads it from the output store when it is a `blob://`
+reference, and requires an array of at most 1000 items: a missing or
+malformed blob, a non-array or a longer list fails the fork before any branch
+starts. The parent context keeps its original value. The template's expansion
+reads the hydrated list from the fork's output (`fail_fast: false`), and each
+clone carries one item as `item`.
 The item reaches the model after the prompt as fenced untrusted data: a
 notice, then the item's JSON inside `<untrusted-<16 hex>>` tags whose tag is
 derived from the item and never appears in it. `item_label` is the item's

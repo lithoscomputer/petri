@@ -45,9 +45,14 @@ pub const FORK_NODES_FIELD: &str = "nodes";
 /// event of one fork visit names the same occurrence the typed
 /// `fork_started` does.
 pub const FORK_OCCURRENCE_FIELD: &str = "occurrence";
-/// The hydrated source array on a dynamic fork's output. Expansion reads it
-/// from the fork's record; it is excluded from branch input tokens.
+/// The hydrated source array on a dynamic fork's output, at most
+/// [`MAX_FOR_EACH_ITEMS`] long. The template's expansion reads it from the
+/// fork's record; the fork's outgoing edge leaves it out of the branch
+/// tokens.
 pub const FORK_ITEMS_FIELD: &str = "items";
+/// The most items a `for_each` fan-out may expand, as Fabro caps it. The
+/// fork step enforces it on the hydrated list.
+pub const MAX_FOR_EACH_ITEMS: usize = 1_000;
 /// The context key a branch child reads the parent's stage records from: the
 /// fork snapshot its preamble is rendered from, since the child's own records
 /// are empty when its target starts.

@@ -15,10 +15,8 @@
 //! The step's output is `{ snapshot, nodes, occurrence }`, where
 //! `occurrence` is `{ fork, firing }`: this visit of the parallel node, which
 //! every branch's call slot and every `fabro.parallel.*` event of the visit
-//! names. A dynamic fork also outputs its hydrated source array as `items`.
-//! Expansion reads that field from the fork's record; the outgoing edge
-//! omits it from the tokens copied to branches. The parent's own `kv` is
-//! not changed.
+//! names. A dynamic fork's output also carries its hydrated source array
+//! as `items` ([`FORK_ITEMS_FIELD`]). The parent's own `kv` is not changed.
 //!
 //! The branch step is the parent-side half of one branch. It takes the fork
 //! snapshot from its input, starts the branch's child graph as an internal
@@ -55,7 +53,7 @@ use execution::{
 use frontend_attractor::hooks::HookEvent;
 use frontend_attractor::kinds::{
     BRANCH_ITEM_KEY, BRANCH_KIND, BRANCH_NODES_KEY, FAN_IN_KIND, FORK_ITEMS_FIELD, FORK_KIND,
-    FORK_NODES_FIELD, FORK_OCCURRENCE_FIELD, FORK_SNAPSHOT_FIELD, StageOutcome,
+    FORK_NODES_FIELD, FORK_OCCURRENCE_FIELD, FORK_SNAPSHOT_FIELD, MAX_FOR_EACH_ITEMS, StageOutcome,
 };
 use ir::placeholder::{is_placeholder_item, placeholder_item};
 use ir::{
@@ -67,7 +65,7 @@ use serde_json::{Map, json};
 use smol_str::SmolStr;
 use steps::{Step, StepCtx};
 
-use crate::blobs::{self, OutputStore};
+use crate::blobs::{self, BlobStore, OutputStore};
 use crate::hooks::{record_report, step_view};
 use crate::stage::record;
 use crate::workflow::ChildInvoker;
@@ -145,35 +143,19 @@ impl Step for ForkStep {
     type Config = ForkConfig;
 
     async fn run(&self, config: ForkConfig, ctx: StepCtx) -> Outcome {
-        // Resolve only the source itself: inline item values remain data,
-        // and neither the parent's context nor its fork snapshot is hydrated.
-        let items = if let Some(key) = &config.source {
-            let mut value = config.kv.get(key).cloned().unwrap_or(Value::Null);
-            if value.is_string()
-                && let Some(store) = ctx.capability::<OutputStore>()
-            {
-                value = blobs::hydrate(value, store.0.as_ref()).await;
-            }
-            let Value::Array(items) = value else {
-                return Outcome::failure(format!(
-                    "for_each source `{key}` must resolve to an array"
-                ));
-            };
-            if items.len() as u64 > frontend_attractor::MAX_FOR_EACH_ITEMS {
-                return Outcome::failure(format!(
-                    "for_each source `{key}` exceeds the {}-item limit",
-                    frontend_attractor::MAX_FOR_EACH_ITEMS
-                ));
-            }
-            Some(items)
-        } else {
-            None
+        let store = ctx.capability::<OutputStore>();
+        let store = store.as_deref().map(|store| store.0.as_ref());
+        let items = match &config.source {
+            Some(key) => match source_items(key, &config.kv, store).await {
+                Ok(items) => Some(items),
+                Err(message) => return Outcome::failure(message),
+            },
+            None => None,
         };
         parallel_start(&ctx, &config).await;
         let mut snapshot = config.kv;
         let mut nodes = config.nodes;
-        if let Some(store) = ctx.capability::<OutputStore>() {
-            let store = store.0.as_ref();
+        if let Some(store) = store {
             if let Value::Object(map) = &mut snapshot {
                 for (key, value) in map.iter_mut() {
                     if config.inline.iter().any(|kept| kept == key) {
@@ -199,6 +181,30 @@ impl Step for ForkStep {
         }
         Outcome::success(output)
     }
+}
+
+/// The `for_each` source list: the context value under `key`, read back from
+/// the output store when it is a reference. Only the source itself is
+/// resolved, so inline item values remain data, and neither the parent's
+/// context nor its fork snapshot is hydrated.
+async fn source_items(
+    key: &str,
+    kv: &Value,
+    store: Option<&dyn BlobStore>,
+) -> Result<Vec<Value>, String> {
+    let mut value = kv.get(key).cloned().unwrap_or(Value::Null);
+    if let (Value::String(_), Some(store)) = (&value, store) {
+        value = blobs::hydrate(value, store).await;
+    }
+    let Value::Array(items) = value else {
+        return Err(format!("for_each source `{key}` must resolve to an array"));
+    };
+    if items.len() > MAX_FOR_EACH_ITEMS {
+        return Err(format!(
+            "for_each source `{key}` exceeds the {MAX_FOR_EACH_ITEMS}-item limit"
+        ));
+    }
+    Ok(items)
 }
 
 #[derive(Debug, Deserialize)]

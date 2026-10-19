@@ -24,12 +24,12 @@
 //! source list and every other large value to the run's output store, so
 //! the snapshot every branch child is declared from, and every clone's input
 //! token, hold references instead of O(items) copies. Its output is
-//! `{ snapshot, nodes, occurrence }`, plus the hydrated `items` for a dynamic
-//! fork. Expansion reads `items` from the fork's record; the edge excludes
-//! it from the token the branch delegates read their `kv` and `nodes` from. A
-//! snapshot key a branch's own graph reads by expression (the source list of a
-//! `for_each` nested inside a static branch) is named in the fork's `inline`
-//! list and stays inline.
+//! `{ snapshot, nodes, occurrence }`, and the branch delegates read their
+//! `kv` and `nodes` from it; a dynamic fork's output also carries the
+//! hydrated `items` ([`FORK_ITEMS_FIELD`]), which its edge leaves out. A
+//! snapshot key a branch's own graph reads by expression (the source list of
+//! a `for_each` nested inside a static branch) is named in the fork's
+//! `inline` list and stays inline.
 //!
 //! The fan-in the branches join at collects the envelopes in branch order,
 //! publishes `parallel.results` and `parallel.branch_count`, and takes the
@@ -49,7 +49,7 @@ use std::time::Duration;
 use frontend::{Diagnostic, Span};
 use ir::placeholder::{BRANCH_ROLE_META, placeholder_item};
 use ir::{
-    BinOp, Budget, Edge, ExpandTarget, ExprId, ExprTable, GraphBuilder, JoinPolicy, NodeId,
+    Arm, BinOp, Budget, Edge, ExpandTarget, ExprId, ExprTable, GraphBuilder, JoinPolicy, NodeId,
     ResultProjection, RetryPolicy, Routing, StepRef,
 };
 use serde_json::{Map, Value, json};
@@ -587,9 +587,10 @@ impl Ctx<'_> {
         let (collector, join) = self.branch_collector(fork, workflow, forks)?;
         let child = self.branch_child(&template.to, &[target], None)?;
 
-        // The fork hydrates and validates the source once. Expansion reads
-        // its output record, while the edge carries only the compact
-        // snapshot so no clone's token contains the whole list.
+        // The fork hydrates and validates the source once, and the
+        // expansion reads the list from its record. The edge forwards the
+        // output without `items`, so no clone's token holds the whole list,
+        // and only on success: a failed fork has no list to expand over.
         let items = {
             let exprs = self.b.exprs();
             let items = exprs.path("nodes", &[&fork.decl.id, "output", FORK_ITEMS_FIELD]);
@@ -601,22 +602,16 @@ impl Ctx<'_> {
             exprs.cond(empty, placeholder_list, items)
         };
         self.fork_step(fork, Some(&key), &BTreeSet::new(), true);
-        let payload = {
+        let (success, payload) = {
             let exprs = self.b.exprs();
+            let success = exprs.call("success", vec![]);
             let output = exprs.var("output");
-            let snapshot = exprs.field(output, FORK_SNAPSHOT_FIELD);
-            let nodes = exprs.field(output, FORK_NODES_FIELD);
-            let occurrence = exprs.field(output, FORK_OCCURRENCE_FIELD);
-            exprs.object(vec![
-                (FORK_SNAPSHOT_FIELD, snapshot),
-                (FORK_NODES_FIELD, nodes),
-                (FORK_OCCURRENCE_FIELD, occurrence),
-            ])
+            let items = exprs.lit(FORK_ITEMS_FIELD);
+            let omitted = exprs.array(vec![items]);
+            (success, exprs.call("omit", vec![output, omitted]))
         };
-        let success = self.b.exprs().call("success", vec![]);
-        let mut edge = Edge::when(self.b.next_edge_id(), target, success);
-        edge.map = Some(payload);
-        self.b.node_mut(fork.id).routing = Routing::next(edge);
+        self.b
+            .select(fork.id, vec![Arm::when(target, success).with_map(payload)]);
         self.branch_step(
             target,
             fork,

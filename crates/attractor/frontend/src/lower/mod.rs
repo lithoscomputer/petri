@@ -60,9 +60,6 @@ use crate::{hooks, stylesheet};
 /// "unlimited" lowers to.
 pub const MAX_FIRINGS: u32 = 500;
 
-/// The most items a `for_each` fan-out may expand, as Fabro caps it.
-pub const MAX_FOR_EACH_ITEMS: u64 = 1_000;
-
 /// How deep nested workflows may go below the root — the GitHub frontend's
 /// reusable-workflow limit, shared so the two formats agree.
 pub const MAX_CALL_DEPTH: usize = 3;
