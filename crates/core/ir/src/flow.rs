@@ -274,6 +274,11 @@ impl FailureClass {
         Self(SmolStr::new(format!("exit_status:{code}")))
     }
 
+    /// Whether this is a [`FailureClass::exit_status`] class.
+    pub fn is_exit_status(&self) -> bool {
+        self.0.starts_with("exit_status:")
+    }
+
     /// The conventional class for a process ended by a foreign signal.
     pub fn signal(signal: i32) -> Self {
         Self(SmolStr::new(format!("signal:{signal}")))
