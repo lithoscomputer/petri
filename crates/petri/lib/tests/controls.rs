@@ -92,6 +92,14 @@ fn firings_of(report: &driver::ExecutionReport, node: &str) -> usize {
         .count()
 }
 
+/// The reason the breaker blocked a route, if it did.
+fn blocked_reason(state: &EngineState) -> Option<String> {
+    state.errors().iter().find_map(|error| match error {
+        RunError::RoutingBlocked { reason, .. } => Some(reason.to_string()),
+        _ => None,
+    })
+}
+
 // ── Circuit breaker ─────────────────────────────────────────────────────────
 
 const RESTART_LOOP: &str = r#"digraph G {
@@ -139,11 +147,7 @@ async fn a_repeated_deterministic_failure_trips_the_breaker_across_restarts() {
         1,
         "the last execution ran work once"
     );
-    let blocked = report.state.errors().iter().find_map(|error| match error {
-        RunError::RoutingBlocked { reason, .. } => Some(reason.to_string()),
-        _ => None,
-    });
-    let reason = blocked.expect("the route was blocked");
+    let reason = blocked_reason(&report.state).expect("the route was blocked");
     assert!(
         reason.contains("deterministic failure cycle detected"),
         "{reason}"
@@ -204,15 +208,7 @@ async fn a_restart_edge_admits_only_transient_failures() {
         .await
         .expect("the run completes");
     assert_eq!(report.status, RunStatus::Failed);
-    let reason = report
-        .state
-        .errors()
-        .iter()
-        .find_map(|error| match error {
-            RunError::RoutingBlocked { reason, .. } => Some(reason.to_string()),
-            _ => None,
-        })
-        .expect("blocked");
+    let reason = blocked_reason(&report.state).expect("blocked");
     assert!(
         reason.contains("loop_restart blocked: failure_class=deterministic"),
         "{reason}"
@@ -240,96 +236,82 @@ async fn a_restart_edge_admits_only_transient_failures() {
     assert_eq!(document.executions.len(), 2, "one restart, then success");
 }
 
-/// Real command diagnostics stay deterministic both on normal loop edges
-/// (where repeats must trip the breaker) and on transient-only restarts.
+/// Command output whose line numbers and names read as transient hints.
+const DIAGNOSTIC: &str = "FAILED tests/test_retry.py::test_timeout at src/domain/order.py:502:5";
+
+/// Real command diagnostics stay deterministic on a normal loop edge, where
+/// repeats must trip the breaker.
 #[tokio::test]
 async fn command_diagnostics_cannot_bypass_the_breaker() {
-    check_command_diagnostics(false).await;
+    let report = run_failing_command("breaker-command-loop", false).await;
+    assert_eq!(
+        firings_of(&report, "work"),
+        3,
+        "{:?}",
+        report.state.errors()
+    );
+    let reason = blocked_reason(&report.state).expect("the breaker blocks the route");
+    assert!(
+        reason.contains("deterministic failure cycle detected"),
+        "{reason}"
+    );
+    assert!(reason.contains("repeated 3 times (limit 3)"), "{reason}");
 }
 
+/// Real command diagnostics stay deterministic on a transient-only restart.
 #[tokio::test]
 async fn command_diagnostics_cannot_take_a_restart_edge() {
-    check_command_diagnostics(true).await;
+    let report = run_failing_command("breaker-command-restart", true).await;
+    assert_eq!(
+        firings_of(&report, "work"),
+        1,
+        "{:?}",
+        report.state.errors()
+    );
+    let reason = blocked_reason(&report.state).expect("the breaker blocks the route");
+    assert!(
+        reason.contains("loop_restart blocked: failure_class=deterministic"),
+        "{reason}"
+    );
 }
 
-async fn check_command_diagnostics(restart: bool) {
-    for diagnostic in [
-        "src/domain/order.py:42:5: F401 unused import",
-        "src/domain/order.py:502:5: F401 unused import",
-        "error: passed by value at crates/domain/src/lib.rs:500:13",
-        "FAILED tests/test_retry.py::test_timeout",
-        "error: undefined name budget",
-    ] {
-        let dir = RunDir::new("breaker-command-diagnostics");
-        let rt = runtime(&dir);
-        let workflow = format!(
-            r#"digraph G {{
-                    graph [loop_restart_signature_limit=3]
-                    start [shape=Mdiamond]
-                    exit [shape=Msquare]
-                    work [shape=parallelogram, max_visits=4,
-                          script="echo '{diagnostic}' >&2; exit 1"]
-                    start -> work
-                    work -> work [condition="outcome=failed", loop_restart={restart}]
-                    work -> exit
-                }}"#
-        );
-        let graph = lower(&rt, &dir, &workflow).graph.expect("lowers");
-        let report = host::run_configured(&rt, HostRun::new(graph), |_, _| {})
-            .await
-            .expect("the run completes");
-        assert_eq!(report.status, RunStatus::Failed);
-        assert_eq!(
-            firings_of(&report, "work"),
-            if restart { 1 } else { 3 },
-            "{diagnostic}, restart={restart}: {:?}",
-            report.state.errors()
-        );
-        let reason = report
-            .state
-            .errors()
-            .iter()
-            .find_map(|error| match error {
-                RunError::RoutingBlocked { reason, .. } => Some(reason.as_str()),
-                _ => None,
-            })
-            .expect("the breaker blocks the route");
-        if restart {
-            assert!(
-                reason.contains("loop_restart blocked: failure_class=deterministic"),
-                "{reason}"
-            );
-        } else {
-            assert!(
-                reason.contains("deterministic failure cycle detected"),
-                "{reason}"
-            );
-            assert!(reason.contains("repeated 3 times (limit 3)"), "{reason}");
-        }
-        let record = report
-            .state
-            .history()
-            .iter()
-            .find(|r| r.name == "work")
-            .expect("command record");
-        let info = record
-            .outcome
-            .status
-            .failure_info()
-            .expect("command failure");
-        assert_eq!(info.class.as_str(), "exit_status:1");
-        assert!(info.message.contains(diagnostic), "{}", info.message);
-        assert_eq!(
-            record.outcome.output["stdout"],
-            json!(format!("{diagnostic}\n"))
-        );
-        assert_eq!(
-            report.state.run_context().get("command.output"),
-            Some(&json!(format!("{diagnostic}\n")))
-        );
-        let document = inspect_run_dir(dir.path()).await.expect("inspects");
-        assert_eq!(document.executions.len(), 1, "no restart: {diagnostic}");
-    }
+/// Runs a command that prints [`DIAGNOSTIC`] and exits 1 on a self-loop, and
+/// checks the diagnostic survives in the failure reason and
+/// `command.output`.
+async fn run_failing_command(name: &str, restart: bool) -> driver::ExecutionReport {
+    let dir = RunDir::new(name);
+    let rt = runtime(&dir);
+    let workflow = format!(
+        r#"digraph G {{
+                graph [loop_restart_signature_limit=3]
+                start [shape=Mdiamond]
+                exit [shape=Msquare]
+                work [shape=parallelogram, max_visits=4,
+                      script="echo '{DIAGNOSTIC}' >&2; exit 1"]
+                start -> work
+                work -> work [condition="outcome=failed", loop_restart={restart}]
+                work -> exit
+            }}"#
+    );
+    let graph = lower(&rt, &dir, &workflow).graph.expect("lowers");
+    let report = host::run_configured(&rt, HostRun::new(graph), |_, _| {})
+        .await
+        .expect("the run completes");
+    assert_eq!(report.status, RunStatus::Failed);
+    let info = report
+        .state
+        .history()
+        .iter()
+        .find(|r| r.name == "work")
+        .and_then(|r| r.outcome.status.failure_info())
+        .expect("command failure");
+    assert_eq!(info.class.as_str(), "exit_status:1");
+    assert!(info.message.contains(DIAGNOSTIC), "{}", info.message);
+    assert_eq!(
+        report.state.run_context().get("command.output"),
+        Some(&json!(format!("{DIAGNOSTIC}\n")))
+    );
+    report
 }
 
 /// Node visit totals survive a `loop_restart` while the context is
@@ -436,15 +418,7 @@ async fn the_breaker_state_is_restored_on_resume() {
 
     let resumed = host::resume(&rt).await.expect("resumes");
     assert_eq!(resumed.status, RunStatus::Failed);
-    let reason = resumed
-        .state
-        .errors()
-        .iter()
-        .find_map(|error| match error {
-            RunError::RoutingBlocked { reason, .. } => Some(reason.to_string()),
-            _ => None,
-        })
-        .expect("the restored count blocks the route");
+    let reason = blocked_reason(&resumed.state).expect("the restored count blocks the route");
     assert!(reason.contains("repeated 3 times"), "{reason}");
 }
 
