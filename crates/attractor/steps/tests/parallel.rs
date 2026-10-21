@@ -10,7 +10,8 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 use std::{fs, thread};
 
-use attractor_steps::blobs::{holds_ref, hydrate};
+use attractor_steps::blobs::{BlobStore as _, blob_ref, holds_ref, hydrate};
+use attractor_steps::parallel::fenced_item;
 use attractor_steps::{
     AGENT_KIND, BLOBS_DIR, BranchStep, CommandStep, FanInStep, ForkStep, HUMAN_KIND,
     LocalBlobStore, STAGE_KIND, StubStep, WAIT_KIND, WORKFLOW_KIND,
@@ -23,6 +24,7 @@ use execution::host::{self, HostRun};
 use execution::inspect::{InvocationInspection, RunInspection, inspect_run_dir};
 use execution::{CoordinatorEvent, ExecutionObserver};
 use frontend::{CompileInputs, Lowered, NoFiles};
+use frontend_attractor::kinds::BRANCH_ITEM_KEY;
 use ir::StepEvent;
 use runtime::driver::{BranchRole, ExecutionReport};
 use runtime::engine::Event;
@@ -323,6 +325,39 @@ async fn invocation_count(dir: &Path) -> usize {
         .expect("inspects")
         .invocations
         .len()
+}
+
+/// Run `FOR_EACH` with `jobs` as the routing step's `jobs` value.
+async fn run_for_each(dir: &Path, jobs: &Value) -> ExecutionReport {
+    let jobs = jobs.to_string().replace('"', "\\\"");
+    run(&runtime(dir), lower(&dot(&FOR_EACH.replace("JOBS", &jobs)))).await
+}
+
+/// The reference the routing step holds in place of a stored JSON value.
+fn json_ref(digest: &str) -> Value {
+    Value::String(format!("{}#json", blob_ref(digest)))
+}
+
+/// Store `bytes` in the run's output store and return its reference.
+async fn stored_source(dir: &Path, bytes: &[u8]) -> Value {
+    let store = LocalBlobStore::new(dir.join(BLOBS_DIR));
+    json_ref(&store.put(bytes).await.expect("stores the source"))
+}
+
+/// The fork failed before any branch: no child invocation, and no parent-side
+/// `job` node fired. An empty list also leaves one invocation but fires the
+/// placeholder clone `job#0`, so the count alone does not tell the two apart.
+async fn assert_fork_failed_without_branches(dir: &Path, report: &ExecutionReport) {
+    assert_eq!(report.status, RunStatus::Failed);
+    assert_eq!(invocation_count(dir).await, 1);
+    assert_eq!(status_of(report, "fan").as_deref(), Some("failure"));
+    assert!(
+        report
+            .state
+            .history()
+            .iter()
+            .all(|r| !r.name.starts_with("job"))
+    );
 }
 
 const FINDERS: &str = r#"
@@ -738,6 +773,99 @@ async fn for_each_items_are_labelled_and_ordered_by_index() {
         assert_eq!(envelope["status"], json!("succeeded"));
     }
     assert_eq!(invocation_count(dir.path()).await, 4);
+}
+
+/// Routing output crosses the context offload boundary before the fork.
+/// Stored and inline lists must declare the same ordered branch item data.
+#[tokio::test]
+async fn for_each_reads_artifact_backed_routing_items() {
+    for width in [10, 50_000] {
+        let dir = RunDir::new("parallel-stored-items");
+        let rt = runtime(dir.path());
+        let workflow = fan_out_over(3).replace("* 100", &format!("* {width}"));
+        let (report, events) = run_projected(&rt, lower(&workflow), |_| {}).await;
+        let jobs = &report.state.run_context().kv["jobs"];
+        assert_eq!(holds_ref(jobs), width == 50_000);
+        assert_eq!(
+            report.status,
+            RunStatus::Success,
+            "{:?}",
+            report.state.errors()
+        );
+        let inspection = inspect_run_dir(dir.path()).await.expect("inspects");
+        let children = children_of(&inspection, "fan");
+        assert_eq!(children.len(), 3);
+        for (index, child) in children.iter().enumerate() {
+            let item = &child.context[BRANCH_ITEM_KEY];
+            let expected = json!({"name": format!("job-{index}"), "brief": "x".repeat(width)});
+            assert_eq!(item, &json!(fenced_item(&expected)));
+            assert!(holds_ref(&child.context["jobs"]));
+        }
+        assert_eq!(published_results(&report).len(), 3);
+        let mut branch_tokens = 0;
+        for event in &events {
+            if let Some(Event::TokenEmitted { token }) = event.engine()
+                && token.payload.get("snapshot").is_some()
+            {
+                branch_tokens += 1;
+                assert!(
+                    token.payload.get("items").is_none(),
+                    "a branch token copies the whole list"
+                );
+            }
+        }
+        assert!(branch_tokens > 0);
+        assert_replay_matches(dir.path(), &events).await;
+    }
+}
+
+/// An explicitly stored empty list retains the zero-branch join behavior.
+#[tokio::test]
+async fn an_artifact_backed_empty_for_each_list_joins_without_children() {
+    let dir = RunDir::new("parallel-stored-empty");
+    let source = stored_source(dir.path(), b"[]").await;
+    let report = run_for_each(dir.path(), &source).await;
+    assert_eq!(
+        report.status,
+        RunStatus::Success,
+        "{:?}",
+        report.state.errors()
+    );
+    assert_eq!(report.state.run_context().get("jobs"), Some(&source));
+    assert_eq!(published_results(&report), Vec::<Value>::new());
+    assert_eq!(invocation_count(dir.path()).await, 1);
+}
+
+/// A missing blob, malformed JSON or a stored non-array must fail before
+/// declaring children, rather than treating the reference text as items.
+#[tokio::test]
+async fn invalid_artifact_backed_for_each_sources_fail_without_children() {
+    for bytes in [None, Some(b"not json".as_slice()), Some(b"{}".as_slice())] {
+        let dir = RunDir::new("parallel-invalid-stored-items");
+        let source = match bytes {
+            Some(bytes) => stored_source(dir.path(), bytes).await,
+            None => json_ref(&"0".repeat(64)),
+        };
+        let report = run_for_each(dir.path(), &source).await;
+        assert_fork_failed_without_branches(dir.path(), &report).await;
+    }
+}
+
+/// The cap applies to the array length after hydration, never to the
+/// reference string's length.
+#[tokio::test]
+async fn oversized_for_each_lists_fail_before_creating_branches() {
+    let list = json!(vec![0; 1_001]);
+    for stored in [false, true] {
+        let dir = RunDir::new("parallel-too-many-items");
+        let source = if stored {
+            stored_source(dir.path(), &serde_json::to_vec(&list).expect("JSON")).await
+        } else {
+            list.clone()
+        };
+        let report = run_for_each(dir.path(), &source).await;
+        assert_fork_failed_without_branches(dir.path(), &report).await;
+    }
 }
 
 /// A fork visited twice is two fork occurrences: each visit's `fork_started`,

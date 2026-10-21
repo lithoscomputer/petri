@@ -90,7 +90,7 @@ a warning; the importing workflow's stylesheet governs.
 | `tab` prompt | `attractor/prompt` | prompt, goal, `fidelity` and the thread attributes (accepted; a prompt node never continues a conversation), `project_memory`, model settings (`model`, `provider`, `reasoning_effort`, `speed`, `max_tokens`), `output_schema`, `output_retries`; API-only: `backend="acp"` on the node is `attractor.prompt_backend`, and the graph's ACP settings never reach it |
 | `parallelogram` command, or any node with `script` | `attractor/command` | script, language, `stdin` (an expression over `kv`), `output_schema`, `env` (`[run.prepare]` step env and the environment's `$secret` values) |
 | `hexagon` human | `attractor/human` | the choices (from the edges, each with the edge's `human.description` and `human.preview` when set), `question_type`, `freeform_target`, `sensitive`, `review_target`, `default_choice` (from `human.default_choice`), `timeout_ms` |
-| `component` parallel | `attractor/fork`: takes the fork snapshot of `kv` (and of the stage records for agent or prompt targets) once per visit, offloads the `for_each` source list and every other value above 4 KiB to the output store, and outputs `{ snapshot, nodes }`; each branch target becomes a synthetic `attractor/branch` delegate (`kind = "parallel.branch"`) that runs a copy of the target in a child invocation from that snapshot; `for_each` marks the delegate `Expansion::ForEach` (below) | fork: `label`, `node`, `kv`, `nodes`, `source`, `inline`; branch: `label`, `node`, `fork`, `index`, `item`, `for_each`, `max_parallel`, `child_digest`, `target_kind`, `kv`, `nodes`, `generation` |
+| `component` parallel | `attractor/fork`: takes the fork snapshot of `kv` (and of the stage records for agent or prompt targets) once per visit, offloads the `for_each` source list and every other value above 4 KiB to the output store, and outputs `{ snapshot, nodes, occurrence, items? }`; each branch target becomes a synthetic `attractor/branch` delegate (`kind = "parallel.branch"`) that runs a copy of the target in a child invocation from that snapshot; `for_each` marks the delegate `Expansion::ForEach` (below) | fork: `label`, `node`, `kv`, `nodes`, `source`, `inline`; branch: `label`, `node`, `fork`, `index`, `item`, `for_each`, `max_parallel`, `child_digest`, `target_kind`, `kv`, `nodes`, `generation` |
 | `tripleoctagon` fan-in | `attractor/fan_in`, `join: all`; publishes `parallel.results` and `parallel.branch_count`; its output is the ordered branch results | |
 | `tripleoctagon` fan-in with a `prompt` | `attractor/prompt`, `join: all`: the ordered barrier, the same `parallel.results` publication, then one model call over the branch results (`sources`, `branch_results`) | |
 | a `component` whose branches share a plain successor | a synthetic `<fork>.fan_in` (`attractor/fan_in`, `synthetic: true`) before that successor | |
@@ -266,12 +266,15 @@ offloads the `for_each` source list at any size and every other snapshot
 value above 4 KiB (`attractor_steps::blobs::FAN_OUT_OFFLOAD_THRESHOLD`) to the
 run's output store, so the snapshot holds `blob://sha256/<hex>` references
 in their place, one blob per value for the whole fork; the parent's own
-`kv` is not changed. Its output is `{ snapshot, nodes }`, which the branch
-delegates read as their `kv` and `nodes`, and which every clone of a
-`for_each` template receives as its input token. A branch child's request,
-its `InvocationDeclared`, `ExecutionDeclared` and `InvocationFinished`
-records, its own `ExecutionStarted` context and the parent's per-clone
-tokens are therefore bounded by the threshold, not by the item count. A
+`kv` is not changed. Its output is `{ snapshot, nodes, occurrence }`, and
+the branch delegates read their `kv` and `nodes` from it. A branch child's
+request, its `InvocationDeclared`, `ExecutionDeclared` and
+`InvocationFinished` records, its own `ExecutionStarted` context and the
+parent's per-clone tokens are therefore bounded by the threshold, not by the
+item count. A dynamic fork also records its hydrated source array as `items`
+in its output, the one record that grows with the item count (at most 1000
+items): the template's expansion reads the list from that record, and the
+fork's outgoing edge leaves `items` out of the token copied to each clone. A
 snapshot key a branch's own graph reads by expression (the source list of a
 `for_each` nested inside a static branch) is named in the fork's `inline`
 list and stays inline. With no output store the fork keeps every value
@@ -322,10 +325,13 @@ on a later command reads `get(kv, 'parallel.results')`; a command placed
 before any fan-in warns `upstream_fan_in`. The same publication and stripping
 happen in a prompted fan-in before its model call.
 
-`for_each="context.K"` names one template branch. The template's expansion
-evaluates `get(kv, 'K')` from the context itself, never from the fork's
-output (Fabro's 1000-item cap is a precondition on the fork, `fail_fast:
-false`), and each clone carries one item as `item`.
+`for_each="context.K"` names one template branch. The fork reads `K` from
+the context, loads it from the output store when it is a `blob://`
+reference, and requires an array of at most 1000 items: a missing or
+malformed blob, a non-array or a longer list fails the fork before any branch
+starts. The parent context keeps its original value. The template's expansion
+reads the hydrated list from the fork's output (`fail_fast: false`), and each
+clone carries one item as `item`.
 The item reaches the model after the prompt as fenced untrusted data: a
 notice, then the item's JSON inside `<untrusted-<16 hex>>` tags whose tag is
 derived from the item and never appears in it. `item_label` is the item's
