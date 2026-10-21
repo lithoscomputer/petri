@@ -39,9 +39,11 @@
 //!   `.fabro/project.toml` under `workflow.toml` ([`EnvironmentLayers`]), so a
 //!   bundle can name an environment the host's catalog declares.
 //! - `[run.prepare]`: setup steps that run as command nodes between `start` and
-//!   its successors, in the selected environment, before any workflow node.
-//!   Each step gets the section's `timeout` (default five minutes) and
-//!   `on_failure="exit"`, so a failed step ends the run before the nodes.
+//!   its successors, in the selected environment, before any workflow node. The
+//!   workflow section replaces the host settings section whole; an empty
+//!   workflow section disables inherited steps. Each step gets the section's
+//!   `timeout` (default five minutes) and `on_failure="exit"`, so a failed step
+//!   ends the run before the nodes.
 //! - `[[run.hooks]]`: the local hook layer beside the workflow, read by
 //!   `crate::hooks` together with `.fabro/project.toml` and the host's settings
 //!   layer.
@@ -130,9 +132,9 @@ impl Settings {
     }
 }
 
-/// Read `workflow.toml` beside `file`, and the environment tables of the
-/// layers below it. Input defaults land in `template`; everything else
-/// comes back as [`Settings`]. Problems are diagnosed.
+/// Read `workflow.toml` beside `file`, the host's preparation defaults, and
+/// the environment tables of the layers below it. Input defaults land in
+/// `template`; everything else comes back as [`Settings`]. Problems are diagnosed.
 pub fn read(
     file: &str,
     files: &dyn FileSource,
@@ -151,12 +153,12 @@ pub fn read(
         None => None,
         Some(Ok(table)) => Some(table),
         Some(Err(error)) => {
-            // The hook loader still sees the text: a configured hook in an
-            // unparseable file is an error there, never a silent skip.
-            diags.warning(
+            // An unreadable workflow might override host preparation. Never
+            // fall back to running host commands when that choice is unknown.
+            diags.error(
                 "fabro.workflow_toml",
                 Span::file(&path),
-                format!("`{path}` is not valid TOML and is ignored: {error}"),
+                format!("`{path}` is not valid TOML: {error}"),
             );
             None
         }
@@ -180,6 +182,16 @@ pub fn read(
         reader.top_level(table);
     }
     reader.launch_goal(inputs);
+    // Select and parse preparation once, after workflow input defaults. A
+    // present section replaces steps AND timeout; project settings do not
+    // participate. An unparseable workflow must not inherit host commands.
+    if (text.is_none() || table.is_some())
+        && !table
+            .as_ref()
+            .is_some_and(|table| reader.prepare_layer(&path, table))
+    {
+        reader.settings_prepare(inputs);
+    }
     // The environment resolves over every layer, so a bundle with no
     // `workflow.toml` still runs in the environment the host's layer names.
     let layers = EnvironmentLayers::read(files, inputs, table.as_ref().map(|t| (path.as_str(), t)));
@@ -437,12 +449,12 @@ impl Reader<'_> {
                 // Inputs were read above. `[[run.hooks]]` is read by
                 // `lower::hooks`, with the project and settings layers, from
                 // the text kept on the settings. `[run.environment]` is read
-                // with the other layers' by `Reader::environment`.
-                "inputs" | "hooks" | "environment" => {}
+                // with the other layers' by `Reader::environment`. Preparation
+                // is selected after this table's input defaults are available.
+                "inputs" | "hooks" | "environment" | "prepare" => {}
                 "goal" => self.goal(item),
                 "model" => self.model(item),
                 "execution" => self.execution(item),
-                "prepare" => self.prepare(item),
                 "agent" => self.agent(item),
                 "clone" => self.clone_section(item),
                 other => self.other_run_key(other),
@@ -542,27 +554,29 @@ impl Reader<'_> {
     /// string. `{{ secrets.* }}` is refused here: only an environment value
     /// may carry one.
     fn render(&mut self, text: &str, what: &str) -> Option<String> {
+        self.render_in(self.path, text, what)
+    }
+
+    fn render_in(&mut self, source: &str, text: &str, what: &str) -> Option<String> {
         match interpolate(text, self.template, false) {
             Ok(rendered) => Some(rendered.text),
             Err(InterpolationError::SecretNotAllowed { name }) => {
-                self.unsupported(
+                self.unsupported_in(
+                    source,
                     "workflow_toml.secret_position",
                     format!(
-                        "{what} in `{}` reads `{{{{ secrets.{name} }}}}`; a secret may appear only \
-                         as an environment value, never in text that reaches a log",
-                        self.path
+                        "{what} in `{source}` reads `{{{{ secrets.{name} }}}}`; a secret may appear only \
+                         as an environment value, never in text that reaches a log"
                     ),
                     "move the secret to `env` and read the variable in the script",
                 );
                 None
             }
             Err(InterpolationError::Unbound { name }) => {
-                self.unsupported(
+                self.unsupported_in(
+                    source,
                     "template.unbound_input",
-                    format!(
-                        "{what} in `{}` reads `{{{{ {name} }}}}`, which no input binds",
-                        self.path
-                    ),
+                    format!("{what} in `{source}` reads `{{{{ {name} }}}}`, which no input binds"),
                     &format!(
                         "pass `--input {}=VALUE`, or add a default under `[run.inputs]`",
                         name.strip_prefix("inputs.").unwrap_or(&name)
@@ -571,12 +585,12 @@ impl Reader<'_> {
                 None
             }
             Err(InterpolationError::Env { name }) => {
-                self.unsupported(
+                self.unsupported_in(
+                    source,
                     "workflow_toml.env_token",
                     format!(
-                        "{what} in `{}` reads `{{{{ env.{name} }}}}`, which Fabro parses but never \
-                         resolves",
-                        self.path
+                        "{what} in `{source}` reads `{{{{ env.{name} }}}}`, which Fabro parses but never \
+                         resolves"
                     ),
                     "use `{{ inputs.NAME }}` or `{{ secrets.NAME }}`",
                 );
@@ -1004,8 +1018,51 @@ impl Reader<'_> {
         self.settings.run.environment = Some(environment);
     }
 
-    fn prepare(&mut self, item: &toml::Value) {
+    /// Return true when this layer decides preparation, even if malformed.
+    fn prepare_layer(&mut self, source: &str, table: &toml::Table) -> bool {
+        let Some(run) = table.get("run") else {
+            return false;
+        };
+        let Some(run) = run.as_table() else {
+            self.unsupported_in(
+                source,
+                "workflow_toml.run.prepare",
+                format!("`run` in `{source}` must be a table"),
+                "write `[run.prepare]` for preparation settings",
+            );
+            return true;
+        };
+        let Some(prepare) = run.get("prepare") else {
+            return false;
+        };
+        self.prepare(source, prepare);
+        true
+    }
+
+    fn settings_prepare(&mut self, inputs: &CompileInputs) {
+        let Some(Value::String(text)) = inputs.vars.get(SETTINGS_HOOKS_VAR) else {
+            return;
+        };
+        match text.parse::<toml::Table>() {
+            Ok(table) => {
+                self.prepare_layer("settings.toml", &table);
+            }
+            Err(error) => self.diags.error(
+                "fabro.prepare.toml",
+                Span::file("settings.toml"),
+                format!("`settings.toml` is not valid TOML; cannot resolve preparation: {error}"),
+            ),
+        }
+    }
+
+    fn prepare(&mut self, source: &str, item: &toml::Value) {
         let Some(prepare) = item.as_table() else {
+            self.unsupported_in(
+                source,
+                "workflow_toml.run.prepare",
+                format!("`run.prepare` in `{source}` must be a table"),
+                "write `[run.prepare]` with `steps` and an optional `timeout`",
+            );
             return;
         };
         if let Some(timeout) = prepare.get("timeout") {
@@ -1014,65 +1071,76 @@ impl Reader<'_> {
                     self.settings.run.prepare_timeout_ms =
                         u64::try_from(duration.as_millis()).unwrap_or(u64::MAX);
                 }
-                None => self.unsupported(
+                None => self.unsupported_in(
+                    source,
                     "workflow_toml.key",
-                    format!(
-                        "`run.prepare.timeout` in `{}` must be a duration such as `5m`",
-                        self.path
-                    ),
+                    format!("`run.prepare.timeout` in `{source}` must be a duration such as `5m`"),
                     "write the timeout with a unit",
                 ),
             }
         }
         for key in prepare.keys() {
             if !matches!(key.as_str(), "steps" | "timeout") {
-                let path = self.path;
-                self.unsupported(
+                self.unsupported_in(
+                    source,
                     "workflow_toml.key",
-                    format!("`run.prepare.{key}` in `{path}` is not a key Fabro accepts"),
+                    format!("`run.prepare.{key}` in `{source}` is not a key Fabro accepts"),
                     "use `steps` and `timeout`",
                 );
             }
         }
-        let Some(steps) = prepare.get("steps").and_then(toml::Value::as_array) else {
+        let Some(steps) = prepare.get("steps") else {
+            return;
+        };
+        let Some(steps) = steps.as_array() else {
+            self.unsupported_in(
+                source,
+                "workflow_toml.run.prepare",
+                format!("`run.prepare.steps` in `{source}` must be an array"),
+                "write `[[run.prepare.steps]]` with `script` or `command`",
+            );
             return;
         };
         for (index, step) in steps.iter().enumerate() {
             let Some(step) = step.as_table() else {
-                self.unsupported(
+                self.unsupported_in(
+                    source,
                     "workflow_toml.run.prepare",
-                    format!(
-                        "`run.prepare.steps[{index}]` in `{}` must be a table",
-                        self.path
-                    ),
+                    format!("`run.prepare.steps[{index}]` in `{source}` must be a table"),
                     "write `[[run.prepare.steps]]` with `script` or `command`",
                 );
                 continue;
             };
-            let script = step.get("script").and_then(toml::Value::as_str);
-            let command = step.get("command").and_then(toml::Value::as_array);
+            let script = step.get("script");
+            let command = step.get("command");
             let text = match (script, command) {
-                (Some(script), None) => {
-                    self.render(script, &format!("`run.prepare.steps[{index}].script`"))
-                }
-                (None, Some(argv)) => {
+                (Some(toml::Value::String(script)), None) => self.render_in(
+                    source,
+                    script,
+                    &format!("`run.prepare.steps[{index}].script`"),
+                ),
+                (None, Some(toml::Value::Array(argv))) => {
                     let mut words = Vec::with_capacity(argv.len());
                     let mut ok = true;
                     for (position, word) in argv.iter().enumerate() {
                         let Some(word) = word.as_str() else {
                             ok = false;
-                            self.unsupported(
+                            self.unsupported_in(
+                                source,
                                 "workflow_toml.run.prepare",
                                 format!(
-                                    "`run.prepare.steps[{index}].command[{position}]` in `{}` must \
-                                     be a string",
-                                    self.path
+                                    "`run.prepare.steps[{index}].command[{position}]` in `{source}` must \
+                                     be a string"
                                 ),
                                 "write every argument as a string",
                             );
                             continue;
                         };
-                        match self.render(word, &format!("`run.prepare.steps[{index}].command`")) {
+                        match self.render_in(
+                            source,
+                            word,
+                            &format!("`run.prepare.steps[{index}].command`"),
+                        ) {
                             Some(rendered) => words.push(rendered),
                             None => ok = false,
                         }
@@ -1081,12 +1149,12 @@ impl Reader<'_> {
                         .flatten()
                 }
                 _ => {
-                    self.unsupported(
+                    self.unsupported_in(
+                        source,
                         "workflow_toml.run.prepare",
                         format!(
-                            "`run.prepare.steps[{index}]` in `{}`: exactly one of script or command \
-                             must be set",
-                            self.path
+                            "`run.prepare.steps[{index}]` in `{source}`: exactly one of script or command \
+                             must be set"
                         ),
                         "give the step a `script` or a `command`, not both",
                     );
@@ -1097,11 +1165,19 @@ impl Reader<'_> {
                 continue;
             };
             let mut env = BTreeMap::new();
-            if let Some(table) = step.get("env").and_then(toml::Value::as_table) {
-                let path = self.path;
+            if let Some(value) = step.get("env") {
+                let Some(table) = value.as_table() else {
+                    self.unsupported_in(
+                        source,
+                        "workflow_toml.run.prepare",
+                        format!("`run.prepare.steps[{index}].env` in `{source}` must be a table"),
+                        "write `env = { NAME = \"value\" }`",
+                    );
+                    continue;
+                };
                 for (key, value) in table {
                     if let Some(value) =
-                        self.env_value(path, &format!("run.prepare.steps[{index}]"), key, value)
+                        self.env_value(source, &format!("run.prepare.steps[{index}]"), key, value)
                     {
                         env.insert(key.clone(), value);
                     }
@@ -1109,10 +1185,10 @@ impl Reader<'_> {
             }
             for key in step.keys() {
                 if !matches!(key.as_str(), "script" | "command" | "env") {
-                    let path = self.path;
-                    self.unsupported(
+                    self.unsupported_in(
+                        source,
                         "workflow_toml.key",
-                        format!("`run.prepare.steps[{index}].{key}` in `{path}` is not a key Fabro accepts"),
+                        format!("`run.prepare.steps[{index}].{key}` in `{source}` is not a key Fabro accepts"),
                         "use `script` or `command`, and `env`",
                     );
                 }

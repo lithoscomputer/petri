@@ -124,10 +124,10 @@ impl Fabro {
 
     /// Carry the user settings layer's text into every load. Fabro reads
     /// `~/.fabro/settings.toml` (`$FABRO_HOME` when set) for hooks, MCP
-    /// servers, `[run.model]` defaults and `[environments.*]`; the host
-    /// reads the file and hands the text here, so lowering stays free of
-    /// environment reads. A Fabro server hands its environment catalog
-    /// here too, as `[environments.<id>]` tables.
+    /// servers, `[run.model]` defaults, `[run.prepare]` and `[environments.*]`;
+    /// the host reads the file and hands the text here, so lowering stays
+    /// free of environment reads. A Fabro server hands its environment
+    /// catalog here too, as `[environments.<id>]` tables.
     #[must_use]
     pub fn with_settings_toml(mut self, text: Option<String>) -> Self {
         self.settings_toml = text;
