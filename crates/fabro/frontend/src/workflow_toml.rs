@@ -134,7 +134,8 @@ impl Settings {
 
 /// Read `workflow.toml` beside `file`, the host's preparation defaults, and
 /// the environment tables of the layers below it. Input defaults land in
-/// `template`; everything else comes back as [`Settings`]. Problems are diagnosed.
+/// `template`; everything else comes back as [`Settings`]. Problems are
+/// diagnosed.
 pub fn read(
     file: &str,
     files: &dyn FileSource,

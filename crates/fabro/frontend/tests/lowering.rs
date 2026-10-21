@@ -439,7 +439,7 @@ fn the_bundle_root_is_the_parent_of_dot_fabro() {
 }
 
 #[test]
-fn an_unparseable_workflow_toml_that_configures_hooks_is_an_error() {
+fn an_unparseable_workflow_toml_is_an_error_with_or_without_hooks() {
     let files = files(&[(
         "wf/workflow.toml",
         "[[run.hooks]]\nevent = \"stage_start\"\nscript = \"sed 's/\\(x\\)/y/'\"\n",
@@ -463,7 +463,8 @@ fn an_unparseable_workflow_toml_that_configures_hooks_is_an_error() {
         lowered.graph.is_none(),
         "a hook that cannot be read is never skipped silently"
     );
-    // The same broken file without hooks stays a warning.
+    // Without hooks, an unreadable file still cannot establish whether the
+    // workflow overrides inherited preparation, so admission must fail.
     let plain = self::files(&[("wf/workflow.toml", "[run]\ngoal = \"bad \\( escape\"\n")]);
     let lowered = load(
         "wf/workflow.fabro",
@@ -474,13 +475,10 @@ fn an_unparseable_workflow_toml_that_configures_hooks_is_an_error() {
         &plain,
         &CompileInputs::new(),
     );
-    assert!(lowered.graph.is_some(), "{:?}", lowered.diagnostics);
-    assert!(
-        lowered
-            .diagnostics
-            .iter()
-            .any(|d| d.code == "fabro.workflow_toml")
-    );
+    assert!(lowered.graph.is_none(), "{:?}", lowered.diagnostics);
+    assert!(lowered.diagnostics.iter().any(|d| d.is_error()
+        && d.code == "fabro.workflow_toml"
+        && d.span.file == "wf/workflow.toml"));
 }
 
 #[test]
