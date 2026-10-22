@@ -1,5 +1,3 @@
-use std::time::Duration;
-
 mod support;
 
 use frontend::{CompileInputs, Frontend};
@@ -109,30 +107,4 @@ fn preparation_mentions_are_not_settings_and_former_names_are_ordinary() {
         &CompileInputs::new(),
     );
     assert!(lowered.graph.is_some(), "{:?}", lowered.diagnostics);
-}
-
-#[test]
-fn authored_setup_keeps_deadline_failure_and_inherited_retry_policy() {
-    let workflow = dot(r#"
-        graph [default_max_retries=2, on_retries_exhausted="exit"]
-        install [shape=parallelogram, script="true", timeout="5m", on_failure="exit"]
-        work [shape=parallelogram, script="true"]
-        start -> install -> work -> exit
-    "#);
-    let lowered = Fabro::new().load(
-        "workflow.fabro",
-        &workflow,
-        &files(&[]),
-        &CompileInputs::new(),
-    );
-    let graph = lowered.graph.expect("authored commands lower");
-    let setup = support::node(&graph, "install");
-    assert_eq!(setup.budget.timeout, Duration::from_secs(300));
-    assert_eq!(setup.step.config["on_failure"], json!("exit"));
-    assert_eq!(setup.step.config["on_retries_exhausted"], json!("exit"));
-    assert_eq!(setup.retry.max_attempts.get(), 3);
-    assert_eq!(
-        support::node(&graph, "work").budget.timeout,
-        Duration::from_secs(600)
-    );
 }

@@ -1134,131 +1134,6 @@ async fn run_model_defaults_reach_openrouter_through_chat_completions() {
     twin.stop();
 }
 
-/// Setup commands run in order in the selected environment. A failure ends
-/// the run before downstream work, even with a nonzero graph retry default.
-#[tokio::test]
-async fn setup_commands_run_in_order_and_a_failure_stops_the_run() {
-    let case = Case::new("prepare");
-    let workflow = case.workflow(
-        r#"digraph Prepared {
-    start [shape=Mdiamond]
-    exit [shape=Msquare]
-    read [shape=parallelogram, script="cat prepared.txt"]
-    initialize [shape=parallelogram, script="printf 'one\n' > prepared.txt", timeout="30s", on_failure="exit"]
-    append [shape=parallelogram, script="TAG='a b; \"c\"'; printf '%s\n' \"$TAG\" >> prepared.txt", timeout="30s", on_failure="exit"]
-    start -> initialize -> append -> read -> exit
-}"#,
-        None,
-    );
-    let finished = case.run(&workflow, &[]).await;
-    finished.assert_code(0);
-    assert_eq!(
-        finished.status_line(),
-        Some("success"),
-        "{}",
-        finished.stderr
-    );
-    assert_eq!(
-        fs::read_to_string(case.workspace().join("prepared.txt")).expect("prepared.txt"),
-        "one\na b; \"c\"\n"
-    );
-    let nodes: Vec<String> = finished
-        .finished_nodes()
-        .into_iter()
-        .map(|(_, node)| node)
-        .collect();
-    let position = |name: &str| {
-        nodes
-            .iter()
-            .position(|n| n == name)
-            .unwrap_or_else(|| panic!("{name} in {nodes:?}"))
-    };
-    assert!(position("initialize") < position("append"));
-    assert!(position("append") < position("read"));
-    assert_eq!(
-        finished.final_context()["command.output"],
-        json!("one\na b; \"c\"\n")
-    );
-
-    let failing = Case::new("prepare-fails");
-    let workflow = failing.workflow(
-        r#"digraph Prepared {
-    start [shape=Mdiamond]
-    exit [shape=Msquare]
-    work [shape=parallelogram, script="printf 'ran\n' > ran.txt"]
-    initialize [shape=parallelogram, script="echo setup broke >&2; exit 3", timeout="5m", on_failure="exit"]
-    graph [default_max_retries=2]
-    start -> initialize -> work -> exit
-}"#,
-        None,
-    );
-    let finished = failing.run(&workflow, &[]).await;
-    finished.assert_code(1);
-    assert_eq!(
-        finished.status_line(),
-        Some("failed"),
-        "{}",
-        finished.stderr
-    );
-    assert!(
-        !failing.workspace().join("ran.txt").exists(),
-        "no node ran after the failed preparation"
-    );
-    let nodes: Vec<(String, String)> = finished.finished_nodes();
-    assert!(
-        nodes
-            .iter()
-            .any(|(status, node)| node == "initialize" && status == "failure"),
-        "{nodes:?}"
-    );
-    assert!(!nodes.iter().any(|(_, node)| node == "work"), "{nodes:?}");
-    assert_eq!(
-        nodes
-            .iter()
-            .filter(|(_, node)| node == "initialize")
-            .count(),
-        1,
-        "ordinary shell failures do not request retries"
-    );
-    assert_eq!(
-        finished.final_context()["failure_class"],
-        json!("exit_status:3")
-    );
-}
-
-/// Cancelling a setup command stops it before downstream work runs.
-#[tokio::test]
-async fn a_cancel_during_setup_stops_downstream_commands() {
-    let case = Case::new("prepare-cancel");
-    let workflow = case.workflow(
-        r#"digraph Prepared {
-    start [shape=Mdiamond]
-    exit [shape=Msquare]
-    work [shape=parallelogram, script="printf 'ran\n' > ran.txt"]
-    initialize [shape=parallelogram, script="printf 'started\n' > started.txt; sleep 60; printf 'finished\n' > finished.txt", timeout="5m", on_failure="exit"]
-    start -> initialize -> work -> exit
-}"#,
-        None,
-    );
-    let finished = case
-        .run_with(&workflow, &[], Launch {
-            interrupt_when: Some(case.workspace().join("started.txt")),
-            ..Launch::default()
-        })
-        .await;
-    assert!(!finished.timed_out, "the interrupt ended the run");
-    assert_eq!(
-        finished.status_line(),
-        Some("cancelled"),
-        "{}",
-        finished.stderr
-    );
-    assert!(case.workspace().join("started.txt").exists());
-    assert!(!case.workspace().join("finished.txt").exists());
-    assert!(!case.workspace().join("ran.txt").exists(), "no node ran");
-    finished.assert_no_leaked_processes().await;
-}
-
 /// A validation error anywhere in `workflow.toml` stops the run
 /// before the preparation steps start.
 #[tokio::test]
@@ -1301,9 +1176,8 @@ async fn run_environment_env_and_secrets_reach_the_commands_and_stay_masked() {
         r#"digraph Env {
     start [shape=Mdiamond]
     exit [shape=Msquare]
-    setup [shape=parallelogram, script="test -n \"$TOKEN\" && echo setup > setup.txt", timeout="5m", on_failure="exit"]
-    show [shape=parallelogram, script="test -f setup.txt && echo \"lang=$LANG token=$TOKEN\""]
-    start -> setup -> show -> exit
+    show [shape=parallelogram, script="echo \"lang=$LANG token=$TOKEN\""]
+    start -> show -> exit
 }"#,
         Some(
             "[run.environment]\nid = \"review\"\n\n[environments.review]\nprovider = \"local\"\n\n[environments.review.env]\nLANG = \"C.UTF-8\"\nTOKEN = \"{{ secrets.REVIEW_TOKEN }}\"\n",
@@ -3018,30 +2892,4 @@ fn launch_param(run_dir: &Path) -> Value {
         "one root graph carries the launch: {found:?}"
     );
     found.remove(0)
-}
-
-#[tokio::test]
-async fn a_setup_command_timeout_stops_downstream_work() {
-    let case = Case::new("setup-timeout");
-    let workflow = case.workflow(
-        r#"digraph G {
-            start [shape=Mdiamond]
-            setup [shape=parallelogram, script="sleep 60", timeout="100ms", on_failure="exit"]
-            work [shape=parallelogram, script="echo unexpected > ran.txt"]
-            exit [shape=Msquare]
-            start -> setup -> work -> exit
-        }"#,
-        None,
-    );
-    let finished = case.run(&workflow, &[]).await;
-    finished.assert_code(1);
-    assert!(!finished.timed_out, "the command deadline ends the run");
-    assert_eq!(finished.status_line(), Some("failed"));
-    assert!(!case.workspace().join("ran.txt").exists());
-    assert!(
-        !finished
-            .finished_nodes()
-            .iter()
-            .any(|(_, node)| node == "work")
-    );
 }

@@ -1417,7 +1417,3 @@ a reader takes no lease. A host with a store of its own installs it with
 (workspaces, step output). `petri resume --run-dir` continues the run from this
 layout alone; `RunPaused` and `RunUnpaused` records in `coordinator.jsonl` make a
 pause durable across it.
-
-Fabro preparation settings (`run.prepare`) have been removed. See the
-[migration guide](crates/fabro/MIGRATION.md) for explicit setup command nodes
-and the compatibility policy for saved runs.

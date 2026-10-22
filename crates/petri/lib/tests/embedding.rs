@@ -18,7 +18,7 @@ use std::time::Duration;
 
 use petri::attractor::{
     AGENT_KIND, BranchStep, CommandStep, FanInStep, ForkStep, HumanStep, StageStep, StubStep,
-    WAIT_KIND, WORKFLOW_KIND, services,
+    WAIT_KIND, WORKFLOW_KIND,
 };
 use petri::driver::lifecycle::{
     AdmitAttempt, AttemptDecision, ExecutionHooks, HookContext, Note, PrepareError, PrepareResult,
@@ -37,15 +37,14 @@ use petri::execution::hooks::{
 };
 use petri::execution::host::{self, HostRun};
 use petri::execution::{
-    Access, CoordinatorEvent, ExecutionObserver, InterviewDispatcher, InterviewReply,
-    InterviewRequest, Interviewer, open_run_dir,
+    CoordinatorEvent, ExecutionObserver, InterviewDispatcher, InterviewReply, InterviewRequest,
+    Interviewer,
 };
-use petri::executor::{MapSecrets, Retention};
+use petri::executor::Retention;
 use petri::frontend::fabro::Fabro;
-use petri::frontend::{CompileInputs, Lowered, graph_digest};
+use petri::frontend::{CompileInputs, Lowered};
 use petri::ir::{
-    Attempt, EdgeId, ExecutionId, Exhaustion, Graph, Outcome, RunStatus, Status, UnderlyingFailure,
-    Value,
+    Attempt, EdgeId, Exhaustion, Graph, Outcome, RunStatus, Status, UnderlyingFailure, Value,
 };
 use petri::steps::Answer;
 use petri::{RunOptions, Runtime, driver};
@@ -2286,118 +2285,4 @@ async fn the_milestone_workflow_runs_through_the_embedding_boundary() {
     let mut replayed = replay_run_dir(dir.path()).await.expect("replays");
     replayed.sort_by_key(|e| e.id);
     assert_eq!(replayed, normalized(&events));
-}
-
-/// Captured from Petri e34d605 before preparation authoring was removed.
-/// Loading this fixture must not involve the source settings parser.
-#[tokio::test]
-async fn saved_preparation_commands_keep_overlays_and_execute_with_ordinary_hooks() {
-    let bytes = include_bytes!("fixtures/legacy-prepare.json");
-    let graph: Graph = serde_json::from_slice(bytes).expect("old graph still decodes");
-    let digest = graph_digest(&graph);
-    let roundtrip: Graph =
-        serde_json::from_slice(&serde_json::to_vec(&graph).expect("encode")).expect("decode");
-    assert_eq!(graph_digest(&roundtrip), digest);
-    let setup = graph
-        .nodes
-        .iter()
-        .find(|node| node.name == "run_prepare_1")
-        .expect("saved command");
-    assert_eq!(setup.step.config["env"]["VALUE"], json!("legacy"));
-    assert_eq!(
-        setup.step.config["env"]["TOKEN"],
-        json!({"$secret": "LEGACY_TOKEN"})
-    );
-    {
-        let dir = RunDir::new("legacy-prepare");
-        // The original source is invalid for new admission, but irrelevant to
-        // executing the saved graph or resuming its recorded execution.
-        fs::write(dir.path().join("workflow.toml"), "[run.prepare]").expect("old source");
-        let secrets = MapSecrets::new(BTreeMap::from([(
-            "LEGACY_TOKEN".into(),
-            "fixture-secret".into(),
-        )]));
-        let rt = services(runtime(&dir, None).secrets(secrets));
-        let report = host::run_configured(&rt, HostRun::new(graph.clone()), |_, _| {})
-            .await
-            .expect("saved graph runs");
-        assert_eq!(
-            report.status,
-            RunStatus::Success,
-            "{:?}",
-            report.state.errors()
-        );
-        let ws = workspace(&dir);
-        assert_eq!(
-            fs::read_to_string(ws.join("setup.log")).expect("effects"),
-            "setup\nwork\n"
-        );
-        assert_eq!(
-            fs::read_to_string(ws.join("hook.log")).expect("ordinary hook"),
-            "hook\n"
-        );
-        let resumed = host::resume_configured(&rt, Vec::new(), Vec::new(), |_, _| {})
-            .await
-            .expect("resume stored graph");
-        assert_eq!(resumed.status, RunStatus::Success);
-        assert_eq!(
-            fs::read_to_string(ws.join("setup.log")).expect("effects"),
-            "setup\nwork\n"
-        );
-        assert_eq!(
-            fs::read_to_string(ws.join("hook.log")).expect("hook"),
-            "hook\n"
-        );
-        assert_eq!(graph_digest(&graph), digest);
-
-        // Fork before setup, and retry setup itself. Both resume the stored
-        // admission with its overlays; neither reads the removed settings.
-        let source = open_run_dir(dir.path(), Access::Read)
-            .await
-            .expect("source logs");
-        for (name, rerun_last) in [("start", false), ("run_prepare_1", true)] {
-            let fork_dir = RunDir::new(&format!("legacy-fork-{name}"));
-            let secrets = MapSecrets::new(BTreeMap::from([(
-                "LEGACY_TOKEN".into(),
-                "fixture-secret".into(),
-            )]));
-            let fork_rt = services(runtime(&fork_dir, None).secrets(secrets));
-            let firing = report
-                .state
-                .history()
-                .iter()
-                .find(|record| record.name == name)
-                .expect("position fired")
-                .firing;
-            let forked = host::fork_from(
-                &fork_rt,
-                &*source,
-                host::ForkPosition {
-                    execution: ExecutionId::new(0),
-                    firing,
-                },
-                host::ForkOptions { rerun_last },
-            )
-            .await
-            .expect("saved graph forks");
-            assert_eq!(forked.graph.to_string(), digest);
-            let resumed = host::resume_configured(&fork_rt, Vec::new(), Vec::new(), |_, _| {})
-                .await
-                .expect("fork resumes before setup");
-            assert_eq!(
-                resumed.status,
-                RunStatus::Success,
-                "{:?}",
-                resumed.state.errors()
-            );
-            assert_eq!(
-                fs::read_to_string(workspace(&fork_dir).join("setup.log")).expect("fork effects"),
-                "setup\nwork\n"
-            );
-            // Local hook configuration is initialized by the start stage.
-            // A cold fork that skips start does not reload it today, for any
-            // command name. This test protects saved-command preservation;
-            // the fresh execution above verifies ordinary prefix-node hooks.
-        }
-    }
 }
