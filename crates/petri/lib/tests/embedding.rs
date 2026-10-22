@@ -18,7 +18,7 @@ use std::time::Duration;
 
 use petri::attractor::{
     AGENT_KIND, BranchStep, CommandStep, FanInStep, ForkStep, HumanStep, StageStep, StubStep,
-    WAIT_KIND, WORKFLOW_KIND,
+    WAIT_KIND, WORKFLOW_KIND, services,
 };
 use petri::driver::lifecycle::{
     AdmitAttempt, AttemptDecision, ExecutionHooks, HookContext, Note, PrepareError, PrepareResult,
@@ -37,14 +37,15 @@ use petri::execution::hooks::{
 };
 use petri::execution::host::{self, HostRun};
 use petri::execution::{
-    CoordinatorEvent, ExecutionObserver, InterviewDispatcher, InterviewReply, InterviewRequest,
-    Interviewer,
+    Access, CoordinatorEvent, ExecutionObserver, InterviewDispatcher, InterviewReply,
+    InterviewRequest, Interviewer, open_run_dir,
 };
-use petri::executor::Retention;
+use petri::executor::{MapSecrets, Retention};
 use petri::frontend::fabro::Fabro;
-use petri::frontend::{CompileInputs, Lowered};
+use petri::frontend::{CompileInputs, Lowered, graph_digest};
 use petri::ir::{
-    Attempt, EdgeId, Exhaustion, Graph, Outcome, RunStatus, Status, UnderlyingFailure, Value,
+    Attempt, EdgeId, ExecutionId, Exhaustion, Graph, Outcome, RunStatus, Status, UnderlyingFailure,
+    Value,
 };
 use petri::steps::Answer;
 use petri::{RunOptions, Runtime, driver};
@@ -2103,7 +2104,7 @@ async fn recovery_redelivers_with_stable_identities() {
 // ── Readiness item 8: the milestone workflow through the embedding boundary ──
 
 /// The intermediate milestone workflow's shape, as the embedding host sees
-/// it: `[run.prepare]` steps, real commands, scripted agents, a human
+/// it: authored setup commands, real commands, scripted agents, a human
 /// decision, a bounded `for_each` fan-out whose results a command consumes,
 /// and final file checks. The fake host pauses the fork's admission, accepts
 /// the final check's failure as a partial success, and reports a best-effort
@@ -2124,18 +2125,14 @@ async fn the_milestone_workflow_runs_through_the_embedding_boundary() {
         report [shape=parallelogram, script="cat > results.json", stdin_source="context.parallel.results"]
         check [shape=parallelogram, script="cat notes.txt results.json; echo unsigned >&2; exit 3", on_failure="exit"]
         hold [shape=parallelogram, script="echo held > held.txt"]
-        start -> plan -> edit -> gate
+        initialize [shape=parallelogram, script="printf 'draft\n' > notes.txt", timeout="5m", on_failure="exit"]
+        start -> initialize -> plan -> edit -> gate
         gate -> jobs [label="[Y] Yes"]
         gate -> hold [label="[N] No"]
         jobs -> fan -> job -> join -> report -> check -> exit
         hold -> exit
     }"#;
     let dir = RunDir::new("embed-milestone");
-    fs::write(
-        dir.path().join("workflow.toml"),
-        "[run.prepare]\n[[run.prepare.steps]]\nscript = \"printf 'draft\\\\n' > notes.txt\"\n",
-    )
-    .expect("write workflow.toml");
     let host = FakeHost::new(Script {
         pause: Some("fan"),
         accept_failure_of: Some("check"),
@@ -2171,9 +2168,9 @@ async fn the_milestone_workflow_runs_through_the_embedding_boundary() {
 
     // Setup ran as a stage before the nodes; the agents, the command edit,
     // the decision and the fan-out all left their marks.
-    assert_eq!(timeline.node("run_prepare_1").kind, "command");
+    assert_eq!(timeline.node("initialize").kind, "command");
     assert_eq!(
-        timeline.node("run_prepare_1").final_status.as_deref(),
+        timeline.node("initialize").final_status.as_deref(),
         Some("success")
     );
     assert_eq!(timeline.node("plan").kind, "agent");
@@ -2234,7 +2231,7 @@ async fn the_milestone_workflow_runs_through_the_embedding_boundary() {
     );
 
     // Transition ordering, per completed node, from the durable notes.
-    for node in ["run_prepare_1", "plan", "edit", "gate", "jobs", "report"] {
+    for node in ["initialize", "plan", "edit", "gate", "jobs", "report"] {
         assert_eq!(
             timeline.node(node).notes,
             vec![
@@ -2289,4 +2286,118 @@ async fn the_milestone_workflow_runs_through_the_embedding_boundary() {
     let mut replayed = replay_run_dir(dir.path()).await.expect("replays");
     replayed.sort_by_key(|e| e.id);
     assert_eq!(replayed, normalized(&events));
+}
+
+/// Captured from Petri e34d605 before preparation authoring was removed.
+/// Loading this fixture must not involve the source settings parser.
+#[tokio::test]
+async fn saved_preparation_commands_keep_overlays_and_execute_with_ordinary_hooks() {
+    let bytes = include_bytes!("fixtures/legacy-prepare.json");
+    let graph: Graph = serde_json::from_slice(bytes).expect("old graph still decodes");
+    let digest = graph_digest(&graph);
+    let roundtrip: Graph =
+        serde_json::from_slice(&serde_json::to_vec(&graph).expect("encode")).expect("decode");
+    assert_eq!(graph_digest(&roundtrip), digest);
+    let setup = graph
+        .nodes
+        .iter()
+        .find(|node| node.name == "run_prepare_1")
+        .expect("saved command");
+    assert_eq!(setup.step.config["env"]["VALUE"], json!("legacy"));
+    assert_eq!(
+        setup.step.config["env"]["TOKEN"],
+        json!({"$secret": "LEGACY_TOKEN"})
+    );
+    {
+        let dir = RunDir::new("legacy-prepare");
+        // The original source is invalid for new admission, but irrelevant to
+        // executing the saved graph or resuming its recorded execution.
+        fs::write(dir.path().join("workflow.toml"), "[run.prepare]").expect("old source");
+        let secrets = MapSecrets::new(BTreeMap::from([(
+            "LEGACY_TOKEN".into(),
+            "fixture-secret".into(),
+        )]));
+        let rt = services(runtime(&dir, None).secrets(secrets));
+        let report = host::run_configured(&rt, HostRun::new(graph.clone()), |_, _| {})
+            .await
+            .expect("saved graph runs");
+        assert_eq!(
+            report.status,
+            RunStatus::Success,
+            "{:?}",
+            report.state.errors()
+        );
+        let ws = workspace(&dir);
+        assert_eq!(
+            fs::read_to_string(ws.join("setup.log")).expect("effects"),
+            "setup\nwork\n"
+        );
+        assert_eq!(
+            fs::read_to_string(ws.join("hook.log")).expect("ordinary hook"),
+            "hook\n"
+        );
+        let resumed = host::resume_configured(&rt, Vec::new(), Vec::new(), |_, _| {})
+            .await
+            .expect("resume stored graph");
+        assert_eq!(resumed.status, RunStatus::Success);
+        assert_eq!(
+            fs::read_to_string(ws.join("setup.log")).expect("effects"),
+            "setup\nwork\n"
+        );
+        assert_eq!(
+            fs::read_to_string(ws.join("hook.log")).expect("hook"),
+            "hook\n"
+        );
+        assert_eq!(graph_digest(&graph), digest);
+
+        // Fork before setup, and retry setup itself. Both resume the stored
+        // admission with its overlays; neither reads the removed settings.
+        let source = open_run_dir(dir.path(), Access::Read)
+            .await
+            .expect("source logs");
+        for (name, rerun_last) in [("start", false), ("run_prepare_1", true)] {
+            let fork_dir = RunDir::new(&format!("legacy-fork-{name}"));
+            let secrets = MapSecrets::new(BTreeMap::from([(
+                "LEGACY_TOKEN".into(),
+                "fixture-secret".into(),
+            )]));
+            let fork_rt = services(runtime(&fork_dir, None).secrets(secrets));
+            let firing = report
+                .state
+                .history()
+                .iter()
+                .find(|record| record.name == name)
+                .expect("position fired")
+                .firing;
+            let forked = host::fork_from(
+                &fork_rt,
+                &*source,
+                host::ForkPosition {
+                    execution: ExecutionId::new(0),
+                    firing,
+                },
+                host::ForkOptions { rerun_last },
+            )
+            .await
+            .expect("saved graph forks");
+            assert_eq!(forked.graph.to_string(), digest);
+            let resumed = host::resume_configured(&fork_rt, Vec::new(), Vec::new(), |_, _| {})
+                .await
+                .expect("fork resumes before setup");
+            assert_eq!(
+                resumed.status,
+                RunStatus::Success,
+                "{:?}",
+                resumed.state.errors()
+            );
+            assert_eq!(
+                fs::read_to_string(workspace(&fork_dir).join("setup.log")).expect("fork effects"),
+                "setup\nwork\n"
+            );
+            assert_eq!(
+                fs::read_to_string(workspace(&fork_dir).join("hook.log")).expect("fork hooks"),
+                "hook\n"
+            );
+        }
+    }
 }

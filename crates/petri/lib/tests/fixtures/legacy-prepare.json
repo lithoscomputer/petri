@@ -1,0 +1,802 @@
+{
+  "nodes": [
+    {
+      "id": 0,
+      "name": "start",
+      "scope": 0,
+      "step": {
+        "kind": "attractor/stage",
+        "config": {
+          "node": "start",
+          "kind": "start",
+          "label": "start",
+          "workflow": "T",
+          "kv": {
+            "$expr": 0
+          },
+          "hooks": [
+            {
+              "name": "stage_start:echo hook >> hook.lo",
+              "event": "stage_start",
+              "type": "command",
+              "command": "echo hook >> hook.log",
+              "matcher": "^run_prepare_1$",
+              "source": "workflow.toml"
+            }
+          ],
+          "checkout": {
+            "enabled": true,
+            "depth": 100,
+            "repository": null
+          }
+        }
+      },
+      "join": "Any",
+      "precondition": null,
+      "routing": {
+        "groups": [
+          {
+            "policy": {
+              "Tiered": [
+                {
+                  "candidates": [
+                    {
+                      "edge": 0,
+                      "when": {
+                        "Expr": 12
+                      },
+                      "rank": 10
+                    }
+                  ],
+                  "pick": "LowestRankThenArmOrder"
+                },
+                {
+                  "candidates": [
+                    {
+                      "edge": 0,
+                      "when": {
+                        "Expr": 24
+                      },
+                      "rank": null
+                    }
+                  ],
+                  "pick": "HighestWeightThenLexical"
+                }
+              ]
+            },
+            "arms": [
+              {
+                "id": 0,
+                "to": 3,
+                "guard": {
+                  "Expr": 4
+                },
+                "map": null,
+                "back": false,
+                "weight": 0,
+                "transition": "Continue"
+              }
+            ],
+            "fallthrough": "NoEmit"
+          }
+        ]
+      },
+      "budget": {
+        "max_firings": 1,
+        "timeout": {
+          "secs": 3600,
+          "nanos": 0
+        }
+      },
+      "retry": {
+        "max_attempts": 1,
+        "backoff": {
+          "initial": {
+            "secs": 5,
+            "nanos": 0
+          },
+          "factor": 2.0,
+          "max": {
+            "secs": 60,
+            "nanos": 0
+          },
+          "jitter": true
+        },
+        "retry_on": {
+          "statuses": [],
+          "failure_classes": [
+            "retry_requested"
+          ]
+        },
+        "on_exhaustion": "Fail"
+      },
+      "run_on_cancel": false,
+      "tolerates_failure": false,
+      "splice_policy": "Deny",
+      "meta": {
+        "label": "start",
+        "shape": "Mdiamond",
+        "kind": "start",
+        "classes": [],
+        "span": {
+          "line": 2,
+          "column": 3
+        },
+        "admission_hooks": "step",
+        "edges": {
+          "0": {
+            "to": "run_prepare_1",
+            "label": null
+          }
+        }
+      },
+      "expand": null
+    },
+    {
+      "id": 1,
+      "name": "exit",
+      "scope": 0,
+      "step": {
+        "kind": "attractor/stage",
+        "config": {
+          "node": "exit",
+          "kind": "exit",
+          "label": "exit",
+          "workflow": "T",
+          "kv": {
+            "$expr": 1
+          },
+          "hooks": [
+            {
+              "name": "stage_start:echo hook >> hook.lo",
+              "event": "stage_start",
+              "type": "command",
+              "command": "echo hook >> hook.log",
+              "matcher": "^run_prepare_1$",
+              "source": "workflow.toml"
+            }
+          ]
+        }
+      },
+      "join": "Any",
+      "precondition": null,
+      "routing": {
+        "groups": []
+      },
+      "budget": {
+        "max_firings": 1,
+        "timeout": {
+          "secs": 3600,
+          "nanos": 0
+        }
+      },
+      "retry": {
+        "max_attempts": 1,
+        "backoff": {
+          "initial": {
+            "secs": 5,
+            "nanos": 0
+          },
+          "factor": 2.0,
+          "max": {
+            "secs": 60,
+            "nanos": 0
+          },
+          "jitter": true
+        },
+        "retry_on": {
+          "statuses": [],
+          "failure_classes": [
+            "retry_requested"
+          ]
+        },
+        "on_exhaustion": "Fail"
+      },
+      "run_on_cancel": false,
+      "tolerates_failure": false,
+      "splice_policy": "Deny",
+      "meta": {
+        "label": "exit",
+        "shape": "Msquare",
+        "kind": "exit",
+        "classes": [],
+        "span": {
+          "line": 3,
+          "column": 3
+        }
+      },
+      "expand": null
+    },
+    {
+      "id": 2,
+      "name": "work",
+      "scope": 0,
+      "step": {
+        "kind": "attractor/command",
+        "config": {
+          "label": "work",
+          "node": "work",
+          "goal": "",
+          "kv": {
+            "$expr": 2
+          },
+          "on_failure": "route",
+          "on_retries_exhausted": "route",
+          "language": "shell",
+          "script": "test -f setup.log && echo work >> setup.log"
+        }
+      },
+      "join": "Any",
+      "precondition": null,
+      "routing": {
+        "groups": [
+          {
+            "policy": {
+              "Tiered": [
+                {
+                  "candidates": [
+                    {
+                      "edge": 1,
+                      "when": {
+                        "Expr": 33
+                      },
+                      "rank": 31
+                    }
+                  ],
+                  "pick": "LowestRankThenArmOrder"
+                },
+                {
+                  "candidates": [
+                    {
+                      "edge": 1,
+                      "when": "Always",
+                      "rank": null
+                    }
+                  ],
+                  "pick": "HighestWeightThenLexical"
+                }
+              ]
+            },
+            "arms": [
+              {
+                "id": 1,
+                "to": 1,
+                "guard": {
+                  "Expr": 25
+                },
+                "map": null,
+                "back": false,
+                "weight": 0,
+                "transition": "Continue"
+              }
+            ],
+            "fallthrough": "NoEmit"
+          }
+        ]
+      },
+      "budget": {
+        "max_firings": 1,
+        "timeout": {
+          "secs": 600,
+          "nanos": 0
+        },
+        "timeout_policy": "handler_managed"
+      },
+      "retry": {
+        "max_attempts": 1,
+        "backoff": {
+          "initial": {
+            "secs": 5,
+            "nanos": 0
+          },
+          "factor": 2.0,
+          "max": {
+            "secs": 60,
+            "nanos": 0
+          },
+          "jitter": true
+        },
+        "retry_on": {
+          "statuses": [],
+          "failure_classes": [
+            "retry_requested"
+          ]
+        },
+        "on_exhaustion": "Fail"
+      },
+      "run_on_cancel": false,
+      "tolerates_failure": false,
+      "splice_policy": "Deny",
+      "meta": {
+        "label": "work",
+        "shape": "parallelogram",
+        "kind": "command",
+        "classes": [],
+        "span": {
+          "line": 4,
+          "column": 1
+        },
+        "script": "test -f setup.log && echo work >> setup.log",
+        "edges": {
+          "1": {
+            "to": "exit",
+            "label": null
+          }
+        }
+      },
+      "expand": null
+    },
+    {
+      "id": 3,
+      "name": "run_prepare_1",
+      "scope": 0,
+      "step": {
+        "kind": "attractor/command",
+        "config": {
+          "label": "Prepare 1",
+          "node": "run_prepare_1",
+          "goal": "",
+          "kv": {
+            "$expr": 3
+          },
+          "on_failure": "exit",
+          "on_retries_exhausted": "exit",
+          "timeout_ms": 300000,
+          "language": "shell",
+          "script": "test \"$VALUE\" = legacy && test -n \"$TOKEN\" && echo setup >> setup.log",
+          "env": {
+            "TOKEN": {
+              "$secret": "LEGACY_TOKEN"
+            },
+            "VALUE": "legacy"
+          }
+        }
+      },
+      "join": "Any",
+      "precondition": null,
+      "routing": {
+        "groups": [
+          {
+            "policy": {
+              "Tiered": [
+                {
+                  "candidates": [
+                    {
+                      "edge": 2,
+                      "when": {
+                        "Expr": 42
+                      },
+                      "rank": 40
+                    }
+                  ],
+                  "pick": "LowestRankThenArmOrder"
+                },
+                {
+                  "candidates": [
+                    {
+                      "edge": 2,
+                      "when": {
+                        "Expr": 54
+                      },
+                      "rank": null
+                    }
+                  ],
+                  "pick": "HighestWeightThenLexical"
+                }
+              ]
+            },
+            "arms": [
+              {
+                "id": 2,
+                "to": 2,
+                "guard": {
+                  "Expr": 34
+                },
+                "map": null,
+                "back": false,
+                "weight": 0,
+                "transition": "Continue"
+              }
+            ],
+            "fallthrough": "NoEmit"
+          }
+        ]
+      },
+      "budget": {
+        "max_firings": 1,
+        "timeout": {
+          "secs": 300,
+          "nanos": 0
+        },
+        "timeout_policy": "handler_managed"
+      },
+      "retry": {
+        "max_attempts": 1,
+        "backoff": {
+          "initial": {
+            "secs": 5,
+            "nanos": 0
+          },
+          "factor": 2.0,
+          "max": {
+            "secs": 60,
+            "nanos": 0
+          },
+          "jitter": true
+        },
+        "retry_on": {
+          "statuses": [],
+          "failure_classes": [
+            "retry_requested"
+          ]
+        },
+        "on_exhaustion": "Fail"
+      },
+      "run_on_cancel": false,
+      "tolerates_failure": false,
+      "splice_policy": "Deny",
+      "meta": {
+        "label": "Prepare 1",
+        "shape": "parallelogram",
+        "kind": "command",
+        "classes": [
+          "run-prepare"
+        ],
+        "span": {
+          "line": 0,
+          "column": 0
+        },
+        "script": "test \"$VALUE\" = legacy && test -n \"$TOKEN\" && echo setup >> setup.log",
+        "edges": {
+          "2": {
+            "to": "work",
+            "label": null
+          }
+        }
+      },
+      "expand": null
+    }
+  ],
+  "scopes": [
+    {
+      "id": 0,
+      "env": {
+        "VALUE": {
+          "Value": "scope"
+        }
+      },
+      "runtime": {
+        "target": "HostProcess",
+        "requirements": []
+      },
+      "workspace": "Shared"
+    }
+  ],
+  "exprs": {
+    "exprs": [
+      {
+        "Var": "kv"
+      },
+      {
+        "Var": "kv"
+      },
+      {
+        "Var": "kv"
+      },
+      {
+        "Var": "kv"
+      },
+      {
+        "Lit": true
+      },
+      {
+        "Var": "output"
+      },
+      {
+        "Field": [
+          5,
+          "suggested_next_ids"
+        ]
+      },
+      {
+        "Array": []
+      },
+      {
+        "Call": [
+          "default",
+          [
+            6,
+            7
+          ]
+        ]
+      },
+      {
+        "Lit": "run_prepare_1"
+      },
+      {
+        "Call": [
+          "index_of",
+          [
+            8,
+            9
+          ]
+        ]
+      },
+      {
+        "Lit": null
+      },
+      {
+        "Binary": [
+          "Ne",
+          10,
+          11
+        ]
+      },
+      {
+        "Var": "status"
+      },
+      {
+        "Lit": "failure"
+      },
+      {
+        "Binary": [
+          "Eq",
+          13,
+          14
+        ]
+      },
+      {
+        "Var": "status"
+      },
+      {
+        "Lit": "cancelled"
+      },
+      {
+        "Binary": [
+          "Eq",
+          16,
+          17
+        ]
+      },
+      {
+        "Binary": [
+          "Or",
+          15,
+          18
+        ]
+      },
+      {
+        "Var": "status"
+      },
+      {
+        "Lit": "timed_out"
+      },
+      {
+        "Binary": [
+          "Eq",
+          20,
+          21
+        ]
+      },
+      {
+        "Binary": [
+          "Or",
+          19,
+          22
+        ]
+      },
+      {
+        "Unary": [
+          "Not",
+          23
+        ]
+      },
+      {
+        "Lit": true
+      },
+      {
+        "Var": "output"
+      },
+      {
+        "Field": [
+          26,
+          "suggested_next_ids"
+        ]
+      },
+      {
+        "Array": []
+      },
+      {
+        "Call": [
+          "default",
+          [
+            27,
+            28
+          ]
+        ]
+      },
+      {
+        "Lit": "exit"
+      },
+      {
+        "Call": [
+          "index_of",
+          [
+            29,
+            30
+          ]
+        ]
+      },
+      {
+        "Lit": null
+      },
+      {
+        "Binary": [
+          "Ne",
+          31,
+          32
+        ]
+      },
+      {
+        "Lit": true
+      },
+      {
+        "Var": "output"
+      },
+      {
+        "Field": [
+          35,
+          "suggested_next_ids"
+        ]
+      },
+      {
+        "Array": []
+      },
+      {
+        "Call": [
+          "default",
+          [
+            36,
+            37
+          ]
+        ]
+      },
+      {
+        "Lit": "work"
+      },
+      {
+        "Call": [
+          "index_of",
+          [
+            38,
+            39
+          ]
+        ]
+      },
+      {
+        "Lit": null
+      },
+      {
+        "Binary": [
+          "Ne",
+          40,
+          41
+        ]
+      },
+      {
+        "Var": "status"
+      },
+      {
+        "Lit": "failure"
+      },
+      {
+        "Binary": [
+          "Eq",
+          43,
+          44
+        ]
+      },
+      {
+        "Var": "status"
+      },
+      {
+        "Lit": "cancelled"
+      },
+      {
+        "Binary": [
+          "Eq",
+          46,
+          47
+        ]
+      },
+      {
+        "Binary": [
+          "Or",
+          45,
+          48
+        ]
+      },
+      {
+        "Var": "status"
+      },
+      {
+        "Lit": "timed_out"
+      },
+      {
+        "Binary": [
+          "Eq",
+          50,
+          51
+        ]
+      },
+      {
+        "Binary": [
+          "Or",
+          49,
+          52
+        ]
+      },
+      {
+        "Unary": [
+          "Not",
+          53
+        ]
+      }
+    ]
+  },
+  "entry": [
+    0
+  ],
+  "policy": {
+    "stall_timeout": {
+      "secs": 1800,
+      "nanos": 0
+    },
+    "loop_restart_signature_limit": 3,
+    "max_invocations": 10000
+  },
+  "params": {
+    "attractor.hooks": [
+      {
+        "name": "stage_start:echo hook >> hook.lo",
+        "event": "stage_start",
+        "type": "command",
+        "command": "echo hook >> hook.log",
+        "matcher": "^run_prepare_1$",
+        "source": "workflow.toml"
+      }
+    ],
+    "attractor.workflow": "T",
+    "fabro.environment": {
+      "id": "local",
+      "provider": "local",
+      "image": null,
+      "env": {
+        "VALUE": "scope"
+      }
+    },
+    "fabro.launch": {
+      "dry_run": false,
+      "auto_approve": false,
+      "model": null,
+      "provider": null,
+      "default_model": null,
+      "default_provider": null,
+      "clone": {
+        "enabled": true,
+        "depth": 100,
+        "repository": null
+      },
+      "sandbox_backend": "host",
+      "cpu_cores": null,
+      "memory_mb": null,
+      "disk_mb": null
+    },
+    "goal": "",
+    "inputs": {},
+    "vars": {}
+  },
+  "completion": {
+    "TerminalNode": 1
+  }
+}

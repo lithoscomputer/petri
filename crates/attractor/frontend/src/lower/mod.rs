@@ -45,8 +45,7 @@ pub use promotion::ROUTES_KEY;
 pub use routing::{FailurePolicy, Policy};
 use serde_json::{Value, json};
 pub use settings::{
-    CloneSettings, EnvValue, Environment, ModelDefaults, ModelOverride, PREPARE_NODE_PREFIX,
-    PrepareStep, RunSettings,
+    CloneSettings, EnvValue, Environment, ModelDefaults, ModelOverride, RunSettings,
 };
 pub use skills::SkillSettings;
 use smol_str::SmolStr;
@@ -195,8 +194,6 @@ struct Ctx<'a> {
     lenient_unbound:  bool,
     /// What the run's settings ask of this lowering, resolved by the caller.
     settings:         RunSettings,
-    /// The env each synthetic prepare command node carries.
-    prepare_envs:     BTreeMap<String, BTreeMap<String, EnvValue>>,
     /// The workflow's name, `FABRO_WORKFLOW` for hooks.
     workflow_name:    String,
     /// The absolute repository root the host bound (`petri.repository`),
@@ -269,7 +266,6 @@ fn lower_nested(
         stack,
         lenient_unbound: inputs.unbound_is_warning,
         settings,
-        prepare_envs: BTreeMap::new(),
         workflow_name: workflow.name.clone(),
         repository,
         styled: HashSet::new(),
@@ -282,14 +278,6 @@ fn lower_nested(
         return Lowered::rejected(ctx.diags);
     };
     if ctx.stack.len() == 1 {
-        let span = Span::file(&ctx.settings_path());
-        ctx.prepare_envs = settings::insert_prepare_nodes(
-            &mut workflow,
-            &structure.start,
-            &ctx.settings,
-            &span,
-            &mut ctx.diags,
-        );
         ctx.environment_scope();
     }
     // Pass 1: one node record each, in declaration order.
@@ -480,16 +468,6 @@ impl Ctx<'_> {
                 )
                 .with_hint(hint),
             );
-        }
-    }
-
-    /// The settings file beside the root workflow, for the spans of what
-    /// the settings put into the graph (Fabro's `workflow.toml`).
-    fn settings_path(&self) -> String {
-        if self.base_dir.is_empty() {
-            "workflow.toml".to_string()
-        } else {
-            format!("{}/workflow.toml", self.base_dir)
         }
     }
 

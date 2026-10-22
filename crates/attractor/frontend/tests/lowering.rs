@@ -1948,7 +1948,7 @@ fn attractor_lowers_the_same_graph_beside_fabro_settings_files() {
         !beside
             .nodes
             .iter()
-            .any(|n| n.name.starts_with(frontend_attractor::PREPARE_NODE_PREFIX)),
+            .any(|n| n.name.starts_with("run_prepare_")),
         "no prepare node"
     );
     assert_eq!(beside.params["attractor.hooks"], json!([]));

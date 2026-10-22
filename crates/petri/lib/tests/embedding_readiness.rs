@@ -261,7 +261,10 @@ fn workflow(model: &str) -> String {
     finish_docs [prompt="Finish the docs page.", model="{model}", provider="openai", fidelity="full", thread_id="docs", on_failure="exit"]
     hold [shape=parallelogram, script="echo held > decision.txt"]
     check [shape=parallelogram, script="cat notes.txt note.txt CHANGELOG.md results.json f5.txt tool-hooks.log"]
-    start -> plan -> write -> delegate -> gate
+    initialize [shape=parallelogram, script="git init -q && printf 'draft\n' > notes.txt && printf 'keep\n' > protected.txt && printf '{MEMORY_RULE}\n' > AGENTS.md", timeout="30s", on_failure="exit"]
+    skill [shape=parallelogram, script="mkdir -p skills/sign && printf '%s\n' '---' 'name: sign' 'description: Sign the release note' '---' 'SIGN INSTRUCTIONS: append the line -- petri to notes.txt with the shell tool, then report SIGNED.' > skills/sign/SKILL.md", timeout="30s", on_failure="exit"]
+    repository [shape=parallelogram, script="git add -A && git -c commit.gpgsign=false -c core.hooksPath=/dev/null -c user.name=petri -c user.email=petri@example.invalid commit -qm base && git init -q --bare \"$TEST_REMOTE\" && git remote add origin \"$TEST_REMOTE\" && echo prepared", timeout="30s", on_failure="exit"]
+    start -> initialize -> skill -> repository -> plan -> write -> delegate -> gate
     gate -> jobs [label="[Y] Yes"]
     gate -> hold [label="[N] No"]
     jobs -> fan -> job -> join -> report -> polish -> review -> draft_docs -> finish_docs -> check -> exit
@@ -290,17 +293,12 @@ fn workflow_toml(run_dir: &Path, remote: &Path, mcp_log: &Path) -> String {
 [run.model.fallbacks]
 "gpt-5.6-sol" = ["anthropic:claude-sonnet-5"]
 
-[run.prepare]
-timeout = "30s"
-
-[[run.prepare.steps]]
-script = 'git init -q && printf "draft\n" > notes.txt && printf "keep\n" > protected.txt && printf "{memory}\n" > AGENTS.md'
-
-[[run.prepare.steps]]
-script = 'mkdir -p skills/sign && printf "%s\n" "---" "name: sign" "description: Sign the release note" "---" "SIGN INSTRUCTIONS: append the line -- petri to notes.txt with the shell tool, then report SIGNED." > skills/sign/SKILL.md'
-
-[[run.prepare.steps]]
-script = 'git add -A && git -c commit.gpgsign=false -c core.hooksPath=/dev/null -c user.name=petri -c user.email=petri@example.invalid commit -qm base && git init -q --bare "{remote}" && git remote add origin "{remote}" && echo prepared'
+[environments.default]
+provider = "local"
+[run.environment]
+id = "default"
+[run.environment.env]
+TEST_REMOTE = {remote:?}
 
 [run.agent.mcps.notes]
 type = "stdio"
@@ -333,8 +331,7 @@ script = "echo run_complete >> run-end.log"
 event = "sandbox_cleanup"
 script = "echo sandbox_cleanup >> run-end.log"
 "#,
-        memory = MEMORY_RULE,
-        remote = remote.display(),
+        remote = remote.display().to_string(),
         mcp_log = mcp_log.display().to_string(),
     )
 }
@@ -1009,9 +1006,9 @@ async fn the_combined_workflow_runs_through_the_embedding_boundary() {
     let projected = project(&events);
     assert_eq!(projected.run_status, Some(RunStatus::Success));
     for node in [
-        "run_prepare_1",
-        "run_prepare_2",
-        "run_prepare_3",
+        "initialize",
+        "skill",
+        "repository",
         "plan",
         "write",
         "delegate",

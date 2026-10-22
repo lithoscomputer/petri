@@ -78,8 +78,8 @@ pub struct CommandConfig {
     pub explicit_routes:      Option<ExplicitRoutes>,
     #[serde(default)]
     pub timeout_ms:           Option<u64>,
-    /// Environment for the process: `[run.prepare]` step env and the
-    /// environment's secret values, resolved at spawn.
+    /// Environment overlays for this process, including secret references
+    /// resolved at spawn. Saved graphs retain their encoded overlays.
     #[serde(default)]
     pub env:                  BTreeMap<SmolStr, ValueOrSecretRef>,
     /// The run context at spawn, resolved by the engine.

@@ -147,7 +147,7 @@ fn workflow_toml_sections_warn_or_reject_and_never_pass_silently() {
     assert_eq!(
         codes("[run.prepare]\nsteps = [{ script = \"a\", command = [\"b\"] }]\n"),
         ["unsupported.workflow_toml.run.prepare"],
-        "exactly one of script or command"
+        "preparation settings are removed"
     );
     // A hook whose event Fabro does not know is a specific error; a good one
     // loads (see `hooks_load_from_every_layer_and_merge_by_id`).
@@ -269,9 +269,9 @@ fn workflow_engine_is_a_known_key_and_unknown_workflow_keys_are_refused() {
 
 /// `[run.environment]` maps the provider onto the launch settings the CLI
 /// reads, the image onto the scope's container target, and literal env onto
-/// the scope env; `[run.prepare]` steps become the first command nodes.
+/// the scope env; authored setup commands receive workflow secret references.
 #[test]
-fn run_environment_and_prepare_lower_onto_the_scope_and_the_graph() {
+fn run_environment_and_setup_commands_lower_onto_the_scope_and_the_graph() {
     let files = files(&[(
         "wf/workflow.toml",
         "[run]\ngoal = \"Fix {{ inputs.target }}\"\n[run.inputs]\ntarget = \"main\"\n\
@@ -283,17 +283,16 @@ fn run_environment_and_prepare_lower_onto_the_scope_and_the_graph() {
          [environments.review]\nprovider = \"docker\"\n[environments.review.image]\n\
          docker = \"ghcr.io/acme/review:1\"\n[environments.review.resources]\ncpu = 4\n\
          [environments.review.env]\nLANG = \"C.UTF-8\"\nOVERRIDE = \"base\"\n\
-         TOKEN = \"{{ secrets.REVIEW_TOKEN }}\"\n\
-         [run.prepare]\ntimeout = \"30s\"\n[[run.prepare.steps]]\nscript = \"make deps\"\n\
-         [[run.prepare.steps]]\ncommand = [\"sh\", \"-c\", \"echo {{ inputs.target }}\"]\n\
-         env = { STEP = \"two\" }\n",
+         TOKEN = \"{{ secrets.REVIEW_TOKEN }}\"\n",
     )]);
     let lowered = load(
         "wf/workflow.fabro",
         &dot(r#"
             a [prompt="x"]
             c [shape=parallelogram, script="true"]
-            start -> a -> c -> exit
+            install [shape=parallelogram, script="make deps", timeout="30s", on_failure="exit"]
+            setup [shape=parallelogram, script="STEP=two sh -c 'echo {{ inputs.target }}'", timeout="30s", on_failure="exit"]
+            start -> install -> setup -> a -> c -> exit
         "#),
         &files,
         &CompileInputs::new(),
@@ -351,39 +350,22 @@ fn run_environment_and_prepare_lower_onto_the_scope_and_the_graph() {
         a["fallbacks"],
         json!({ "gpt-5.6-sol": ["anthropic:claude-opus", "openrouter:kimi-k3"] })
     );
-    // Prepare steps: first after start, in order, with env, timeout, exit.
-    assert_eq!(tiers(&graph, "start")[0].1[0].0, "run_prepare_1");
-    assert_eq!(tiers(&graph, "run_prepare_1")[0].1[0].0, "run_prepare_2");
-    assert_eq!(tiers(&graph, "run_prepare_2")[0].1[0].0, "a");
-    let two = node(&graph, "run_prepare_2");
+    // Authored setup: first after start, in order, with timeout and exit policy.
+    assert_eq!(tiers(&graph, "start")[0].1[0].0, "install");
+    assert_eq!(tiers(&graph, "install")[0].1[0].0, "setup");
+    assert_eq!(tiers(&graph, "setup")[0].1[0].0, "a");
+    let two = node(&graph, "setup");
     assert_eq!(two.step.kind, COMMAND_KIND);
-    assert_eq!(two.step.config["script"], json!("sh -c 'echo main'"));
-    assert_eq!(two.step.config["env"]["STEP"], json!("two"));
+    assert_eq!(
+        two.step.config["script"],
+        json!("STEP=two sh -c 'echo main'")
+    );
     assert_eq!(
         two.step.config["env"]["TOKEN"],
         json!({ "$secret": "REVIEW_TOKEN" })
     );
     assert_eq!(two.step.config["on_failure"], json!("exit"));
     assert_eq!(two.budget.timeout, Duration::from_secs(30));
-    assert_eq!(two.meta["classes"], json!(["run-prepare"]));
-    // A reserved id is refused.
-    let clash = load(
-        "wf/workflow.fabro",
-        &dot(r#"
-            run_prepare_1 [prompt="x"]
-            start -> run_prepare_1 -> exit
-        "#),
-        &files,
-        &CompileInputs::new(),
-    );
-    assert!(
-        clash
-            .diagnostics
-            .iter()
-            .any(|d| d.code == "attractor.reserved_node_id"),
-        "{:?}",
-        clash.diagnostics
-    );
 }
 
 /// `[run.model.fallbacks]` rides on the `start` node as written, beside
@@ -458,12 +440,16 @@ fn an_unparseable_workflow_toml_that_configures_hooks_is_an_error() {
         .iter()
         .map(|d| d.code.to_string())
         .collect();
-    assert!(codes.contains(&"fabro.hooks.toml".to_string()), "{codes:?}");
+    assert!(
+        codes.contains(&"fabro.settings.toml".to_string()),
+        "{codes:?}"
+    );
     assert!(
         lowered.graph.is_none(),
         "a hook that cannot be read is never skipped silently"
     );
-    // The same broken file without hooks stays a warning.
+    // Invalid settings are rejected even without hooks; they cannot hide removed
+    // fields.
     let plain = self::files(&[("wf/workflow.toml", "[run]\ngoal = \"bad \\( escape\"\n")]);
     let lowered = load(
         "wf/workflow.fabro",
@@ -474,12 +460,12 @@ fn an_unparseable_workflow_toml_that_configures_hooks_is_an_error() {
         &plain,
         &CompileInputs::new(),
     );
-    assert!(lowered.graph.is_some(), "{:?}", lowered.diagnostics);
+    assert!(lowered.graph.is_none(), "{:?}", lowered.diagnostics);
     assert!(
         lowered
             .diagnostics
             .iter()
-            .any(|d| d.code == "fabro.workflow_toml")
+            .any(|d| d.code == "fabro.settings.toml")
     );
 }
 

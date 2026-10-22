@@ -745,24 +745,24 @@ async fn a_sandbox_server_in_a_docker_scope_is_reached_through_the_plugins_forwa
     let twin = Twin::start(provider, &case.root.join("twins"), scripts).await;
     case.redirect(&twin);
     // The container's workspace starts empty and nothing on the host mirrors
-    // it, so a prepare step writes the scripted server into it first.
+    // it, so a setup command writes the scripted server into it first.
     let script = fs::read_to_string(server_script()).expect("the scripted server is readable");
-    assert!(
-        !script.contains("'''") && !script.lines().any(|line| line == "PETRI_MCP_SERVER"),
-        "the script embeds as a TOML literal and a heredoc"
-    );
-    let toml = format!(
-        "[[run.prepare.steps]]\nscript = '''cat > mcp_server.py <<'PETRI_MCP_SERVER'\n{}\nPETRI_MCP_SERVER\n'''\n\n[run.agent.mcps.scoped]\ntype = \"sandbox\"\ncommand = [\"python3\", \"mcp_server.py\", \"--http\", \"8765\"]\nport = 8765\nenv = {{ MCP_TEST_LOG = \"mcp.log\" }}\nstartup_timeout = \"60s\"\n",
+    assert!(!script.lines().any(|line| line == "PETRI_MCP_SERVER"));
+    let setup = serde_json::to_string(&format!(
+        "cat > mcp_server.py <<'PETRI_MCP_SERVER'\n{}\nPETRI_MCP_SERVER\n",
         script.trim_end()
-    );
+    ))
+    .expect("quote the setup script for DOT");
+    let toml = "[run.agent.mcps.scoped]\ntype = \"sandbox\"\ncommand = [\"python3\", \"mcp_server.py\", \"--http\", \"8765\"]\nport = 8765\nenv = { MCP_TEST_LOG = \"mcp.log\" }\nstartup_timeout = \"60s\"\n";
     let workflow = case.workflow(
         &agent_workflow(
             provider,
             "",
-            r#"verify [shape=parallelogram, script="cat note.txt; cat mcp.log"]
-    start -> agent -> verify -> exit"#,
+            &format!(r#"install_server [shape=parallelogram, script={setup}, timeout="5m", on_failure="exit"]
+    verify [shape=parallelogram, script="cat note.txt; cat mcp.log"]
+    start -> install_server -> agent -> verify -> exit"#),
         ),
-        Some(&toml),
+        Some(toml),
     );
     let finished = case.run(&workflow, &["--retain", "never"]).await;
     finished.assert_code(0);

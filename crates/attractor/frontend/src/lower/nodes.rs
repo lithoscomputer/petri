@@ -563,12 +563,7 @@ impl Ctx<'_> {
                 format!("command node `{}` needs a `script`", node.id),
             ),
         }
-        let mut env = self.workflow_secret_env();
-        if let Some(prepare_env) = self.prepare_envs.get(&node.id) {
-            for (key, value) in prepare_env {
-                env.insert(key.clone(), value.to_json());
-            }
-        }
+        let env = self.workflow_secret_env();
         if !env.is_empty() {
             config.insert("env".into(), Value::Object(env));
         }

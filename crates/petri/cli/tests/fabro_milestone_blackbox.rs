@@ -1,5 +1,5 @@
 //! Readiness item 8, the intermediate workflow execution milestone, through
-//! the shipped binary: one workflow combining `[run.prepare]`, real commands,
+//! the shipped binary: one workflow combining setup commands, real commands,
 //! a scripted native agent that edits a file, a retained thread across two
 //! `full` fidelity agent nodes, project memory from the workspace, a
 //! configured tool hook that blocks one effect and lets another through, a
@@ -41,7 +41,9 @@ fn workflow(model: &str, tail: &str) -> String {
     report [shape=parallelogram, script="cat > results.json", stdin_source="context.parallel.results"]
     hold [shape=parallelogram, script="echo held > decision.txt"]
     {tail}
-    start -> plan -> write -> gate
+    initialize [shape=parallelogram, script="printf 'draft\n' > notes.txt && printf 'keep\n' > protected.txt", timeout="30s", on_failure="exit"]
+    memory [shape=parallelogram, script="printf 'Always sign release notes with -- petri\n' > AGENTS.md", timeout="30s", on_failure="exit"]
+    start -> initialize -> memory -> plan -> write -> gate
     gate -> jobs [label="[Y] Yes"]
     gate -> hold [label="[N] No"]
     jobs -> fan -> job -> join -> report
@@ -51,15 +53,6 @@ fn workflow(model: &str, tail: &str) -> String {
 }
 
 const WORKFLOW_TOML: &str = r#"
-[run.prepare]
-timeout = "30s"
-
-[[run.prepare.steps]]
-script = "printf 'draft\n' > notes.txt && printf 'keep\n' > protected.txt"
-
-[[run.prepare.steps]]
-script = "printf 'Always sign release notes with -- petri\n' > AGENTS.md"
-
 [[run.hooks]]
 name = "no-destruction"
 event = "pre_tool_use"
@@ -183,7 +176,7 @@ fn assert_agent_phases(case: &Case, twin: &Twin, finished: &Finished) {
     let first = serde_json::to_string(&requests[0]).expect("json");
     assert!(
         first.contains(MEMORY_RULE),
-        "project memory (AGENTS.md written by run.prepare) reaches the first request: {first}"
+        "project memory (AGENTS.md written by setup) reaches the first request: {first}"
     );
     let second = serde_json::to_string(&requests[1]).expect("json");
     assert!(
@@ -204,7 +197,7 @@ fn assert_agent_phases(case: &Case, twin: &Twin, finished: &Finished) {
     assert_eq!(
         read(&workspace.join("notes.txt")),
         "draft\nreviewed -- petri\n",
-        "run.prepare wrote the draft, the agent appended through the allowed tool"
+        "setup wrote the draft, the agent appended through the allowed tool"
     );
     assert_eq!(
         read(&workspace.join("tool-hooks.log")),
@@ -274,7 +267,7 @@ async fn the_milestone_workflow_runs_end_to_end_through_the_binary() {
         "{nodes:?}"
     );
     assert!(
-        nodes.contains(&"run_prepare_1".to_owned()) && nodes.contains(&"run_prepare_2".to_owned()),
+        nodes.contains(&"initialize".to_owned()) && nodes.contains(&"memory".to_owned()),
         "the preparation steps ran as stages: {nodes:?}"
     );
 

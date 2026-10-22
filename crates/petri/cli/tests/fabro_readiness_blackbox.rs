@@ -6,7 +6,7 @@
 //! downstream, a compaction, and a later node that reuses the compacted
 //! thread. A second thread (`docs`) fails over from the OpenAI twin to the
 //! Anthropic twin on its first node and continues on that route on its
-//! second. `[run.prepare]` makes the workspace a Git repository with a local
+//! second. Setup commands make the workspace a Git repository with a local
 //! bare remote, so the run's absence of platform Git operations is a fact the
 //! repository itself shows afterwards. Provider twins on loopback, the
 //! scripted `mcp_server.py`, real shell tools, a scripted human answer; no
@@ -74,7 +74,10 @@ fn workflow(model: &str, tail: &str) -> String {
     finish_docs [prompt="Finish the docs page.", model="{model}", provider="openai", fidelity="full", thread_id="docs", on_failure="exit"]
     hold [shape=parallelogram, script="echo held > decision.txt"]
     {tail}
-    start -> plan -> write -> delegate -> gate
+    initialize [shape=parallelogram, script="git init -q && printf 'draft\n' > notes.txt && printf 'keep\n' > protected.txt && printf '{MEMORY_RULE}\n' > AGENTS.md", timeout="30s", on_failure="exit"]
+    skill [shape=parallelogram, script="mkdir -p skills/sign && printf '%s\n' '---' 'name: sign' 'description: Sign the release note' '---' 'SIGN INSTRUCTIONS: append the line -- petri to notes.txt with the shell tool, then report SIGNED.' > skills/sign/SKILL.md", timeout="30s", on_failure="exit"]
+    repository [shape=parallelogram, script="git add -A && git -c commit.gpgsign=false -c core.hooksPath=/dev/null -c user.name=petri -c user.email=petri@example.invalid commit -qm base && git init -q --bare \"$TEST_REMOTE\" && git remote add origin \"$TEST_REMOTE\" && echo prepared", timeout="30s", on_failure="exit"]
+    start -> initialize -> skill -> repository -> plan -> write -> delegate -> gate
     gate -> jobs [label="[Y] Yes"]
     gate -> hold [label="[N] No"]
     jobs -> fan -> job -> join -> report -> polish -> review -> draft_docs -> finish_docs
@@ -91,9 +94,8 @@ fn server_script() -> PathBuf {
         .expect("the scripted MCP server exists")
 }
 
-/// `workflow.toml`: the fallback chain, the preparation that builds the
-/// repository, the memory file and the skill, the MCP server, the hooks
-/// (one blocks destructive shell commands, one blocks MCP writes to the
+/// `workflow.toml`: the fallback chain, the setup remote, the MCP server, the
+/// hooks (one blocks destructive shell commands, one blocks MCP writes to the
 /// protected file, one logs every tool that ran), and the run-end hooks.
 fn workflow_toml(case: &Case, remote: &Path, mcp_log: &Path) -> String {
     let command = serde_json::to_string(&[
@@ -108,17 +110,12 @@ fn workflow_toml(case: &Case, remote: &Path, mcp_log: &Path) -> String {
 [run.model.fallbacks]
 "gpt-5.6-sol" = ["anthropic:claude-sonnet-5"]
 
-[run.prepare]
-timeout = "30s"
-
-[[run.prepare.steps]]
-script = 'git init -q && printf "draft\n" > notes.txt && printf "keep\n" > protected.txt && printf "{memory}\n" > AGENTS.md'
-
-[[run.prepare.steps]]
-script = 'mkdir -p skills/sign && printf "%s\n" "---" "name: sign" "description: Sign the release note" "---" "SIGN INSTRUCTIONS: append the line -- petri to notes.txt with the shell tool, then report SIGNED." > skills/sign/SKILL.md'
-
-[[run.prepare.steps]]
-script = 'git add -A && git -c commit.gpgsign=false -c core.hooksPath=/dev/null -c user.name=petri -c user.email=petri@example.invalid commit -qm base && git init -q --bare "{remote}" && git remote add origin "{remote}" && echo prepared'
+[environments.default]
+provider = "local"
+[run.environment]
+id = "default"
+[run.environment.env]
+TEST_REMOTE = {remote:?}
 
 [run.agent.mcps.notes]
 type = "stdio"
@@ -155,8 +152,7 @@ script = "echo run_failed >> run-end.log"
 event = "sandbox_cleanup"
 script = "echo sandbox_cleanup >> run-end.log"
 "#,
-        memory = MEMORY_RULE,
-        remote = remote.display(),
+        remote = remote.display().to_string(),
         mcp_log = mcp_log.display().to_string(),
     )
 }
@@ -547,7 +543,7 @@ fn assert_common_phases(setup: &Setup, finished: &Finished) {
         "the skill body reached the model: {}",
         requests[1]
     );
-    // Project memory written by `[run.prepare]` reaches the first request.
+    // Project memory written by setup commands reaches the first request.
     assert!(requests[0].contains(MEMORY_RULE), "{}", requests[0]);
     // The thread: the write continues the plan's conversation.
     assert!(
@@ -714,7 +710,7 @@ fn assert_common_phases(setup: &Setup, finished: &Finished) {
     );
 }
 
-/// No platform Git operation happened: the repository `[run.prepare]` built
+/// No platform Git operation happened: the repository setup commands built
 /// still has its one commit and a dirty working tree, no tag, and the local
 /// remote received nothing.
 fn assert_no_platform_git_operations(setup: &Setup) {

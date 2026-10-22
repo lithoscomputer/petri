@@ -1134,22 +1134,21 @@ async fn run_model_defaults_reach_openrouter_through_chat_completions() {
     twin.stop();
 }
 
-/// Task 7: `[run.prepare]` steps run in the selected environment before any
-/// node, in order, with their `env`; a node then sees their effect. A failing
-/// step ends the run before the first node runs.
+/// Setup commands run in order in the selected environment. A failure ends
+/// the run before downstream work, even with a nonzero graph retry default.
 #[tokio::test]
-async fn run_prepare_steps_run_before_the_nodes_and_a_failure_stops_the_run() {
+async fn setup_commands_run_in_order_and_a_failure_stops_the_run() {
     let case = Case::new("prepare");
     let workflow = case.workflow(
         r#"digraph Prepared {
     start [shape=Mdiamond]
     exit [shape=Msquare]
     read [shape=parallelogram, script="cat prepared.txt"]
-    start -> read -> exit
+    initialize [shape=parallelogram, script="printf 'one\n' > prepared.txt", timeout="30s", on_failure="exit"]
+    append [shape=parallelogram, script="TAG='a b; \"c\"'; printf '%s\n' \"$TAG\" >> prepared.txt", timeout="30s", on_failure="exit"]
+    start -> initialize -> append -> read -> exit
 }"#,
-        Some(
-            "[run.prepare]\ntimeout = \"30s\"\n\n[[run.prepare.steps]]\nscript = \"printf 'one\\\\n' > prepared.txt\"\n\n[[run.prepare.steps]]\ncommand = [\"sh\", \"-c\", \"printf \\\"$TAG\\\\n\\\" >> prepared.txt\"]\nenv = { TAG = \"two\" }\n",
-        ),
+        None,
     );
     let finished = case.run(&workflow, &[]).await;
     finished.assert_code(0);
@@ -1161,7 +1160,7 @@ async fn run_prepare_steps_run_before_the_nodes_and_a_failure_stops_the_run() {
     );
     assert_eq!(
         fs::read_to_string(case.workspace().join("prepared.txt")).expect("prepared.txt"),
-        "one\ntwo\n"
+        "one\na b; \"c\"\n"
     );
     let nodes: Vec<String> = finished
         .finished_nodes()
@@ -1174,11 +1173,11 @@ async fn run_prepare_steps_run_before_the_nodes_and_a_failure_stops_the_run() {
             .position(|n| n == name)
             .unwrap_or_else(|| panic!("{name} in {nodes:?}"))
     };
-    assert!(position("run_prepare_1") < position("run_prepare_2"));
-    assert!(position("run_prepare_2") < position("read"));
+    assert!(position("initialize") < position("append"));
+    assert!(position("append") < position("read"));
     assert_eq!(
         finished.final_context()["command.output"],
-        json!("one\ntwo\n")
+        json!("one\na b; \"c\"\n")
     );
 
     let failing = Case::new("prepare-fails");
@@ -1187,9 +1186,11 @@ async fn run_prepare_steps_run_before_the_nodes_and_a_failure_stops_the_run() {
     start [shape=Mdiamond]
     exit [shape=Msquare]
     work [shape=parallelogram, script="printf 'ran\n' > ran.txt"]
-    start -> work -> exit
+    initialize [shape=parallelogram, script="echo setup broke >&2; exit 3", timeout="5m", on_failure="exit"]
+    graph [default_max_retries=2]
+    start -> initialize -> work -> exit
 }"#,
-        Some("[[run.prepare.steps]]\nscript = \"echo setup broke >&2; exit 3\"\n"),
+        None,
     );
     let finished = failing.run(&workflow, &[]).await;
     finished.assert_code(1);
@@ -1207,29 +1208,37 @@ async fn run_prepare_steps_run_before_the_nodes_and_a_failure_stops_the_run() {
     assert!(
         nodes
             .iter()
-            .any(|(status, node)| node == "run_prepare_1" && status == "failure"),
+            .any(|(status, node)| node == "initialize" && status == "failure"),
         "{nodes:?}"
     );
     assert!(!nodes.iter().any(|(_, node)| node == "work"), "{nodes:?}");
+    assert_eq!(
+        nodes
+            .iter()
+            .filter(|(_, node)| node == "initialize")
+            .count(),
+        1,
+        "ordinary shell failures do not request retries"
+    );
     assert_eq!(
         finished.final_context()["failure_class"],
         json!("exit_status:3")
     );
 }
 
-/// Task 7: a cancel during `[run.prepare]` stops the preparation and the run
-/// ends cancelled with no node run.
+/// Cancelling a setup command stops it before downstream work runs.
 #[tokio::test]
-async fn a_cancel_during_run_prepare_stops_the_run_before_any_node() {
+async fn a_cancel_during_setup_stops_downstream_commands() {
     let case = Case::new("prepare-cancel");
     let workflow = case.workflow(
         r#"digraph Prepared {
     start [shape=Mdiamond]
     exit [shape=Msquare]
     work [shape=parallelogram, script="printf 'ran\n' > ran.txt"]
-    start -> work -> exit
+    initialize [shape=parallelogram, script="printf 'started\n' > started.txt; sleep 60; printf 'finished\n' > finished.txt", timeout="5m", on_failure="exit"]
+    start -> initialize -> work -> exit
 }"#,
-        Some("[[run.prepare.steps]]\nscript = \"printf 'started\\\\n' > started.txt; sleep 60; printf 'finished\\\\n' > finished.txt\"\n"),
+        None,
     );
     let finished = case
         .run_with(&workflow, &[], Launch {
@@ -1250,7 +1259,7 @@ async fn a_cancel_during_run_prepare_stops_the_run_before_any_node() {
     finished.assert_no_leaked_processes().await;
 }
 
-/// Task 7: a validation error anywhere in `workflow.toml` stops the run
+/// A validation error anywhere in `workflow.toml` stops the run
 /// before the preparation steps start.
 #[tokio::test]
 async fn the_complete_configuration_is_validated_before_preparation_starts() {
@@ -1260,10 +1269,11 @@ async fn the_complete_configuration_is_validated_before_preparation_starts() {
     start [shape=Mdiamond]
     exit [shape=Msquare]
     work [shape=parallelogram, script="true"]
-    start -> work -> exit
+    initialize [shape=parallelogram, script="printf 'prepared\n' > prepared.txt", timeout="5m", on_failure="exit"]
+    start -> initialize -> work -> exit
 }"#,
         Some(
-            "[[run.prepare.steps]]\nscript = \"printf 'prepared\\\\n' > prepared.txt\"\n\n[run.environment]\nid = \"missing\"\n",
+            "[run.environment]\nid = \"missing\"\n",
         ),
     );
     let finished = case.run(&workflow, &[]).await;
@@ -1291,8 +1301,9 @@ async fn run_environment_env_and_secrets_reach_the_commands_and_stay_masked() {
         r#"digraph Env {
     start [shape=Mdiamond]
     exit [shape=Msquare]
-    show [shape=parallelogram, script="echo \"lang=$LANG token=$TOKEN\""]
-    start -> show -> exit
+    setup [shape=parallelogram, script="test -n \"$TOKEN\" && echo setup > setup.txt", timeout="5m", on_failure="exit"]
+    show [shape=parallelogram, script="test -f setup.txt && echo \"lang=$LANG token=$TOKEN\""]
+    start -> setup -> show -> exit
 }"#,
         Some(
             "[run.environment]\nid = \"review\"\n\n[environments.review]\nprovider = \"local\"\n\n[environments.review.env]\nLANG = \"C.UTF-8\"\nTOKEN = \"{{ secrets.REVIEW_TOKEN }}\"\n",
@@ -3007,4 +3018,30 @@ fn launch_param(run_dir: &Path) -> Value {
         "one root graph carries the launch: {found:?}"
     );
     found.remove(0)
+}
+
+#[tokio::test]
+async fn a_setup_command_timeout_stops_downstream_work() {
+    let case = Case::new("setup-timeout");
+    let workflow = case.workflow(
+        r#"digraph G {
+            start [shape=Mdiamond]
+            setup [shape=parallelogram, script="sleep 60", timeout="100ms", on_failure="exit"]
+            work [shape=parallelogram, script="echo unexpected > ran.txt"]
+            exit [shape=Msquare]
+            start -> setup -> work -> exit
+        }"#,
+        None,
+    );
+    let finished = case.run(&workflow, &[]).await;
+    finished.assert_code(1);
+    assert!(!finished.timed_out, "the command deadline ends the run");
+    assert_eq!(finished.status_line(), Some("failed"));
+    assert!(!case.workspace().join("ran.txt").exists());
+    assert!(
+        !finished
+            .finished_nodes()
+            .iter()
+            .any(|(_, node)| node == "work")
+    );
 }
