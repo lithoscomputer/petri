@@ -6,7 +6,7 @@ use std::time::Duration;
 
 use frontend::{CompileInputs, Frontend, Lowered};
 use frontend_attractor::kinds::COMMAND_KIND;
-use frontend_fabro::Fabro;
+use frontend_fabro::{Fabro, SETTINGS_FILE};
 use serde_json::json;
 use support::{dot, files, node, tiers};
 
@@ -29,8 +29,8 @@ fn lower(server: Option<&str>, workflow: Option<&str>, inputs: &CompileInputs) -
         )
 }
 
-fn graph(server: Option<&str>, workflow: Option<&str>) -> ir::Graph {
-    let lowered = lower(server, workflow, &CompileInputs::new());
+fn graph(server: Option<&str>, workflow: Option<&str>, inputs: &CompileInputs) -> ir::Graph {
+    let lowered = lower(server, workflow, inputs);
     assert!(
         !lowered.diagnostics.has_errors(),
         "{:?}",
@@ -50,9 +50,13 @@ fn prepare_count(graph: &ir::Graph) -> usize {
 #[test]
 fn server_preparation_runs_before_work_with_or_without_workflow_settings() {
     for workflow in [None, Some("[run.inputs]\nmode = 'fast'")] {
-        let graph = graph(Some(SERVER_PREPARE), workflow);
-        assert_eq!(prepare_count(&graph), 2);
-        assert_eq!(tiers(&graph, "start")[0].1[0].0, "run_prepare_1");
+        let graph = graph(Some(SERVER_PREPARE), workflow, &CompileInputs::new());
+        assert_eq!(prepare_count(&graph), 2, "{workflow:?}");
+        assert_eq!(
+            tiers(&graph, "start")[0].1[0].0,
+            "run_prepare_1",
+            "{workflow:?}"
+        );
         assert_eq!(tiers(&graph, "run_prepare_1")[0].1[0].0, "run_prepare_2");
         assert_eq!(tiers(&graph, "run_prepare_2")[0].1[0].0, "a");
         for (name, script) in [
@@ -73,13 +77,17 @@ fn workflow_preparation_replaces_server_steps_and_timeout() {
     for (timeout, expected) in [("timeout = '41s'", 41), ("", 300)] {
         let workflow =
             format!("[run.prepare]\n{timeout}\nsteps = [{{ script = 'echo workflow' }}]");
-        let graph = graph(Some(SERVER_PREPARE), Some(&workflow));
-        assert_eq!(prepare_count(&graph), 1);
+        let graph = graph(Some(SERVER_PREPARE), Some(&workflow), &CompileInputs::new());
+        assert_eq!(prepare_count(&graph), 1, "{workflow}");
         assert_eq!(tiers(&graph, "start")[0].1[0].0, "run_prepare_1");
         assert_eq!(tiers(&graph, "run_prepare_1")[0].1[0].0, "a");
         let step = node(&graph, "run_prepare_1");
         assert_eq!(step.step.config["script"], json!("echo workflow"));
-        assert_eq!(step.budget.timeout, Duration::from_secs(expected));
+        assert_eq!(
+            step.budget.timeout,
+            Duration::from_secs(expected),
+            "{workflow}"
+        );
     }
 }
 
@@ -90,7 +98,7 @@ fn explicit_empty_preparation_disables_inherited_steps() {
         "[run.prepare]\nsteps = []",
         "[run.prepare]\ntimeout = '2s'",
     ] {
-        let graph = graph(Some(SERVER_PREPARE), Some(workflow));
+        let graph = graph(Some(SERVER_PREPARE), Some(workflow), &CompileInputs::new());
         assert_eq!(prepare_count(&graph), 0, "{workflow}");
         assert_eq!(tiers(&graph, "start")[0].1[0].0, "a");
     }
@@ -99,9 +107,9 @@ fn explicit_empty_preparation_disables_inherited_steps() {
 #[test]
 fn absent_preparation_leaves_the_start_route_unchanged() {
     for workflow in [None, Some("[run.inputs]\nmode = 'fast'")] {
-        let graph = graph(None, workflow);
-        assert_eq!(prepare_count(&graph), 0);
-        assert_eq!(tiers(&graph, "start")[0].1[0].0, "a");
+        let graph = graph(None, workflow, &CompileInputs::new());
+        assert_eq!(prepare_count(&graph), 0, "{workflow:?}");
+        assert_eq!(tiers(&graph, "start")[0].1[0].0, "a", "{workflow:?}");
     }
 }
 
@@ -123,18 +131,12 @@ steps = [
         if let Some(value) = supplied {
             inputs.inputs.insert("target".into(), json!(value));
         }
-        let lowered = lower(
+        let graph = graph(
             Some(server),
             Some("[run.inputs]\ntarget = 'two words'"),
             &inputs,
         );
-        assert!(
-            !lowered.diagnostics.has_errors(),
-            "{:?}",
-            lowered.diagnostics
-        );
-        let graph = lowered.graph.expect("templates resolve");
-        assert_eq!(prepare_count(&graph), 2);
+        assert_eq!(prepare_count(&graph), 2, "{supplied:?}");
         let first = node(&graph, "run_prepare_1");
         assert_eq!(
             first.step.config["script"],
@@ -164,7 +166,6 @@ steps = [
 fn malformed_selected_preparation_is_rejected_at_its_source() {
     let malformed = [
         ("[run]\nprepare = false", "run.prepare"),
-        ("run = false", "run"),
         (
             "[run.prepare]\nsteps = [{ script = 'true', command = false }]",
             "run.prepare.steps[0]",
@@ -201,7 +202,7 @@ fn malformed_selected_preparation_is_rejected_at_its_source() {
     ];
     for (text, message) in malformed {
         for (server, workflow, source) in [
-            (Some(text), None, "settings.toml"),
+            (Some(text), None, SETTINGS_FILE),
             (Some(SERVER_PREPARE), Some(text), "wf/workflow.toml"),
         ] {
             let lowered = lower(server, workflow, &CompileInputs::new());
@@ -226,8 +227,9 @@ fn workflow_override_does_not_parse_or_render_discarded_server_preparation() {
         let graph = graph(
             Some(server),
             Some("[run.prepare]\nsteps = [{ script = 'echo workflow' }]"),
+            &CompileInputs::new(),
         );
-        assert_eq!(prepare_count(&graph), 1);
+        assert_eq!(prepare_count(&graph), 1, "{server}");
         assert_eq!(
             node(&graph, "run_prepare_1").step.config["script"],
             json!("echo workflow")

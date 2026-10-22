@@ -37,7 +37,7 @@ use frontend::{
 };
 pub use frontend_attractor::RunSettings;
 use frontend_attractor::template::Context;
-pub use hooks::{PROJECT_FILE, SETTINGS_HOOKS_VAR};
+pub use hooks::{PROJECT_FILE, SETTINGS_FILE, SETTINGS_HOOKS_VAR};
 pub use mcps::MCP_CATALOG_VAR;
 pub use model_layers::LaunchModel;
 use serde_json::Value;

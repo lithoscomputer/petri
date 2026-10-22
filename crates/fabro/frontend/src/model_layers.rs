@@ -21,7 +21,7 @@ use frontend_attractor::{ModelDefaults, ModelOverride};
 use serde_json::Value;
 
 use crate::fallbacks;
-use crate::hooks::{PROJECT_FILE, SETTINGS_HOOKS_VAR};
+use crate::hooks::{PROJECT_FILE, SETTINGS_FILE, SETTINGS_HOOKS_VAR};
 
 /// Fill `model`'s unset keys from the project layer, then the settings
 /// layer.
@@ -35,7 +35,7 @@ pub(crate) fn apply(
         fill(&text, PROJECT_FILE, model, diags);
     }
     if let Some(Value::String(text)) = inputs.vars.get(SETTINGS_HOOKS_VAR) {
-        fill(text, "settings.toml", model, diags);
+        fill(text, SETTINGS_FILE, model, diags);
     }
 }
 

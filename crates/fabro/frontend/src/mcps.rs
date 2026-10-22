@@ -35,7 +35,7 @@ use frontend_attractor::model::parse_duration;
 use frontend_attractor::template::Context;
 use ir::Value;
 
-use crate::hooks::{PROJECT_FILE, SETTINGS_HOOKS_VAR};
+use crate::hooks::{PROJECT_FILE, SETTINGS_FILE, SETTINGS_HOOKS_VAR};
 use crate::secrets::{InterpolationError, interpolate};
 
 /// The `CompileInputs` variable a host sets to the text of its MCP catalog,
@@ -108,7 +108,7 @@ pub fn load(
     let catalog = catalog.as_ref();
     let mut layers = Vec::with_capacity(3);
     if let Some(Value::String(text)) = inputs.vars.get(SETTINGS_HOOKS_VAR) {
-        layers.push(read_layer(text, "settings.toml", template, catalog, diags));
+        layers.push(read_layer(text, SETTINGS_FILE, template, catalog, diags));
     }
     if let Some(text) = files.read(PROJECT_FILE) {
         layers.push(read_layer(&text, PROJECT_FILE, template, catalog, diags));

@@ -29,6 +29,10 @@ pub const SETTINGS_HOOKS_VAR: &str = "fabro.settings_toml";
 /// The project layer's repository-relative path.
 pub const PROJECT_FILE: &str = ".fabro/project.toml";
 
+/// The name diagnostics give the host's settings layer, whose text arrives
+/// as [`SETTINGS_HOOKS_VAR`] rather than from a path lowering can read.
+pub const SETTINGS_FILE: &str = "settings.toml";
+
 /// Read and merge every hook layer. `workflow_toml` is the already-read
 /// `(path, text)` of the workflow's own `workflow.toml`, when it exists.
 pub fn load(
@@ -39,7 +43,7 @@ pub fn load(
 ) -> Vec<HookDefinition> {
     let mut layers = Vec::with_capacity(3);
     if let Some(Value::String(text)) = inputs.vars.get(SETTINGS_HOOKS_VAR) {
-        layers.push(read_layer(text, "settings.toml", diags));
+        layers.push(read_layer(text, SETTINGS_FILE, diags));
     }
     if let Some(text) = files.read(PROJECT_FILE) {
         layers.push(read_layer(&text, PROJECT_FILE, diags));
@@ -96,8 +100,9 @@ pub fn read_layer(text: &str, source: &str, diags: &mut Diagnostics) -> Vec<Hook
         Ok(table) => table,
         Err(error) => {
             // A file that names hooks and cannot be read would skip them
-            // silently; the workflow reader's own warning covers a file that
-            // configures none.
+            // silently. The workflow reader fails admission for its own file
+            // whatever it configures; a lower layer that names no hooks is
+            // left to the readers of the sections it does name.
             if text.contains("run.hooks") {
                 diags.error(
                     "fabro.hooks.toml",

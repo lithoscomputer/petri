@@ -217,6 +217,7 @@ fn workflow_toml_sections_warn_or_reject_and_never_pass_silently() {
     assert_eq!(codes("[run]\nnot_a_key = 1\n"), [
         "unsupported.workflow_toml.key"
     ]);
+    assert_eq!(codes("run = false\n"), ["unsupported.workflow_toml.key"]);
     // A clean file is clean.
     assert!(codes("_version = 1\n[workflow]\ngraph = \"workflow.fabro\"\n").is_empty());
 }

@@ -60,8 +60,9 @@ use frontend_attractor::{
     RunSettings,
 };
 use serde_json::{Value, json};
+use toml::de::Error as TomlError;
 
-use crate::hooks::{PROJECT_FILE, SETTINGS_HOOKS_VAR};
+use crate::hooks::{PROJECT_FILE, SETTINGS_FILE, SETTINGS_HOOKS_VAR};
 use crate::model_layers::LaunchModel;
 use crate::secrets::{InterpolationError, interpolate};
 use crate::skills;
@@ -154,8 +155,8 @@ pub fn read(
         None => None,
         Some(Ok(table)) => Some(table),
         Some(Err(error)) => {
-            // An unreadable workflow might override host preparation. Never
-            // fall back to running host commands when that choice is unknown.
+            // A settings file that cannot be read decides nothing: no section
+            // of it can be trusted, so admission fails.
             diags.error(
                 "fabro.workflow_toml",
                 Span::file(&path),
@@ -164,6 +165,12 @@ pub fn read(
             None
         }
     };
+    // The host's settings layer, parsed once for every section read here.
+    let settings_toml = inputs
+        .vars
+        .get(SETTINGS_HOOKS_VAR)
+        .and_then(Value::as_str)
+        .map(str::parse::<toml::Table>);
     let mut reader = Reader {
         path: &path,
         dir,
@@ -183,24 +190,42 @@ pub fn read(
         reader.top_level(table);
     }
     reader.launch_goal(inputs);
-    // Select and parse preparation once, after workflow input defaults. A
-    // present section replaces steps AND timeout; project settings do not
-    // participate. An unparseable workflow must not inherit host commands.
-    if (text.is_none() || table.is_some())
-        && !table
-            .as_ref()
-            .is_some_and(|table| reader.prepare_layer(&path, table))
-    {
-        reader.settings_prepare(inputs);
+    // Preparation is read after the workflow's input defaults, which its
+    // steps may render. The workflow's section, when present, replaces the
+    // host's whole; project configuration does not participate.
+    match &table {
+        Some(table) => match prepare_section(table) {
+            Some(item) => reader.prepare(&path, item),
+            None => reader.settings_prepare(settings_toml.as_ref()),
+        },
+        // No `workflow.toml`: the host's section applies.
+        None if text.is_none() => reader.settings_prepare(settings_toml.as_ref()),
+        // An unreadable `workflow.toml` failed admission above. Never fall
+        // back to the host's commands when the workflow's choice is unknown.
+        None => {}
     }
     // The environment resolves over every layer, so a bundle with no
     // `workflow.toml` still runs in the environment the host's layer names.
-    let layers = EnvironmentLayers::read(files, inputs, table.as_ref().map(|t| (path.as_str(), t)));
+    let layers = EnvironmentLayers::read(
+        files,
+        settings_toml
+            .as_ref()
+            .and_then(|parsed| parsed.as_ref().ok()),
+        inputs,
+        table.as_ref().map(|t| (path.as_str(), t)),
+    );
     reader.environment_keys(&layers);
     reader.environment(&layers);
     let mut settings = reader.settings;
     settings.hooks_text = text.map(|text| (path, text));
     settings
+}
+
+/// `[run.prepare]` of a parsed settings layer. A `run` that is not a table
+/// has no section, as for every other layer reader; [`Reader::top_level`]
+/// diagnoses the shape in the workflow's own file.
+fn prepare_section(table: &toml::Table) -> Option<&toml::Value> {
+    table.get("run")?.as_table()?.get("prepare")
 }
 
 /// `[environments.<id>]` and `[run.environment]` from every settings layer,
@@ -224,11 +249,13 @@ struct EnvironmentLayers {
 }
 
 impl EnvironmentLayers {
-    /// `workflow` is the bundle's own file, already parsed, when it exists.
-    /// A lower layer that is not TOML is skipped here: the model layer's
-    /// reader has warned that the file is ignored.
+    /// `settings` is the host's layer and `workflow` the bundle's own file,
+    /// each already parsed, when it exists. A lower layer that is not TOML
+    /// is skipped here: the model layer's reader has warned that the file is
+    /// ignored.
     fn read(
         files: &dyn FileSource,
+        settings: Option<&toml::Table>,
         inputs: &CompileInputs,
         workflow: Option<(&str, &toml::Table)>,
     ) -> Self {
@@ -244,10 +271,8 @@ impl EnvironmentLayers {
             launch,
             sources: BTreeMap::new(),
         };
-        if let Some(Value::String(text)) = inputs.vars.get(SETTINGS_HOOKS_VAR)
-            && let Ok(table) = text.parse::<toml::Table>()
-        {
-            layers.add("settings.toml", &table);
+        if let Some(table) = settings {
+            layers.add(SETTINGS_FILE, table);
         }
         if let Some(text) = files.read(PROJECT_FILE)
             && let Ok(table) = text.parse::<toml::Table>()
@@ -412,8 +437,17 @@ impl Reader<'_> {
         if let Some(workflow) = value.get("workflow").and_then(toml::Value::as_table) {
             self.workflow_table(workflow);
         }
-        if let Some(run) = value.get("run").and_then(toml::Value::as_table) {
-            self.run_table(run);
+        match value.get("run") {
+            Some(toml::Value::Table(run)) => self.run_table(run),
+            Some(_) => {
+                let path = self.path;
+                self.unsupported(
+                    "workflow_toml.key",
+                    format!("`run` in `{path}` must be a table"),
+                    "write `[run]` sections such as `[run.goal]` and `[run.prepare]`",
+                );
+            }
+            None => {}
         }
     }
 
@@ -1019,39 +1053,23 @@ impl Reader<'_> {
         self.settings.run.environment = Some(environment);
     }
 
-    /// Return true when this layer decides preparation, even if malformed.
-    fn prepare_layer(&mut self, source: &str, table: &toml::Table) -> bool {
-        let Some(run) = table.get("run") else {
-            return false;
-        };
-        let Some(run) = run.as_table() else {
-            self.unsupported_in(
-                source,
-                "workflow_toml.run.prepare",
-                format!("`run` in `{source}` must be a table"),
-                "write `[run.prepare]` for preparation settings",
-            );
-            return true;
-        };
-        let Some(prepare) = run.get("prepare") else {
-            return false;
-        };
-        self.prepare(source, prepare);
-        true
-    }
-
-    fn settings_prepare(&mut self, inputs: &CompileInputs) {
-        let Some(Value::String(text)) = inputs.vars.get(SETTINGS_HOOKS_VAR) else {
-            return;
-        };
-        match text.parse::<toml::Table>() {
-            Ok(table) => {
-                self.prepare_layer("settings.toml", &table);
+    /// The host's `[run.prepare]`, when the workflow leaves preparation to
+    /// it. A host layer that is not TOML is an error here: its commands
+    /// cannot be read, and a run must not start without them silently.
+    fn settings_prepare(&mut self, settings: Option<&Result<toml::Table, TomlError>>) {
+        match settings {
+            None => {}
+            Some(Ok(table)) => {
+                if let Some(item) = prepare_section(table) {
+                    self.prepare(SETTINGS_FILE, item);
+                }
             }
-            Err(error) => self.diags.error(
-                "fabro.prepare.toml",
-                Span::file("settings.toml"),
-                format!("`settings.toml` is not valid TOML; cannot resolve preparation: {error}"),
+            Some(Err(error)) => self.diags.error(
+                "fabro.workflow_toml",
+                Span::file(SETTINGS_FILE),
+                format!(
+                    "`{SETTINGS_FILE}` is not valid TOML; its preparation cannot be read: {error}"
+                ),
             ),
         }
     }
@@ -1154,10 +1172,10 @@ impl Reader<'_> {
                         source,
                         "workflow_toml.run.prepare",
                         format!(
-                            "`run.prepare.steps[{index}]` in `{source}`: exactly one of script or command \
-                             must be set"
+                            "`run.prepare.steps[{index}]` in `{source}` must set exactly one of \
+                             `script` (a string) or `command` (an array of strings)"
                         ),
-                        "give the step a `script` or a `command`, not both",
+                        "give the step a `script` string or a `command` array, not both",
                     );
                     None
                 }
