@@ -68,7 +68,7 @@ kinds those steps emit (`fabro.prompt`, `fabro.thread`, `fabro.hook`,
 (now `attractor.hooks` and `attractor.workflow`), and the diagnostic codes
 the language raises (`fabro.*` is now `attractor.*`). What the Fabro
 frontend itself writes keeps its name: `fabro.launch`, `fabro.environment`,
-the `fabro.settings_toml` compile variable, and the `fabro.workflow_toml`,
+the `fabro.settings_toml` compile variable, and the `fabro.settings.toml`,
 `fabro.hooks.*`, `fabro.mcps.*` and `fabro.model_fallbacks` codes. A run
 directory written before the rename names the old kinds and cannot be
 resumed or inspected by this build; no alias is kept

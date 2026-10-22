@@ -52,6 +52,7 @@ use frontend_attractor::{
     DEFAULT_PRESERVE_TURNS, DEFAULT_THRESHOLD_PERCENT, EnvValue, Environment, RunSettings,
 };
 use serde_json::{Value, json};
+use toml::de::Error as TomlError;
 
 use crate::hooks::{PROJECT_FILE, SETTINGS_HOOKS_VAR};
 use crate::model_layers::LaunchModel;
@@ -172,16 +173,21 @@ pub fn read(
 /// Validate each source before merging so overridden retired settings cannot
 /// disappear, and malformed TOML cannot silently skip configured commands.
 fn read_table(source: &str, text: &str, diags: &mut Diagnostics) -> Option<toml::Table> {
-    let Ok(table) = text.parse::<toml::Table>() else {
-        // TOML's display includes source snippets, which can contain secrets.
-        diags.error(
-            "fabro.settings.toml",
-            Span::file(source),
-            format!(
-                "`{source}` is not valid TOML; fix the settings syntax before running the workflow"
-            ),
-        );
-        return None;
+    let table = match text.parse::<toml::Table>() {
+        Ok(table) => table,
+        Err(error) => {
+            // TOML's display includes source snippets, which can contain
+            // secrets, so the diagnostic carries the position and not the text.
+            diags.error(
+                "fabro.settings.toml",
+                toml_error_span(source, text, &error),
+                format!(
+                    "`{source}` is not valid TOML; fix the settings syntax before running the \
+                     workflow"
+                ),
+            );
+            return None;
+        }
     };
     if table
         .get("run")
@@ -192,10 +198,27 @@ fn read_table(source: &str, text: &str, diags: &mut Diagnostics) -> Option<toml:
             "workflow_toml.run.prepare",
             Span::file(source),
             format!("`run.prepare` in `{source}` is no longer supported"),
-            "move setup into ordinary command nodes after `start`, preserving step order, timeout (previous default `5m`), and `on_failure=\"exit\"`; see crates/fabro/MIGRATION.md",
+            "move setup into ordinary command nodes after `start`, preserving step order, timeout (previous default `5m`), and `on_failure=\"exit\"`",
         );
     }
     Some(table)
+}
+
+/// Where a TOML parse error points in `text`, as a 1-based line and column
+/// on `source`; the file alone when the error names no position.
+fn toml_error_span(source: &str, text: &str, error: &TomlError) -> Span {
+    let Some(range) = error.span() else {
+        return Span::file(source);
+    };
+    let before = text.get(..range.start).unwrap_or(text);
+    let line = before.matches('\n').count() + 1;
+    let line_start = before.rfind('\n').map_or(0, |nl| nl + 1);
+    let column = before[line_start..].chars().count() + 1;
+    Span::new(
+        source,
+        u32::try_from(line).unwrap_or(u32::MAX),
+        u32::try_from(column).unwrap_or(u32::MAX),
+    )
 }
 
 /// `[environments.<id>]` and `[run.environment]` from every settings layer,
@@ -1176,9 +1199,7 @@ fn rename_hint(key: &str) -> Option<&'static str> {
         "graph" => "move to `[workflow]`",
         "labels" => "move to `[run.metadata]`",
         "vars" => "rename to `[run.inputs]`",
-        "setup" => {
-            "move setup into ordinary command nodes after `start`; see crates/fabro/MIGRATION.md"
-        }
+        "setup" => "move setup into ordinary command nodes after `start`",
         "sandbox" => "rename to `[run.environment]` and `[environments.<slug>]`",
         "checkpoint" => "move under `[run.checkpoint]`",
         "pull_request" => "move under `[run.pull_request]`",

@@ -88,6 +88,13 @@ fn malformed_settings_fail_admission_without_echoing_source_values() {
                 "diagnostics must omit source values"
             );
         }
+        let syntax = lowered
+            .diagnostics
+            .errors()
+            .find(|d| d.code == "fabro.settings.toml")
+            .expect("the syntax error");
+        assert_eq!(syntax.span.line, 1, "{syntax:?}");
+        assert!(syntax.span.column > 1, "{syntax:?}");
     }
 }
 

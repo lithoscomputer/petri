@@ -66,8 +66,8 @@ lowering's.
 
 ## Diagnostics
 
-What the Fabro frontend raises keeps the `fabro` prefix: `fabro.workflow_toml`
-(a file that is not TOML), `fabro.hooks.*` and `fabro.mcps.*` (a malformed
+What the Fabro frontend raises keeps the `fabro` prefix: `fabro.settings.toml`
+(a settings file in any layer that is not TOML, with the line and column), `fabro.hooks.*` and `fabro.mcps.*` (a malformed
 entry in any layer or in the host's MCP catalog), `fabro.model_fallbacks` (a chain table Fabro's parser
 would refuse), `fabro.petri_extension` (`[run.agent] skills`, which Fabro
 refuses), and the `unsupported.workflow_toml.*` and

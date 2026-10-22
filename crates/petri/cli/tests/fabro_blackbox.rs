@@ -1134,11 +1134,11 @@ async fn run_model_defaults_reach_openrouter_through_chat_completions() {
     twin.stop();
 }
 
-/// A validation error anywhere in `workflow.toml` stops the run
-/// before the preparation steps start.
+/// A validation error anywhere in `workflow.toml` stops the run before any
+/// command runs, including a setup command right after `start`.
 #[tokio::test]
-async fn the_complete_configuration_is_validated_before_preparation_starts() {
-    let case = Case::new("prepare-validate");
+async fn the_complete_configuration_is_validated_before_any_command_runs() {
+    let case = Case::new("settings-validate");
     let workflow = case.workflow(
         r#"digraph Prepared {
     start [shape=Mdiamond]

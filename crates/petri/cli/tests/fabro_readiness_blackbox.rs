@@ -115,7 +115,7 @@ provider = "local"
 [run.environment]
 id = "default"
 [run.environment.env]
-TEST_REMOTE = {remote:?}
+TEST_REMOTE = {remote}
 
 [run.agent.mcps.notes]
 type = "stdio"
@@ -152,7 +152,7 @@ script = "echo run_failed >> run-end.log"
 event = "sandbox_cleanup"
 script = "echo sandbox_cleanup >> run-end.log"
 "#,
-        remote = remote.display().to_string(),
+        remote = serde_json::to_string(&remote.display().to_string()).expect("json"),
         mcp_log = mcp_log.display().to_string(),
     )
 }
