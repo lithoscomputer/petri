@@ -106,7 +106,9 @@ name-based hook exemption is removed, including for commands in saved graphs
 and previously user-authored nodes with that prefix. When those commands execute
 under the new runtime, configured ordinary hooks can run. This does not replay
 hooks for commands that already completed. Other synthetic-node hook rules stay
-unchanged.
+unchanged. The existing local hook service initializes configuration when
+`start` runs; a cold resume or fork that skips `start` may not reload that
+configuration. This removal does not change that initialization behavior.
 
 Rust consumers must remove uses of `RunSettings.prepare`,
 `RunSettings.prepare_timeout_ms`, `PrepareStep`, and `PREPARE_NODE_PREFIX`.
