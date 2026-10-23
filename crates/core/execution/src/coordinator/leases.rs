@@ -116,11 +116,10 @@ impl ScopeLeaseAllocator for InvocationLeaseAllocator {
             invocation: self.invocation,
             scope:      identity,
         };
-        let runtime = spec.runtime.clone();
         let assignment = {
             let mut resources = self.resources.lock().await;
             let record = resources
-                .reserve_scope(allocation, &provider, runtime, introduced_by)
+                .reserve_scope(allocation, &provider, spec, introduced_by)
                 .await
                 .map_err(|source| match source {
                     ResourceError::Store(_) => store_failed(&source),

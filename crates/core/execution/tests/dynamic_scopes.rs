@@ -169,12 +169,12 @@ async fn a_dynamic_scope_resumes_its_durable_lease_and_rejects_corrupt_provenanc
 
     let report = prune(&runtime).await.unwrap();
     assert!(report.is_clean(), "{report:?}");
-    // An arbitrary runtime or originating execution is not sufficient proof
-    // that a dynamic resource belonged to this invocation.
+    // Admission snapshots reject corruption before it can enter the log.
     for corrupt_runtime in [false, true] {
         let logs = testkit::write_run_dir(directory.path()).await;
         let mut store = ResourceStore::load(&logs).await.unwrap();
-        store
+        let original = store.resolve(before.lease).unwrap().clone();
+        let error = store
             .update(before.lease, |record| {
                 record.introduced_by = Some(if corrupt_runtime {
                     ExecutionId::new(0)
@@ -186,18 +186,13 @@ async fn a_dynamic_scope_resumes_its_durable_lease_and_rejects_corrupt_provenanc
                 }
             })
             .await
-            .unwrap();
-        drop(store);
-        drop(logs);
-        assert!(
-            Coordinator::resume(
-                runtime.prepare_run(directory.path()),
-                Vec::new(),
-                CoordinatorOptions::default(),
-            )
-            .await
-            .is_err()
-        );
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            execution::ResourceError::AdmissionMismatch(_)
+        ));
+        let reopened = ResourceStore::load(&logs).await.unwrap();
+        assert_eq!(reopened.resolve(before.lease).unwrap(), &original);
     }
 }
 

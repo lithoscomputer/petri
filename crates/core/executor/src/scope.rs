@@ -29,7 +29,8 @@ pub const DEFAULT_GRACE: Duration = Duration::from_secs(10);
 /// A sidecar container the scope needs, with its env already resolved.
 /// Credentials stay a secret *name*; the executor resolves it inside acquire,
 /// at the point of use.
-#[derive(Clone)]
+#[derive(Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ServiceSpec {
     /// The alias other processes in the scope reach it by.
     pub name:        SmolStr,
