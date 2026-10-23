@@ -1134,136 +1134,21 @@ async fn run_model_defaults_reach_openrouter_through_chat_completions() {
     twin.stop();
 }
 
-/// Task 7: `[run.prepare]` steps run in the selected environment before any
-/// node, in order, with their `env`; a node then sees their effect. A failing
-/// step ends the run before the first node runs.
+/// A validation error anywhere in `workflow.toml` stops the run before any
+/// command runs, including a setup command right after `start`.
 #[tokio::test]
-async fn run_prepare_steps_run_before_the_nodes_and_a_failure_stops_the_run() {
-    let case = Case::new("prepare");
-    let workflow = case.workflow(
-        r#"digraph Prepared {
-    start [shape=Mdiamond]
-    exit [shape=Msquare]
-    read [shape=parallelogram, script="cat prepared.txt"]
-    start -> read -> exit
-}"#,
-        Some(
-            "[run.prepare]\ntimeout = \"30s\"\n\n[[run.prepare.steps]]\nscript = \"printf 'one\\\\n' > prepared.txt\"\n\n[[run.prepare.steps]]\ncommand = [\"sh\", \"-c\", \"printf \\\"$TAG\\\\n\\\" >> prepared.txt\"]\nenv = { TAG = \"two\" }\n",
-        ),
-    );
-    let finished = case.run(&workflow, &[]).await;
-    finished.assert_code(0);
-    assert_eq!(
-        finished.status_line(),
-        Some("success"),
-        "{}",
-        finished.stderr
-    );
-    assert_eq!(
-        fs::read_to_string(case.workspace().join("prepared.txt")).expect("prepared.txt"),
-        "one\ntwo\n"
-    );
-    let nodes: Vec<String> = finished
-        .finished_nodes()
-        .into_iter()
-        .map(|(_, node)| node)
-        .collect();
-    let position = |name: &str| {
-        nodes
-            .iter()
-            .position(|n| n == name)
-            .unwrap_or_else(|| panic!("{name} in {nodes:?}"))
-    };
-    assert!(position("run_prepare_1") < position("run_prepare_2"));
-    assert!(position("run_prepare_2") < position("read"));
-    assert_eq!(
-        finished.final_context()["command.output"],
-        json!("one\ntwo\n")
-    );
-
-    let failing = Case::new("prepare-fails");
-    let workflow = failing.workflow(
-        r#"digraph Prepared {
-    start [shape=Mdiamond]
-    exit [shape=Msquare]
-    work [shape=parallelogram, script="printf 'ran\n' > ran.txt"]
-    start -> work -> exit
-}"#,
-        Some("[[run.prepare.steps]]\nscript = \"echo setup broke >&2; exit 3\"\n"),
-    );
-    let finished = failing.run(&workflow, &[]).await;
-    finished.assert_code(1);
-    assert_eq!(
-        finished.status_line(),
-        Some("failed"),
-        "{}",
-        finished.stderr
-    );
-    assert!(
-        !failing.workspace().join("ran.txt").exists(),
-        "no node ran after the failed preparation"
-    );
-    let nodes: Vec<(String, String)> = finished.finished_nodes();
-    assert!(
-        nodes
-            .iter()
-            .any(|(status, node)| node == "run_prepare_1" && status == "failure"),
-        "{nodes:?}"
-    );
-    assert!(!nodes.iter().any(|(_, node)| node == "work"), "{nodes:?}");
-    assert_eq!(
-        finished.final_context()["failure_class"],
-        json!("exit_status:3")
-    );
-}
-
-/// Task 7: a cancel during `[run.prepare]` stops the preparation and the run
-/// ends cancelled with no node run.
-#[tokio::test]
-async fn a_cancel_during_run_prepare_stops_the_run_before_any_node() {
-    let case = Case::new("prepare-cancel");
-    let workflow = case.workflow(
-        r#"digraph Prepared {
-    start [shape=Mdiamond]
-    exit [shape=Msquare]
-    work [shape=parallelogram, script="printf 'ran\n' > ran.txt"]
-    start -> work -> exit
-}"#,
-        Some("[[run.prepare.steps]]\nscript = \"printf 'started\\\\n' > started.txt; sleep 60; printf 'finished\\\\n' > finished.txt\"\n"),
-    );
-    let finished = case
-        .run_with(&workflow, &[], Launch {
-            interrupt_when: Some(case.workspace().join("started.txt")),
-            ..Launch::default()
-        })
-        .await;
-    assert!(!finished.timed_out, "the interrupt ended the run");
-    assert_eq!(
-        finished.status_line(),
-        Some("cancelled"),
-        "{}",
-        finished.stderr
-    );
-    assert!(case.workspace().join("started.txt").exists());
-    assert!(!case.workspace().join("finished.txt").exists());
-    assert!(!case.workspace().join("ran.txt").exists(), "no node ran");
-    finished.assert_no_leaked_processes().await;
-}
-
-/// Task 7: a validation error anywhere in `workflow.toml` stops the run
-/// before the preparation steps start.
-#[tokio::test]
-async fn the_complete_configuration_is_validated_before_preparation_starts() {
-    let case = Case::new("prepare-validate");
+async fn the_complete_configuration_is_validated_before_any_command_runs() {
+    let case = Case::new("settings-validate");
     let workflow = case.workflow(
         r#"digraph Prepared {
     start [shape=Mdiamond]
     exit [shape=Msquare]
     work [shape=parallelogram, script="true"]
-    start -> work -> exit
+    initialize [shape=parallelogram, script="printf 'prepared\n' > prepared.txt", timeout="5m", on_failure="exit"]
+    start -> initialize -> work -> exit
 }"#,
         Some(
-            "[[run.prepare.steps]]\nscript = \"printf 'prepared\\\\n' > prepared.txt\"\n\n[run.environment]\nid = \"missing\"\n",
+            "[run.environment]\nid = \"missing\"\n",
         ),
     );
     let finished = case.run(&workflow, &[]).await;

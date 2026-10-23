@@ -1107,7 +1107,7 @@ until the child's end is recorded and handed back during a retry backoff;
 invocation ceiling, checked at create, resume and every declaration; `house`
 → a nested invocation by graph digest; `tab` and a prompted `tripleoctagon` → the `attractor/prompt` step;
 `import` → expanded at load, so the persisted graph carries the imported
-nodes; `[run.prepare]` → command nodes between start and its successors.
+nodes; setup is authored as ordinary command nodes after start (`run.prepare` settings are rejected).
 Conditions lower onto the expression language with Fabro's text comparison,
 truthiness and numeric rules spelled out; `outcome=X` names only the four
 Fabro outcomes. The legacy dialect's attributes and unknown outcome values are

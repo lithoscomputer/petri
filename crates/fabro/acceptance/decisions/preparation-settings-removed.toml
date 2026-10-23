@@ -1,0 +1,9 @@
+id = "preparation-settings-removed"
+title = "Setup is authored as ordinary command nodes"
+scenarios = ["*"]
+bundles = ["*"]
+fabro = "The pinned reference accepts run.prepare settings and inserts setup commands before workflow work."
+petri = "Admission rejects run.prepare in each consumed settings layer with migration guidance. Authored setup commands use ordinary hooks, including commands whose name starts with run_prepare_."
+user_visible_effect = "Authors move setup into graph command nodes and preserve timeout, failure and environment behavior. Saved graphs keep commands and overlays, but executing prefix-named commands now receives ordinary hooks."
+reason = "Preparation configuration duplicated command authoring and suppressed hooks by node name. Explicit graph nodes make setup ordering and behavior visible."
+acceptance = "This record documents source-admission and hook-policy differences only and accepts no projection differences. Existing differential bundles remain unchanged; any future bundle migration must name its old and new digests and narrow scenario scope."

@@ -38,10 +38,6 @@
 //!   settings layer and merged key by key, the host's settings layer under
 //!   `.fabro/project.toml` under `workflow.toml` ([`EnvironmentLayers`]), so a
 //!   bundle can name an environment the host's catalog declares.
-//! - `[run.prepare]`: setup steps that run as command nodes between `start` and
-//!   its successors, in the selected environment, before any workflow node.
-//!   Each step gets the section's `timeout` (default five minutes) and
-//!   `on_failure="exit"`, so a failed step ends the run before the nodes.
 //! - `[[run.hooks]]`: the local hook layer beside the workflow, read by
 //!   `crate::hooks` together with `.fabro/project.toml` and the host's settings
 //!   layer.
@@ -51,13 +47,12 @@ use std::collections::BTreeMap;
 use frontend::{
     CompileInputs, Diagnostics, FileSource, LAUNCH_ENVIRONMENT_VAR, LAUNCH_GOAL_VAR, Span,
 };
-use frontend_attractor::model::parse_duration;
 use frontend_attractor::template::Context;
 use frontend_attractor::{
-    DEFAULT_PRESERVE_TURNS, DEFAULT_THRESHOLD_PERCENT, EnvValue, Environment, PrepareStep,
-    RunSettings,
+    DEFAULT_PRESERVE_TURNS, DEFAULT_THRESHOLD_PERCENT, EnvValue, Environment, RunSettings,
 };
 use serde_json::{Value, json};
+use toml::de::Error as TomlError;
 
 use crate::hooks::{PROJECT_FILE, SETTINGS_HOOKS_VAR};
 use crate::model_layers::LaunchModel;
@@ -66,9 +61,6 @@ use crate::skills;
 
 /// The settings schema version this build reads, Fabro's `_version`.
 const WORKFLOW_TOML_VERSION: i64 = 1;
-
-/// Fabro's default timeout for one `[run.prepare]` step.
-const PREPARE_TIMEOUT_MS: u64 = 300_000;
 
 /// The `Graph.params` key the launch settings persist under.
 pub const LAUNCH_PARAM: &str = "fabro.launch";
@@ -147,20 +139,9 @@ pub fn read(
         format!("{dir}/workflow.toml")
     };
     let text = files.read(&path);
-    let table: Option<toml::Table> = match text.as_deref().map(str::parse) {
-        None => None,
-        Some(Ok(table)) => Some(table),
-        Some(Err(error)) => {
-            // The hook loader still sees the text: a configured hook in an
-            // unparseable file is an error there, never a silent skip.
-            diags.warning(
-                "fabro.workflow_toml",
-                Span::file(&path),
-                format!("`{path}` is not valid TOML and is ignored: {error}"),
-            );
-            None
-        }
-    };
+    let table = text
+        .as_deref()
+        .and_then(|text| read_table(&path, text, diags));
     let mut reader = Reader {
         path: &path,
         dir,
@@ -168,13 +149,7 @@ pub fn read(
         files,
         template,
         diags,
-        settings: Settings {
-            run: RunSettings {
-                prepare_timeout_ms: PREPARE_TIMEOUT_MS,
-                ..RunSettings::default()
-            },
-            ..Settings::default()
-        },
+        settings: Settings::default(),
     };
     if let Some(table) = &table {
         reader.top_level(table);
@@ -182,12 +157,68 @@ pub fn read(
     reader.launch_goal(inputs);
     // The environment resolves over every layer, so a bundle with no
     // `workflow.toml` still runs in the environment the host's layer names.
-    let layers = EnvironmentLayers::read(files, inputs, table.as_ref().map(|t| (path.as_str(), t)));
+    let layers = EnvironmentLayers::read(
+        files,
+        inputs,
+        table.as_ref().map(|t| (path.as_str(), t)),
+        reader.diags,
+    );
     reader.environment_keys(&layers);
     reader.environment(&layers);
     let mut settings = reader.settings;
     settings.hooks_text = text.map(|text| (path, text));
     settings
+}
+
+/// Validate each source before merging so overridden retired settings cannot
+/// disappear, and malformed TOML cannot silently skip configured commands.
+fn read_table(source: &str, text: &str, diags: &mut Diagnostics) -> Option<toml::Table> {
+    let table = match text.parse::<toml::Table>() {
+        Ok(table) => table,
+        Err(error) => {
+            // TOML's display includes source snippets, which can contain
+            // secrets, so the diagnostic carries the position and not the text.
+            diags.error(
+                "fabro.settings.toml",
+                toml_error_span(source, text, &error),
+                format!(
+                    "`{source}` is not valid TOML; fix the settings syntax before running the \
+                     workflow"
+                ),
+            );
+            return None;
+        }
+    };
+    if table
+        .get("run")
+        .and_then(toml::Value::as_table)
+        .is_some_and(|run| run.contains_key("prepare"))
+    {
+        diags.unsupported(
+            "workflow_toml.run.prepare",
+            Span::file(source),
+            format!("`run.prepare` in `{source}` is no longer supported"),
+            "move setup into ordinary command nodes after `start`, preserving step order, timeout (previous default `5m`), and `on_failure=\"exit\"`",
+        );
+    }
+    Some(table)
+}
+
+/// Where a TOML parse error points in `text`, as a 1-based line and column
+/// on `source`; the file alone when the error names no position.
+fn toml_error_span(source: &str, text: &str, error: &TomlError) -> Span {
+    let Some(range) = error.span() else {
+        return Span::file(source);
+    };
+    let before = text.get(..range.start).unwrap_or(text);
+    let line = before.matches('\n').count() + 1;
+    let line_start = before.rfind('\n').map_or(0, |nl| nl + 1);
+    let column = before[line_start..].chars().count() + 1;
+    Span::new(
+        source,
+        u32::try_from(line).unwrap_or(u32::MAX),
+        u32::try_from(column).unwrap_or(u32::MAX),
+    )
 }
 
 /// `[environments.<id>]` and `[run.environment]` from every settings layer,
@@ -212,12 +243,12 @@ struct EnvironmentLayers {
 
 impl EnvironmentLayers {
     /// `workflow` is the bundle's own file, already parsed, when it exists.
-    /// A lower layer that is not TOML is skipped here: the model layer's
-    /// reader has warned that the file is ignored.
+    /// Every lower layer is validated independently before its values merge.
     fn read(
         files: &dyn FileSource,
         inputs: &CompileInputs,
         workflow: Option<(&str, &toml::Table)>,
+        diags: &mut Diagnostics,
     ) -> Self {
         let launch = inputs
             .vars
@@ -232,12 +263,12 @@ impl EnvironmentLayers {
             sources: BTreeMap::new(),
         };
         if let Some(Value::String(text)) = inputs.vars.get(SETTINGS_HOOKS_VAR)
-            && let Ok(table) = text.parse::<toml::Table>()
+            && let Some(table) = read_table("settings.toml", text, diags)
         {
             layers.add("settings.toml", &table);
         }
         if let Some(text) = files.read(PROJECT_FILE)
-            && let Ok(table) = text.parse::<toml::Table>()
+            && let Some(table) = read_table(PROJECT_FILE, &text, diags)
         {
             layers.add(PROJECT_FILE, &table);
         }
@@ -438,11 +469,11 @@ impl Reader<'_> {
                 // `lower::hooks`, with the project and settings layers, from
                 // the text kept on the settings. `[run.environment]` is read
                 // with the other layers' by `Reader::environment`.
-                "inputs" | "hooks" | "environment" => {}
+                // Preparation was rejected by read_table before layers merge.
+                "inputs" | "hooks" | "environment" | "prepare" => {}
                 "goal" => self.goal(item),
                 "model" => self.model(item),
                 "execution" => self.execution(item),
-                "prepare" => self.prepare(item),
                 "agent" => self.agent(item),
                 "clone" => self.clone_section(item),
                 other => self.other_run_key(other),
@@ -1003,126 +1034,6 @@ impl Reader<'_> {
         }
         self.settings.run.environment = Some(environment);
     }
-
-    fn prepare(&mut self, item: &toml::Value) {
-        let Some(prepare) = item.as_table() else {
-            return;
-        };
-        if let Some(timeout) = prepare.get("timeout") {
-            match timeout.as_str().and_then(parse_duration) {
-                Some(duration) => {
-                    self.settings.run.prepare_timeout_ms =
-                        u64::try_from(duration.as_millis()).unwrap_or(u64::MAX);
-                }
-                None => self.unsupported(
-                    "workflow_toml.key",
-                    format!(
-                        "`run.prepare.timeout` in `{}` must be a duration such as `5m`",
-                        self.path
-                    ),
-                    "write the timeout with a unit",
-                ),
-            }
-        }
-        for key in prepare.keys() {
-            if !matches!(key.as_str(), "steps" | "timeout") {
-                let path = self.path;
-                self.unsupported(
-                    "workflow_toml.key",
-                    format!("`run.prepare.{key}` in `{path}` is not a key Fabro accepts"),
-                    "use `steps` and `timeout`",
-                );
-            }
-        }
-        let Some(steps) = prepare.get("steps").and_then(toml::Value::as_array) else {
-            return;
-        };
-        for (index, step) in steps.iter().enumerate() {
-            let Some(step) = step.as_table() else {
-                self.unsupported(
-                    "workflow_toml.run.prepare",
-                    format!(
-                        "`run.prepare.steps[{index}]` in `{}` must be a table",
-                        self.path
-                    ),
-                    "write `[[run.prepare.steps]]` with `script` or `command`",
-                );
-                continue;
-            };
-            let script = step.get("script").and_then(toml::Value::as_str);
-            let command = step.get("command").and_then(toml::Value::as_array);
-            let text = match (script, command) {
-                (Some(script), None) => {
-                    self.render(script, &format!("`run.prepare.steps[{index}].script`"))
-                }
-                (None, Some(argv)) => {
-                    let mut words = Vec::with_capacity(argv.len());
-                    let mut ok = true;
-                    for (position, word) in argv.iter().enumerate() {
-                        let Some(word) = word.as_str() else {
-                            ok = false;
-                            self.unsupported(
-                                "workflow_toml.run.prepare",
-                                format!(
-                                    "`run.prepare.steps[{index}].command[{position}]` in `{}` must \
-                                     be a string",
-                                    self.path
-                                ),
-                                "write every argument as a string",
-                            );
-                            continue;
-                        };
-                        match self.render(word, &format!("`run.prepare.steps[{index}].command`")) {
-                            Some(rendered) => words.push(rendered),
-                            None => ok = false,
-                        }
-                    }
-                    ok.then(|| shlex::try_join(words.iter().map(String::as_str)).ok())
-                        .flatten()
-                }
-                _ => {
-                    self.unsupported(
-                        "workflow_toml.run.prepare",
-                        format!(
-                            "`run.prepare.steps[{index}]` in `{}`: exactly one of script or command \
-                             must be set",
-                            self.path
-                        ),
-                        "give the step a `script` or a `command`, not both",
-                    );
-                    None
-                }
-            };
-            let Some(text) = text else {
-                continue;
-            };
-            let mut env = BTreeMap::new();
-            if let Some(table) = step.get("env").and_then(toml::Value::as_table) {
-                let path = self.path;
-                for (key, value) in table {
-                    if let Some(value) =
-                        self.env_value(path, &format!("run.prepare.steps[{index}]"), key, value)
-                    {
-                        env.insert(key.clone(), value);
-                    }
-                }
-            }
-            for key in step.keys() {
-                if !matches!(key.as_str(), "script" | "command" | "env") {
-                    let path = self.path;
-                    self.unsupported(
-                        "workflow_toml.key",
-                        format!("`run.prepare.steps[{index}].{key}` in `{path}` is not a key Fabro accepts"),
-                        "use `script` or `command`, and `env`",
-                    );
-                }
-            }
-            self.settings
-                .run
-                .prepare
-                .push(PrepareStep { script: text, env });
-        }
-    }
 }
 
 /// Fabro's size grammar: an integer with `B`, `KB`, `MB`, `GB`, `TB` (or
@@ -1288,7 +1199,7 @@ fn rename_hint(key: &str) -> Option<&'static str> {
         "graph" => "move to `[workflow]`",
         "labels" => "move to `[run.metadata]`",
         "vars" => "rename to `[run.inputs]`",
-        "setup" => "rename to `[run.prepare]`",
+        "setup" => "move setup into ordinary command nodes after `start`",
         "sandbox" => "rename to `[run.environment]` and `[environments.<slug>]`",
         "checkpoint" => "move under `[run.checkpoint]`",
         "pull_request" => "move under `[run.pull_request]`",

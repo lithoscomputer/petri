@@ -605,7 +605,6 @@ fn handler_type(view: &FiringView) -> Option<String> {
 fn is_synthetic(view: &FiringView) -> bool {
     view.meta().get("synthetic").and_then(Value::as_bool) == Some(true)
         || view.node_name() == GOAL_CHECK_NODE
-        || view.node_name().starts_with("run_prepare_")
 }
 
 /// The edge table the frontend attached to a node: `meta.edges`, one entry

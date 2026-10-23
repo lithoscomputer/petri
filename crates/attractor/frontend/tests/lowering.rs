@@ -1944,13 +1944,6 @@ fn attractor_lowers_the_same_graph_beside_fabro_settings_files() {
         json!([]),
         "no server reaches the node"
     );
-    assert!(
-        !beside
-            .nodes
-            .iter()
-            .any(|n| n.name.starts_with(frontend_attractor::PREPARE_NODE_PREFIX)),
-        "no prepare node"
-    );
     assert_eq!(beside.params["attractor.hooks"], json!([]));
     assert!(!beside.params.contains_key("fabro.launch"));
 }

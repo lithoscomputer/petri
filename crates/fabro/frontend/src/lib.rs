@@ -12,7 +12,7 @@
 //!
 //! What is Fabro's here: the files and their layering, `[run.inputs]`
 //! defaults under the host's `--input`, `[run] goal`, `[run.model]` with its
-//! fallback chains, `[run.execution]`, `[run.environment]`, `[run.prepare]`,
+//! fallback chains, `[run.execution]`, `[run.environment]`,
 //! `[run.clone]`, `[[run.hooks]]`, `[run.agent.mcps]`, the launch precedence
 //! (`petri run --model`, `--provider`, `--environment`, `--goal`, `--dry-run`,
 //! `--auto-approve`, `--backend`), and the `.fabro` bundle root. What the graph
@@ -53,6 +53,9 @@ pub fn load(file: &str, text: &str, files: &dyn FileSource, inputs: &CompileInpu
     let mut diags = Diagnostics::new();
     let mut template = Context::new(inputs);
     let mut settings = workflow_toml::read(file, files, inputs, &mut template, &mut diags);
+    if diags.has_errors() {
+        return Lowered::rejected(diags);
+    }
     model_layers::apply(files, inputs, &mut settings.run.model, &mut diags);
     // The launch itself: what `petri run --model`/`--provider` asked for
     // overrides the files and the graph's defaults, and the host's default

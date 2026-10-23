@@ -2103,7 +2103,7 @@ async fn recovery_redelivers_with_stable_identities() {
 // ── Readiness item 8: the milestone workflow through the embedding boundary ──
 
 /// The intermediate milestone workflow's shape, as the embedding host sees
-/// it: `[run.prepare]` steps, real commands, scripted agents, a human
+/// it: authored setup commands, real commands, scripted agents, a human
 /// decision, a bounded `for_each` fan-out whose results a command consumes,
 /// and final file checks. The fake host pauses the fork's admission, accepts
 /// the final check's failure as a partial success, and reports a best-effort
@@ -2124,18 +2124,14 @@ async fn the_milestone_workflow_runs_through_the_embedding_boundary() {
         report [shape=parallelogram, script="cat > results.json", stdin_source="context.parallel.results"]
         check [shape=parallelogram, script="cat notes.txt results.json; echo unsigned >&2; exit 3", on_failure="exit"]
         hold [shape=parallelogram, script="echo held > held.txt"]
-        start -> plan -> edit -> gate
+        initialize [shape=parallelogram, script="printf 'draft\n' > notes.txt", timeout="5m", on_failure="exit"]
+        start -> initialize -> plan -> edit -> gate
         gate -> jobs [label="[Y] Yes"]
         gate -> hold [label="[N] No"]
         jobs -> fan -> job -> join -> report -> check -> exit
         hold -> exit
     }"#;
     let dir = RunDir::new("embed-milestone");
-    fs::write(
-        dir.path().join("workflow.toml"),
-        "[run.prepare]\n[[run.prepare.steps]]\nscript = \"printf 'draft\\\\n' > notes.txt\"\n",
-    )
-    .expect("write workflow.toml");
     let host = FakeHost::new(Script {
         pause: Some("fan"),
         accept_failure_of: Some("check"),
@@ -2171,9 +2167,9 @@ async fn the_milestone_workflow_runs_through_the_embedding_boundary() {
 
     // Setup ran as a stage before the nodes; the agents, the command edit,
     // the decision and the fan-out all left their marks.
-    assert_eq!(timeline.node("run_prepare_1").kind, "command");
+    assert_eq!(timeline.node("initialize").kind, "command");
     assert_eq!(
-        timeline.node("run_prepare_1").final_status.as_deref(),
+        timeline.node("initialize").final_status.as_deref(),
         Some("success")
     );
     assert_eq!(timeline.node("plan").kind, "agent");
@@ -2234,7 +2230,7 @@ async fn the_milestone_workflow_runs_through_the_embedding_boundary() {
     );
 
     // Transition ordering, per completed node, from the durable notes.
-    for node in ["run_prepare_1", "plan", "edit", "gate", "jobs", "report"] {
+    for node in ["initialize", "plan", "edit", "gate", "jobs", "report"] {
         assert_eq!(
             timeline.node(node).notes,
             vec![
