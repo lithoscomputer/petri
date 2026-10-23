@@ -88,6 +88,7 @@ fn workflow_toml_sections_warn_or_reject_and_never_pass_silently() {
          id = \"review\"\n[run.integrations.github.permissions]\npull_requests = \"write\"\n\
          [run.checkpoint]\nexclude_globs = []\n[run.artifacts]\ninclude = []\n\
          [run.execution]\nmode = \"normal\"\n[run.agent]\nfabro_tools = true\n\
+         [run.children]\nauto_approve = true\n\
          [environments.review]\nprovider = \"docker\"\n[environments.review.network]\n\
          mode = \"none\"\n[environments.review.image]\ndockerfile = { path = \"Dockerfile\" }\n",
     );
@@ -102,6 +103,7 @@ fn workflow_toml_sections_warn_or_reject_and_never_pass_silently() {
         "ignored.workflow_toml.run.integrations",
         "ignored.workflow_toml.run.checkpoint",
         "ignored.workflow_toml.run.artifacts",
+        "ignored.workflow_toml.run.children",
         "ignored.workflow_toml.run.agent.fabro_tools",
     ] {
         assert!(
