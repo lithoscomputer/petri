@@ -1591,3 +1591,14 @@ language's. Each keeps its name and behavior.
   `FABRO_WORKFLOW`, `FABRO_NODE_ID`, `FABRO_HOOK_CONTEXT` and the
   `.fabro-hook-context-*.json` file (`attractor_steps::hooks`). User scripts
   read these names.
+
+## Environment lowering boundary
+
+Attractor receives a resolved `RunSettings.environment` from its host frontend.
+Its literal environment values and image workload use the same scope IR as
+native workflows. Fabro resolves its environment name before this
+boundary and retains the original name in `fabro.environment.id`. Attractor
+itself does not load a provider catalog or interpret a name as a provider kind.
+Current `local`/`docker`/`daytona` compatibility translation remains active;
+new driver environment selection awaits catalog integration. See the
+[sandbox transition](../core/executor-sandbox/TRANSITION.md).

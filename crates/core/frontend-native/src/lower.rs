@@ -234,8 +234,21 @@ impl Ctx<'_> {
             spec.reject_unknown_keys(SCOPE_KEYS, &mut self.diags, &format!("scope `{name}`"));
             let mut scope = Scope::new(ScopeId::new(0));
 
+            if spec.get("runtime").is_some() && spec.get("source").is_some() {
+                self.diags.error(
+                    "native.conflicting_source",
+                    spec.span(),
+                    "use either `source` or the legacy `runtime`, not both",
+                );
+            }
             if let Some(runtime) = spec.get("runtime") {
                 scope.runtime = self.runtime(runtime);
+            }
+            if let Some(source) = spec.get("source") {
+                scope.runtime = self.source(source);
+            }
+            if let Some(services) = spec.get("services") {
+                scope.services = self.services(services);
             }
             if let Some(reqs) = spec.get("requirements").and_then(|n| n.as_sequence()) {
                 scope.runtime.requirements = reqs
@@ -283,6 +296,75 @@ impl Ctx<'_> {
         }
     }
 
+    fn source(&mut self, node: Node<'_>) -> RuntimeSpec {
+        if node.as_str() == Some("host_directory") {
+            return RuntimeSpec::host_process();
+        }
+        if let Some(source) = node.as_mapping() {
+            source.reject_unknown_keys(&["image"], &mut self.diags, "`source`");
+            if let Some(image) = source.get("image").and_then(|image| image.as_str())
+                && !image.trim().is_empty()
+            {
+                return RuntimeSpec::container(image);
+            }
+        }
+        self.diags.error("native.bad_source", node.span(),
+            "`source` must be `host_directory` or `{ image: <nonempty image> }`; other sources require the shared sandbox API");
+        RuntimeSpec::host_process()
+    }
+
+    fn services(&mut self, node: Node<'_>) -> Vec<ir::ServiceSpec> {
+        let Some(services) = node.expect_mapping(&mut self.diags, "`services`") else {
+            return Vec::new();
+        };
+        let mut result = Vec::new();
+        for (name, value) in services.iter() {
+            let Some(service) = value.expect_mapping(&mut self.diags, "service") else {
+                continue;
+            };
+            service.reject_unknown_keys(&["image", "env"], &mut self.diags, "service");
+            if name.is_empty()
+                || name.len() > 63
+                || name.starts_with('-')
+                || name.ends_with('-')
+                || !name
+                    .bytes()
+                    .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == b'-')
+            {
+                self.diags.error(
+                    "native.bad_service",
+                    value.span(),
+                    "service names must be lowercase DNS labels",
+                );
+            }
+            let Some(image) = service
+                .get("image")
+                .and_then(|image| image.as_str())
+                .filter(|image| !image.trim().is_empty())
+            else {
+                self.diags.error(
+                    "native.bad_service",
+                    value.span(),
+                    "a service needs a nonempty `image`",
+                );
+                continue;
+            };
+            let mut lowered = ir::ServiceSpec::new(name, image);
+            if let Some(env) = service
+                .get("env")
+                .and_then(|env| env.expect_mapping(&mut self.diags, "service env"))
+            {
+                for (key, value) in env.iter() {
+                    lowered
+                        .env
+                        .insert(SmolStr::new(key), self.scalar_or_expr(value, true));
+                }
+            }
+            result.push(lowered);
+        }
+        result
+    }
+
     fn runtime(&mut self, node: Node<'_>) -> RuntimeSpec {
         const SHAPE: &str = "runtime must be `host` or `{ container: { image: … } }`";
         if let Some(text) = node.as_str() {
@@ -301,6 +383,7 @@ impl Ctx<'_> {
         let Some(mapping) = node.expect_mapping(&mut self.diags, "`runtime`") else {
             return RuntimeSpec::host_process();
         };
+        mapping.reject_unknown_keys(&["container"], &mut self.diags, "`runtime`");
         let Some(container) = mapping.get("container") else {
             self.diags.error("native.bad_runtime", node.span(), SHAPE);
             return RuntimeSpec::host_process();
