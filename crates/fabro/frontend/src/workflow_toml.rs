@@ -173,7 +173,7 @@ pub fn read(
 /// Validate each source before merging so overridden retired settings cannot
 /// disappear, and malformed TOML cannot silently skip configured commands.
 fn read_table(source: &str, text: &str, diags: &mut Diagnostics) -> Option<toml::Table> {
-    let table = match text.parse::<toml::Table>() {
+    let mut table = match text.parse::<toml::Table>() {
         Ok(table) => table,
         Err(error) => {
             // TOML's display includes source snippets, which can contain
@@ -200,6 +200,26 @@ fn read_table(source: &str, text: &str, diags: &mut Diagnostics) -> Option<toml:
             format!("`run.prepare` in `{source}` is no longer supported"),
             "move setup into ordinary command nodes after `start`, preserving step order, timeout (previous default `5m`), and `on_failure=\"exit\"`",
         );
+    }
+    if let Some(environment) = table
+        .get_mut("run")
+        .and_then(toml::Value::as_table_mut)
+        .and_then(|run| run.get_mut("environment"))
+    {
+        match environment {
+            toml::Value::String(id) if !id.trim().is_empty() => {
+                *environment = toml::Value::Table(toml::Table::from_iter([(
+                    "id".to_owned(),
+                    toml::Value::String(id.clone()),
+                )]));
+            }
+            toml::Value::Table(_) => {}
+            _ => diags.error(
+                "fabro.settings.environment",
+                Span::file(source),
+                "`run.environment` must be a nonempty environment name or a table",
+            ),
+        }
     }
     Some(table)
 }

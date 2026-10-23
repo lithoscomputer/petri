@@ -382,3 +382,66 @@ fn malformed_yaml_is_a_diagnostic_not_a_panic() {
         "{diags:?}"
     );
 }
+
+#[test]
+fn portable_sources_keep_legacy_runtime_lowering() {
+    for (source, runtime) in [
+        ("host_directory", "host"),
+        (
+            "{ image: alpine:3.20 }",
+            "{ container: { image: alpine:3.20 } }",
+        ),
+    ] {
+        let make = |key: &str, value: &str| {
+            lower_ok(&format!(
+                "scopes:\n  main:\n    {key}: {value}\nnodes:\n  step: {{ run: 'echo ok' }}\n"
+            ))
+        };
+        assert_eq!(make("source", source), make("runtime", runtime));
+    }
+}
+
+#[test]
+fn native_services_lower_to_the_common_scope_workload() {
+    let graph = lower_ok(
+        r"
+params: { password: test }
+scopes:
+  main:
+    source: { image: alpine:3.20 }
+    services:
+      db:
+        image: postgres:16
+        env: { POSTGRES_PASSWORD: '${{ params.password }}' }
+nodes:
+  step: { run: 'echo ok' }
+",
+    );
+    let service = &graph.scopes[0].services[0];
+    assert_eq!(service.name, "db");
+    assert_eq!(service.image, "postgres:16");
+    assert!(matches!(
+        service.env["POSTGRES_PASSWORD"],
+        ir::ExprOrValue::Expr(_)
+    ));
+    assert_eq!(service.options, ir::ServiceOptions::default());
+}
+
+#[test]
+fn unsupported_workload_inputs_are_never_silently_dropped() {
+    for input in [
+        "runtime: { container: { image: alpine }, environment: other }",
+        "runtime: host\n    source: host_directory",
+        "source: { snapshot: saved }",
+        "source: { image: '' }",
+        "services: { DB: { image: postgres } }",
+        "services: { db: { image: postgres, readiness: [pg_isready] } }",
+    ] {
+        let lowered = load(
+            "test.yml",
+            &format!("scopes:\n  main:\n    {input}\nnodes:\n  step: {{ run: 'echo ok' }}\n"),
+        );
+        assert!(lowered.diagnostics.has_errors(), "accepted {input}");
+        assert!(lowered.graph.is_none());
+    }
+}
