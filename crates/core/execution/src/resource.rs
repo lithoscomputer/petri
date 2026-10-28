@@ -15,6 +15,7 @@
 //! lease is refused.
 
 use std::collections::BTreeMap;
+use std::fmt;
 use std::sync::{Arc, Weak};
 
 use driver::RecordingClock;
@@ -35,6 +36,7 @@ use crate::{ExecutionId, SandboxAllocationKey, SandboxLeaseId};
 pub const HOST_PROVIDER: &str = "host";
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct SandboxResourceRecord {
     pub lease:         SandboxLeaseId,
     pub allocation:    SandboxAllocationKey,
@@ -58,9 +60,90 @@ pub struct SandboxResourceRecord {
     /// daemon or endpoint, and the account or target. Never credentials.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub fingerprint:   Option<SmolStr>,
+    /// Resolved non-secret workload inputs for newly admitted scopes. Old
+    /// records keep `None`; recovery must not backfill from current settings.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub admission:     Option<ScopeAdmission>,
+}
+
+/// Application-owned input snapshot on the legacy execution path. This is
+/// not a driver SandboxRef or a promise of new-contract provider semantics.
+#[derive(Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ScopeAdmission {
+    runtime:  ir::RuntimeSpec,
+    env:      BTreeMap<SmolStr, SmolStr>,
+    services: Vec<executor::ServiceSpec>,
+    /// Frozen legacy routing evidence, never a synthesized namespace.
+    binding:  Option<LegacyBinding>,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct LegacyBinding {
+    provider:    SmolStr,
+    fingerprint: SmolStr,
+}
+
+impl fmt::Debug for ScopeAdmission {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ScopeAdmission")
+            .field("env_keys", &self.env.keys())
+            .field("service_count", &self.services.len())
+            .field("binding", &self.binding)
+            .finish_non_exhaustive()
+    }
+}
+
+impl ScopeAdmission {
+    fn new(scope: &executor::ScopeSpec) -> Self {
+        Self {
+            runtime:  scope.runtime.clone(),
+            env:      scope.env.clone(),
+            services: scope.services.clone(),
+            binding:  None,
+        }
+    }
 }
 
 impl SandboxResourceRecord {
+    fn check_admission(&self) -> Result<(), ResourceError> {
+        if let Some(saved) = &self.admission
+            && (saved.runtime != self.runtime
+                || saved.binding.is_none() != self.fingerprint.is_none()
+                || saved.binding.as_ref().is_some_and(|binding| {
+                    binding.provider != self.provider
+                        || self.fingerprint.as_ref() != Some(&binding.fingerprint)
+                }))
+        {
+            return Err(ResourceError::AdmissionMismatch(self.lease));
+        }
+        Ok(())
+    }
+
+    fn check_admission_transition(&self, previous: &Self) -> Result<(), ResourceError> {
+        if previous.admission.is_none() && self.admission.is_some() {
+            return Err(ResourceError::AdmissionMismatch(self.lease));
+        }
+        if let Some(saved) = &previous.admission {
+            let Some(current) = &self.admission else {
+                return Err(ResourceError::AdmissionMismatch(self.lease));
+            };
+            if saved.runtime != current.runtime
+                || saved.env != current.env
+                || saved.services != current.services
+                || (saved.binding.is_some() && saved.binding != current.binding)
+                || self.lease != previous.lease
+                || self.allocation != previous.allocation
+                || self.workspace != previous.workspace
+                || self.introduced_by != previous.introduced_by
+            {
+                return Err(ResourceError::AdmissionMismatch(self.lease));
+            }
+        }
+        Ok(())
+    }
+
     /// Whether this lease still needs release. Host leases can own action
     /// hosts. A stopped sandbox with no pending intent already had its
     /// retention applied by its owning invocation.
@@ -74,6 +157,7 @@ impl SandboxResourceRecord {
 
 /// One line of the resource log: a lease's whole record at one transition.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ResourceLogRecord {
     pub seq:         u64,
     /// Milliseconds since the Unix epoch when the transition was recorded.
@@ -97,6 +181,8 @@ pub enum ResourceError {
     DuplicateAllocation(SandboxAllocationKey),
     #[error("sandbox allocation {0:?} does not match its recorded resource")]
     AllocationMismatch(SandboxAllocationKey),
+    #[error("sandbox lease {0} does not match its immutable admission snapshot")]
+    AdmissionMismatch(SandboxLeaseId),
     #[error("unknown sandbox lease {0}")]
     UnknownLease(SandboxLeaseId),
     #[error("sandbox lease {0} was deleted; its workspace is gone")]
@@ -141,6 +227,10 @@ impl ResourceStore {
                     source,
                 })?;
             let record = record.body;
+            record.check_admission()?;
+            if let Some(previous) = by_lease.get(&record.lease) {
+                record.check_admission_transition(previous)?;
+            }
             if let Some(existing) = by_allocation.insert(record.allocation.clone(), record.lease)
                 && existing != record.lease
             {
@@ -191,7 +281,7 @@ impl ResourceStore {
         &mut self,
         allocation: SandboxAllocationKey,
         provider: &str,
-        runtime: ir::RuntimeSpec,
+        scope: &executor::ScopeSpec,
         introduced_by: Option<ExecutionId>,
     ) -> Result<&SandboxResourceRecord, ResourceError> {
         let workspace = if let Some(lease) = self.by_allocation.get(&allocation) {
@@ -207,8 +297,15 @@ impl ResourceStore {
                 )),
             }
         };
-        self.ensure_record(allocation, provider, workspace, runtime, introduced_by)
-            .await
+        self.ensure_record_with_admission(
+            allocation,
+            provider.into(),
+            workspace,
+            scope.runtime.clone(),
+            introduced_by,
+            Some(ScopeAdmission::new(scope)),
+        )
+        .await
     }
 
     /// The record of `lease`, tombstones included: replay of a historical
@@ -243,7 +340,26 @@ impl ResourceStore {
         runtime: ir::RuntimeSpec,
         introduced_by: Option<ExecutionId>,
     ) -> Result<&SandboxResourceRecord, ResourceError> {
-        let provider = provider.into();
+        self.ensure_record_with_admission(
+            allocation,
+            provider.into(),
+            workspace,
+            runtime,
+            introduced_by,
+            None,
+        )
+        .await
+    }
+
+    async fn ensure_record_with_admission(
+        &mut self,
+        allocation: SandboxAllocationKey,
+        provider: SmolStr,
+        workspace: WorkspaceId,
+        runtime: ir::RuntimeSpec,
+        introduced_by: Option<ExecutionId>,
+        admission: Option<ScopeAdmission>,
+    ) -> Result<&SandboxResourceRecord, ResourceError> {
         if let Some(lease) = self.by_allocation.get(&allocation).copied() {
             let record = self
                 .by_lease
@@ -251,6 +367,13 @@ impl ResourceStore {
                 .expect("both resource indexes are written together");
             if record.workspace != workspace || record.runtime != runtime {
                 return Err(ResourceError::AllocationMismatch(allocation));
+            }
+            if let (Some(saved), Some(current)) = (&record.admission, &admission)
+                && (saved.runtime != current.runtime
+                    || saved.env != current.env
+                    || saved.services != current.services)
+            {
+                return Err(ResourceError::AdmissionMismatch(lease));
             }
             return Ok(record);
         }
@@ -266,6 +389,7 @@ impl ResourceStore {
             state: LeaseState::Allocating,
             pending: None,
             fingerprint: None,
+            admission,
         };
         self.write(&record).await?;
         self.next_lease = self.next_lease.saturating_add(1);
@@ -287,6 +411,8 @@ impl ResourceStore {
     ) -> Result<(), ResourceError> {
         let mut record = self.resolve(lease)?.clone();
         update(&mut record);
+        record.check_admission()?;
+        record.check_admission_transition(self.resolve(lease)?)?;
         self.write(&record).await?;
         self.by_lease.insert(lease, record);
         Ok(())
@@ -391,6 +517,12 @@ impl LeaseLedger for ResourceLedger {
             record.pending = None;
             record.provider = SmolStr::new(provider);
             record.fingerprint = Some(SmolStr::new(fingerprint));
+            if let Some(admission) = &mut record.admission {
+                admission.binding.get_or_insert_with(|| LegacyBinding {
+                    provider:    SmolStr::new(provider),
+                    fingerprint: SmolStr::new(fingerprint),
+                });
+            }
         })
         .await
     }
@@ -427,5 +559,220 @@ impl LeaseLedger for ResourceLedger {
             record.pending = None;
         })
         .await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use executor::{ScopeSpec, ServiceSpec};
+    use ir::{RuntimeSpec, ScopeId};
+    use serde_json::json;
+
+    use super::*;
+    use crate::{Access, InvocationId, MemoryRunStore, OwnerId, RunKey, RunStore as _};
+
+    fn allocation() -> SandboxAllocationKey {
+        SandboxAllocationKey {
+            invocation: InvocationId::ROOT,
+            scope:      engine::ScopeIdentity::Declared(ScopeId::new(0)),
+        }
+    }
+
+    fn scope() -> ScopeSpec {
+        ScopeSpec::new(ScopeId::new(0), "scope-0")
+            .with_runtime(RuntimeSpec::container("alpine:3.20"))
+            .with_env(BTreeMap::from([("SETTING".into(), "admitted".into())]))
+            .with_services(vec![ServiceSpec::new("db", "postgres:16")])
+    }
+
+    async fn fixture() -> (Arc<dyn RunLogs>, ResourceStore, SandboxLeaseId) {
+        let logs = MemoryRunStore::new()
+            .open(&RunKey::new("admission"), Access::Create {
+                owner: OwnerId::mint(),
+            })
+            .await
+            .unwrap();
+        let mut resources = ResourceStore::load(&logs).await.unwrap();
+        let lease = resources
+            .reserve_scope(allocation(), "docker", &scope(), None)
+            .await
+            .unwrap()
+            .lease;
+        (logs, resources, lease)
+    }
+
+    #[tokio::test]
+    async fn reservation_atomically_saves_inputs_and_refuses_later_edits() {
+        let (logs, _, lease) = fixture().await;
+        assert_eq!(logs.read(&LogId::Resources).await.unwrap().len(), 1);
+        let mut reopened = ResourceStore::load(&logs).await.unwrap();
+        reopened
+            .reserve_scope(allocation(), "docker", &scope(), None)
+            .await
+            .unwrap();
+        for change_service in [false, true] {
+            let mut changed = scope();
+            if change_service {
+                changed.services[0].image = "postgres:17".into();
+            } else {
+                changed
+                    .env
+                    .insert("SETTING".into(), "edited catalog".into());
+            }
+            assert!(
+                matches!(reopened.reserve_scope(allocation(), "docker", &changed, None).await,
+                Err(ResourceError::AdmissionMismatch(id)) if id == lease)
+            );
+        }
+        assert_eq!(logs.read(&LogId::Resources).await.unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn legacy_binding_is_frozen_and_delete_history_keeps_the_snapshot() {
+        let (logs, resources, lease) = fixture().await;
+        let ledger = ResourceLedger::new(Arc::new(Mutex::new(resources)));
+        ledger
+            .allocating(lease, "docker", "original-daemon")
+            .await
+            .unwrap();
+        ledger.live(lease, "box-1").await.unwrap();
+        for (provider, fingerprint) in
+            [("daytona", "original-daemon"), ("docker", "another-daemon")]
+        {
+            assert!(
+                ledger
+                    .allocating(lease, provider, fingerprint)
+                    .await
+                    .is_err()
+            );
+        }
+        ledger.pending(lease, PendingIntent::Delete).await.unwrap();
+        let pending = ResourceStore::load(&logs).await.unwrap();
+        assert_eq!(
+            pending.resolve(lease).unwrap().pending,
+            Some(PendingIntent::Delete)
+        );
+        assert_eq!(
+            pending.resolve(lease).unwrap().resource_id.as_deref(),
+            Some("box-1")
+        );
+        let saved = pending.resolve(lease).unwrap().admission.clone();
+        ledger.deleted(lease).await.unwrap();
+        let deleted = ResourceStore::load(&logs).await.unwrap();
+        assert_eq!(deleted.resolve(lease).unwrap().admission, saved);
+        assert!(matches!(
+            deleted.resolve_usable(lease),
+            Err(ResourceError::DeletedLease(_))
+        ));
+        assert!(!deleted.resolve(lease).unwrap().needs_release());
+    }
+
+    #[tokio::test]
+    async fn replay_and_updates_reject_rewritten_or_removed_admission() {
+        for remove in [false, true] {
+            let (logs, mut resources, lease) = fixture().await;
+            let mut changed = resources.resolve(lease).unwrap().clone();
+            if remove {
+                changed.admission = None;
+            } else {
+                changed
+                    .admission
+                    .as_mut()
+                    .unwrap()
+                    .env
+                    .insert("SETTING".into(), "changed".into());
+            }
+            assert!(matches!(
+                resources
+                    .update(lease, |record| *record = changed.clone())
+                    .await,
+                Err(ResourceError::AdmissionMismatch(_))
+            ));
+            // Simulate an incompatible writer, bypassing this build's checks.
+            let line = ResourceLogRecord {
+                seq:         1,
+                recorded_at: 0,
+                body:        changed,
+            };
+            logs.append(&LogId::Resources, &[Record::encode(&line).unwrap()])
+                .await
+                .unwrap();
+            assert!(matches!(
+                ResourceStore::load(&logs).await,
+                Err(ResourceError::AdmissionMismatch(_))
+            ));
+        }
+    }
+
+    #[tokio::test]
+    async fn old_records_stay_legacy_and_never_gain_current_binding_or_inputs() {
+        let (logs, resources, lease) = fixture().await;
+        let initial = resources.resolve(lease).unwrap();
+        let mut raw = serde_json::to_value(initial).unwrap();
+        for field in [
+            "admission",
+            "state",
+            "pending",
+            "fingerprint",
+            "resource_id",
+        ] {
+            raw.as_object_mut().unwrap().remove(field);
+        }
+        let old: SandboxResourceRecord = serde_json::from_value(raw).unwrap();
+        assert_eq!(old.state, LeaseState::Allocating);
+        assert!(old.admission.is_none());
+        assert!(old.fingerprint.is_none());
+        let old_logs = MemoryRunStore::new()
+            .open(&RunKey::new("legacy"), Access::Create {
+                owner: OwnerId::mint(),
+            })
+            .await
+            .unwrap();
+        old_logs
+            .append(&LogId::Resources, &[Record::encode(&ResourceLogRecord {
+                seq:         0,
+                recorded_at: 0,
+                body:        old,
+            })
+            .unwrap()])
+            .await
+            .unwrap();
+        let mut legacy = ResourceStore::load(&old_logs).await.unwrap();
+        let record = legacy
+            .reserve_scope(allocation(), "daytona", &scope(), None)
+            .await
+            .unwrap();
+        assert!(record.admission.is_none());
+        assert_eq!(record.provider, "docker");
+        assert!(record.fingerprint.is_none());
+        assert_eq!(old_logs.read(&LogId::Resources).await.unwrap().len(), 1);
+        drop(logs);
+    }
+
+    #[tokio::test]
+    async fn future_identity_and_workload_fields_fail_closed() {
+        let (_, resources, lease) = fixture().await;
+        let original = serde_json::to_value(resources.resolve(lease).unwrap()).unwrap();
+        for field in ["sandbox_ref", "provider_binding", "format_version"] {
+            let mut future = original.clone();
+            future[field] =
+                json!({"provider": "prod", "namespace": "backend-issued", "id": "box-1"});
+            assert!(serde_json::from_value::<SandboxResourceRecord>(future).is_err());
+        }
+        let mut future = original;
+        future["runtime"]["environment"] = json!("new-catalog-entry");
+        assert!(serde_json::from_value::<SandboxResourceRecord>(future).is_err());
+    }
+
+    #[test]
+    fn admission_debug_does_not_print_workload_values() {
+        let mut scope = scope();
+        scope.env.insert("TOKEN".into(), "sensitive-value".into());
+        scope.services[0]
+            .env
+            .insert("PASSWORD".into(), "sensitive-value".into());
+        let debug = format!("{:?}", ScopeAdmission::new(&scope));
+        assert!(debug.contains("TOKEN"));
+        assert!(!debug.contains("sensitive-value"));
     }
 }

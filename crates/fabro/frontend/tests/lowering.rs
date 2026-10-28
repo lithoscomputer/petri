@@ -1570,3 +1570,45 @@ fn workflow_secrets_reach_agent_processes_as_references() {
         );
     }
 }
+
+#[test]
+fn environment_name_short_form_uses_the_existing_layered_translation() {
+    let host = "[environments.review]\nprovider = \"docker\"\n[environments.review.image]\ndocker = \"alpine:3.20\"\n[run.environment.env]\nFROM_HOST = \"yes\"\n";
+    let inputs = CompileInputs::new().with_var(SETTINGS_HOOKS_VAR, host);
+    let lower = |selection: &str| {
+        let loaded = load(
+            "wf/w.fabro",
+            &dot("start -> exit"),
+            &files(&[("wf/workflow.toml", selection)]),
+            &inputs,
+        );
+        assert!(!loaded.diagnostics.has_errors(), "{:?}", loaded.diagnostics);
+        loaded.graph.unwrap()
+    };
+    let short = lower("[run]\nenvironment = \"review\"\n");
+    let table = lower("[run.environment]\nid = \"review\"\n");
+    assert_eq!(short.scopes, table.scopes);
+    assert_eq!(short.params, table.params);
+    assert_eq!(short.params["fabro.environment"]["id"], "review");
+}
+
+#[test]
+fn malformed_environment_selections_fail_before_lowering() {
+    for value in ["''", "'   '", "42", "[]", "false"] {
+        let text = format!("[run]\nenvironment = {value}\n");
+        let lowered = load(
+            "wf/w.fabro",
+            &dot("start -> exit"),
+            &files(&[("wf/workflow.toml", &text)]),
+            &CompileInputs::new(),
+        );
+        assert!(
+            lowered
+                .diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.code == "fabro.settings.environment"),
+            "{value}"
+        );
+        assert!(lowered.graph.is_none());
+    }
+}

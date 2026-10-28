@@ -19,6 +19,7 @@ use smol_str::SmolStr;
 /// Options a job's container accepts.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
+#[serde(deny_unknown_fields)]
 pub struct ContainerOptions {
     /// `-e KEY=VALUE`; applied after the scope env, so a flag wins.
     #[serde(skip_serializing_if = "Vec::is_empty")]
@@ -38,6 +39,7 @@ pub struct ContainerOptions {
 /// Options a service container accepts.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
+#[serde(deny_unknown_fields)]
 pub struct ServiceOptions {
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub env:        Vec<(SmolStr, SmolStr)>,
@@ -61,6 +63,7 @@ pub struct ServiceOptions {
 /// A service's health check, in the shape Docker's own takes.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
+#[serde(deny_unknown_fields)]
 pub struct HealthCheck {
     /// The check command, run by the container's default shell.
     #[serde(skip_serializing_if = "Option::is_none")]

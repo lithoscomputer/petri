@@ -31,13 +31,38 @@ nodes:
     run: echo "deploying"
 ```
 
-A scope's `runtime` is `host` or `{ container: { image: … } }`, and the
-container form takes only the image. What runs the container, and with which
-flags, is the executor's configuration, not the workflow's; the native format
-carries no container options and no service containers. (The graph has typed
-fields for both — `ir::ContainerOptions`, `ir::ServiceOptions` — which the
-GitHub frontend fills from `container.options` and `services:`. A native key
-for them would lower the same way.)
+A scope may name `source: host_directory` or `source: { image: alpine:3.20 }`.
+These lower to the same shared runtime targets as the existing `runtime: host`
+and `runtime: { container: { image: alpine:3.20 } }` forms. Use one spelling,
+not both. `host_directory` selects the legacy process workload; the CLI's
+existing backend and runner settings still decide where that process runs.
+It does not promise new driver Host ownership semantics.
+
+Basic service workloads use the common scope service model:
+
+```yaml
+scopes:
+  main:
+    source: { image: alpine:3.20 }
+    services:
+      db:
+        image: postgres:16
+        env:
+          POSTGRES_PASSWORD: ${{ params.database_password }}
+```
+
+Services have lowercase DNS-label names and accept `image` and `env`. Their env
+uses the same parameter expressions as scope env. The existing executor owns
+service startup and cleanup; without a readiness check, startup is not an
+application-readiness guarantee. Native container options, service ports,
+credentials, readiness, snapshots and Dockerfile sources are not enabled yet;
+unsupported keys fail lowering. GitHub's existing container/service options
+continue to use the shared IR and their legacy execution semantics.
+
+Named driver environments and provider overrides remain gated on the shared
+catalog integration. Native input does not silently reinterpret an environment
+name as a provider kind. See [sandbox transition](../executor-sandbox/TRANSITION.md)
+for the common mapping and saved-record rules.
 
 ## Routing — the explicit part
 

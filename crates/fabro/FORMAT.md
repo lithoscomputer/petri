@@ -83,3 +83,16 @@ workflow environment for the same name. That is the reverse of Fabro, where
 the workflow environment won. As in Fabro, an ACP agent gets no product API
 key the workflow does not name. Secret values never enter the admitted graph or
 unmasked run records. See "ACP products" in the Attractor format.
+
+## Environment selection compatibility
+
+`[run] environment = "review"` is a shorthand for `[run.environment] id = "review"`.
+It uses the same layered `[environments.review]` lookup, overrides and CLI
+`--environment` precedence. The name is retained in `fabro.environment.id`;
+the existing provider/image translation and execution path remain active.
+Empty names and values other than a name or table are errors.
+
+This is the existing Fabro catalog, not activation of the driver's new catalog.
+Connection `config_schema` and workload `provider_config`/`spec_schema` remain
+separate in that future integration. See the
+[sandbox transition](../core/executor-sandbox/TRANSITION.md).

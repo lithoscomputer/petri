@@ -763,6 +763,7 @@ pub enum ExprOrValue<S = Live> {
 
 /// Where a scope's steps run, plus the placement hints that go with it.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct RuntimeSpec {
     pub target:       RuntimeTarget,
     /// Uninterpreted placement labels, populated by frontends from whatever
@@ -782,6 +783,7 @@ pub struct RuntimeSpec {
 /// are provided — this machine, a Docker daemon, a cloud API — is the
 /// executor's business and never named here.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub enum RuntimeTarget {
     /// A process with the machine's own filesystem and tools.
     HostProcess,

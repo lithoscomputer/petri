@@ -61,7 +61,7 @@ pub use observe::{
 };
 pub use resource::{
     HOST_PROVIDER, LeaseState, PendingIntent, ResourceError, ResourceLedger, ResourceLogRecord,
-    ResourceStore, SandboxResourceRecord,
+    ResourceStore, SandboxResourceRecord, ScopeAdmission,
 };
 pub use secret::InvocationSecrets;
 pub use state::{
