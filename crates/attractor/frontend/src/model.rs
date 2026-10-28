@@ -62,6 +62,11 @@ pub struct Attr {
     pub span:  Span,
 }
 
+/// Attributes that together make one choice: a layer setting any of them
+/// replaces all of them, so a node's `acp.config` never pairs with an
+/// inherited `acp.command`.
+const ONE_CHOICE: &[&str] = &["acp.command", "acp.config"];
+
 /// An attribute map, with typed accessors that diagnose a wrong type instead
 /// of ignoring it: Fabro reads a mistyped attribute as absent, and a value
 /// that silently does nothing is exactly the failure a frontend must not
@@ -86,6 +91,26 @@ impl Attrs {
 
     pub fn remove(&mut self, key: &str) -> Option<Attr> {
         self.map.remove(key)
+    }
+
+    /// Clear what a layer setting `keys` replaces as a whole, before the
+    /// layer's own values go in: both ACP agent attributes when it sets
+    /// either.
+    pub fn replace_choices<'k>(&mut self, keys: impl IntoIterator<Item = &'k str>) {
+        if keys.into_iter().any(|key| ONE_CHOICE.contains(&key)) {
+            for key in ONE_CHOICE {
+                self.map.remove(*key);
+            }
+        }
+    }
+
+    /// Lay `layer` over these attributes: its values win, and a choice it
+    /// makes replaces the inherited one whole.
+    pub fn overlay(&mut self, layer: &Self) {
+        self.replace_choices(layer.keys());
+        for (key, attr) in layer.iter() {
+            self.insert(key, attr.value.clone(), attr.span.clone());
+        }
     }
 
     pub fn iter(&self) -> impl Iterator<Item = (&str, &Attr)> {
@@ -367,6 +392,7 @@ impl Builder {
     }
 
     fn apply_block(attrs: &mut Attrs, block: &AttrBlock) {
+        attrs.replace_choices(block.iter().map(|attr| attr.key.as_str()));
         for attr in block {
             attrs.insert(
                 &attr.key,
@@ -382,11 +408,14 @@ impl Builder {
         for statement in statements {
             match statement {
                 Statement::GraphAttrs(block) => Self::apply_block(&mut self.workflow.attrs, block),
-                Statement::GraphAttr(attr) => self.workflow.attrs.insert(
-                    &attr.key,
-                    AttrValue::from_ast(&attr.value),
-                    attr.span.clone(),
-                ),
+                Statement::GraphAttr(attr) => {
+                    self.workflow.attrs.replace_choices([attr.key.as_str()]);
+                    self.workflow.attrs.insert(
+                        &attr.key,
+                        AttrValue::from_ast(&attr.value),
+                        attr.span.clone(),
+                    );
+                }
                 Statement::NodeDefaults(block) => Self::apply_block(&mut self.node_defaults, block),
                 Statement::EdgeDefaults(block) => Self::apply_block(&mut self.edge_defaults, block),
                 Statement::Node(stmt) => {

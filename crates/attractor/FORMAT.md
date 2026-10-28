@@ -63,7 +63,8 @@ predecessor, both with their attributes. The placeholder may carry only
 `import`, `class`, and the inheritable defaults `model`, `provider`,
 `reasoning_effort`, `speed`, `backend`, `acp.command`, `acp.config`,
 `fidelity`, `max_retries`, `thread_id`; each default lands on every imported
-node that does not set it. The placeholder's classes and a class made from its
+node that does not set it, and an imported node that sets `acp.command` or
+`acp.config` takes neither from the placeholder. The placeholder's classes and a class made from its
 id (lowercase, spaces to `-`, `[a-z0-9-]` only) propagate to every imported
 node. `retry_target` and `fallback_retry_target` inside the import are rewritten
 to the prefixed ids; `@file` references inside it resolve beside the imported
@@ -474,12 +475,18 @@ the coordinator registers `attractor_steps::workflow::ChildInvoker`.
   the client gives it, is under "ACP products" below. `provider` (or `default_provider`) qualifies the
   model selector, and `reasoning_effort` configures the actual model request.
   The node's backend overrides the graph's backend; model stylesheets can also
-  select it. `acp.command` and `acp.config` are inherited as one choice: a node
-  setting either inherits neither graph attribute; otherwise an ACP node
-  inherits the graph's pair. A selected pair containing both attributes is
-  rejected. Graph ACP configuration applies only to ACP nodes; nodes whose
-  backend defaults to API inherit no ACP options. Setting ACP options directly
-  on an API node is an error. An ACP turn that fails after
+  select it. `acp.command` and `acp.config` are one choice wherever they are
+  inherited: a node, a `node [...]` default or an import placeholder that sets
+  either replaces both from the level above, and a later statement about the
+  same node replaces an earlier one's pair. An ACP node that sets neither
+  inherits the graph's pair. Setting both at one level is an error. The graph's
+  pair is checked once, at the graph, whether or not a node inherits it:
+  `acp.command` must split into a non-empty command line, and `acp.config`
+  must be a JSON object with a non-empty `command` (the step checks the rest
+  of the stdio shape when it starts the agent). Graph ACP configuration
+  applies only to ACP nodes. Setting ACP options on a node that runs on the
+  API, by `backend="api"` or because no backend is set, is an error. An ACP
+  turn that fails after
   the agent started (the process exits before the protocol completes, a
   protocol error, a rejected request, a stop reason other than `end_turn` or
   `refusal`, or a turn that outlives the node's `timeout`) is classed
@@ -1456,6 +1463,10 @@ call to the prompt that compacted, so these two are a breakdown of
 | a node that sets both `script` and `prompt` | `attractor.script_prompt_conflict` |
 | `for_each` on a node that is not a `component` | `attractor.for_each.not_parallel` |
 | an agent on `backend="acp"` with no `acp.command` or `acp.config` on the node or the graph | `attractor.acp_requires_command` |
+| `acp.command` and `acp.config` both set on a node or on the graph | `attractor.acp_both` |
+| an `acp.command` that is empty or has unbalanced quotes | `attractor.bad_acp_command` |
+| an `acp.config` that is not a JSON object with a non-empty `command` | `attractor.bad_acp_config` |
+| `acp.command` or `acp.config` on a prompt node, or on an agent that runs on the API | `attractor.backend_options` |
 | an agent on `backend="acp"` that sets `model`, `provider`, `reasoning_effort`, `max_tokens` or `speed` itself (a stylesheet's value does not count) | `attractor.acp_api_only_attributes` |
 | with a model client at `Runtime::check`: a model, provider, or chain entry the catalog cannot resolve (see "Model resolution at admission") | `attractor.model.unknown` |
 | with a model client at `Runtime::check`: a `[run.model.fallbacks]` table that is malformed or keyed by a provider | `attractor.model.fallbacks` |

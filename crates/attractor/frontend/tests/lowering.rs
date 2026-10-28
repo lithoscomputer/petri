@@ -10,7 +10,7 @@ use std::num::NonZeroU32;
 use std::time::Duration;
 
 use frontend::print::print_expr;
-use frontend::{CompileInputs, NoFiles};
+use frontend::{CompileInputs, Diagnostic, NoFiles};
 use frontend_attractor::kinds::{
     AGENT_KIND, BRANCH_KIND, COMMAND_KIND, FAN_IN_KIND, FORK_KIND, HUMAN_KIND, PROMPT_KIND,
     STAGE_KIND, WAIT_KIND, WORKFLOW_KIND,
@@ -2167,8 +2167,6 @@ fn acp_nodes_inherit_or_replace_graph_agents_as_a_pair() {
                 r#"acp.config="{\"command\":\"node-agent\",\"args\":[\"--strict\"]}""#,
                 json!({"config": {"command": "node-agent", "args": ["--strict"]}}),
             ),
-            // Presence, not validity, determines which level supplies the pair.
-            (r#"acp.command="""#, json!({"command": ""})),
         ] {
             let graph = lower_ok(&dot(&format!(
                 r#"
@@ -2183,35 +2181,102 @@ fn acp_nodes_inherit_or_replace_graph_agents_as_a_pair() {
 }
 
 #[test]
-fn acp_node_overrides_ignore_conflicting_or_invalid_graph_defaults() {
-    for graph_attrs in [
-        r#"acp.command="shared-agent", acp.config="{}""#,
-        r#"acp.config="not JSON""#,
+fn acp_node_defaults_are_replaced_as_a_pair() {
+    for (defaults, node_attrs, expected) in [
+        (
+            r#"node [acp.command="shared-agent"]"#,
+            r#"acp.config="{\"command\":\"node-agent\"}""#,
+            json!({"config": {"command": "node-agent"}}),
+        ),
+        (
+            r#"node [acp.config="{\"command\":\"shared-agent\"}"]"#,
+            r#"acp.command="node-agent""#,
+            json!({"command": "node-agent"}),
+        ),
     ] {
-        for (node_attrs, expected) in [
-            (
-                r#"acp.command="node-agent""#,
-                json!({"command": "node-agent"}),
-            ),
-            (
-                r#"acp.config="{\"command\":\"node-agent\"}""#,
-                json!({"config": {"command": "node-agent"}}),
-            ),
-        ] {
-            let graph = lower_ok(&dot(&format!(
-                r#"
-                graph [{graph_attrs}]
+        let graph = lower_ok(&dot(&format!(
+            r#"
+            {defaults}
+            subgraph cluster_r {{
                 a [backend="acp", prompt="work", {node_attrs}]
-                start -> a -> exit
-            "#
-            )));
-            assert_eq!(node(&graph, "a").step.config["acp"], expected);
-        }
+            }}
+            start -> a -> exit
+        "#
+        )));
+        assert_eq!(node(&graph, "a").step.config["acp"], expected, "{defaults}");
     }
+    // A subgraph's defaults replace the outer pair for the subgraph's nodes.
+    let graph = lower_ok(&dot(r#"
+        node [acp.command="outer"]
+        subgraph cluster_r {
+            node [acp.config="{\"command\":\"inner\"}"]
+            a [backend="acp", prompt="work"]
+        }
+        b [backend="acp", prompt="work"]
+        start -> a -> b -> exit
+    "#));
+    assert_eq!(
+        node(&graph, "a").step.config["acp"],
+        json!({"config": {"command": "inner"}})
+    );
+    assert_eq!(
+        node(&graph, "b").step.config["acp"],
+        json!({"command": "outer"})
+    );
+    // A later statement about a node replaces the pair an earlier one set.
+    let graph = lower_ok(&dot(r#"
+        a [backend="acp", prompt="work", acp.command="first-agent"]
+        a [acp.config="{\"command\":\"second-agent\"}"]
+        start -> a -> exit
+    "#));
+    assert_eq!(
+        node(&graph, "a").step.config["acp"],
+        json!({"config": {"command": "second-agent"}})
+    );
+    // A node a statement names before declaring it starts from the defaults.
+    let graph = lower_ok(&dot(r#"
+        node [acp.command="shared-agent"]
+        start -> a -> exit
+        a [backend="acp", prompt="work", acp.config="{\"command\":\"node-agent\"}"]
+    "#));
+    assert_eq!(
+        node(&graph, "a").step.config["acp"],
+        json!({"config": {"command": "node-agent"}})
+    );
 }
 
 #[test]
-fn acp_selected_conflicts_and_invalid_configs_are_still_rejected() {
+fn acp_import_defaults_are_replaced_as_a_pair() {
+    let files = files(&[(
+        "review.fabro",
+        r#"digraph Review {
+            start [shape=Mdiamond]
+            exit [shape=Msquare]
+            check [backend="acp", prompt="check", acp.config="{\"command\":\"node-agent\"}"]
+            plain [backend="acp", prompt="plain"]
+            start -> check -> plain -> exit
+        }"#,
+    )]);
+    let graph = lower_ok_with(
+        &dot(r#"
+            review [import="review.fabro", acp.command="shared-agent"]
+            start -> review -> exit
+        "#),
+        &files,
+        &CompileInputs::new(),
+    );
+    assert_eq!(
+        node(&graph, "review.check").step.config["acp"],
+        json!({"config": {"command": "node-agent"}})
+    );
+    assert_eq!(
+        node(&graph, "review.plain").step.config["acp"],
+        json!({"command": "shared-agent"})
+    );
+}
+
+#[test]
+fn acp_selected_conflicts_and_invalid_agents_are_rejected() {
     for (graph_attrs, node_attrs, code) in [
         (
             "",
@@ -2239,6 +2304,24 @@ fn acp_selected_conflicts_and_invalid_configs_are_still_rejected() {
             "attractor.bad_acp_config",
         ),
         (r#"acp.config="not JSON""#, "", "attractor.bad_acp_config"),
+        ("", r#"acp.config="{}""#, "attractor.bad_acp_config"),
+        ("", r#"acp.config="42""#, "attractor.bad_acp_config"),
+        (
+            "",
+            r#"acp.config="{\"command\":\"\"}""#,
+            "attractor.bad_acp_config",
+        ),
+        (
+            r#"acp.command="shared-agent""#,
+            r#"acp.command="""#,
+            "attractor.bad_acp_command",
+        ),
+        ("", r#"acp.command="  ""#, "attractor.bad_acp_command"),
+        (
+            "",
+            r#"acp.command="agent 'open""#,
+            "attractor.bad_acp_command",
+        ),
     ] {
         let text = dot(&format!(
             r#"
@@ -2247,21 +2330,50 @@ fn acp_selected_conflicts_and_invalid_configs_are_still_rejected() {
             start -> a -> exit
         "#
         ));
-        let lowered = load(
-            "w.fabro",
-            &text,
-            &frontend::NoFiles,
-            &frontend::CompileInputs::new(),
-        );
-        assert!(lowered.graph.is_none());
         assert!(
-            lowered
-                .diagnostics
-                .iter()
-                .any(|d| d.is_error() && d.code == code),
+            codes(&text).contains(&code.to_string()),
             "{graph_attrs}; {node_attrs}: {:?}",
-            lowered.diagnostics
+            diagnostics(&text)
         );
+    }
+}
+
+#[test]
+fn acp_graph_agents_are_diagnosed_once_at_the_graph() {
+    for (graph_attrs, code) in [
+        (
+            r#"acp.command="agent", acp.config="{\"command\":\"agent\"}""#,
+            "attractor.acp_both",
+        ),
+        (r#"acp.config="not JSON""#, "attractor.bad_acp_config"),
+    ] {
+        // Whether every ACP node inherits the graph's agent, every ACP node
+        // names its own, or no node runs on ACP, the graph's error is one
+        // error, about the graph.
+        for nodes in [
+            r#"a [backend="acp", prompt="work"]; b [backend="acp", prompt="work"]"#,
+            r#"a [backend="acp", prompt="work", acp.command="node-agent"]; b [prompt="work"]"#,
+            r#"a [prompt="work"]; b [backend="api", prompt="work"]"#,
+        ] {
+            let text = dot(&format!(
+                r"
+                graph [{graph_attrs}]
+                {nodes}
+                start -> a -> b -> exit
+            "
+            ));
+            let errors: Vec<_> = diagnostics(&text)
+                .into_iter()
+                .filter(Diagnostic::is_error)
+                .collect();
+            assert_eq!(errors.len(), 1, "{graph_attrs}; {nodes}: {errors:?}");
+            assert_eq!(errors[0].code, code);
+            assert!(
+                errors[0].message.contains("the graph"),
+                "{}",
+                errors[0].message
+            );
+        }
     }
 }
 
@@ -2311,26 +2423,25 @@ fn acp_graph_defaults_follow_the_effective_backend() {
 }
 
 #[test]
-fn acp_invalid_graph_defaults_do_not_reject_api_or_prompt_nodes() {
-    for graph_attrs in [
-        r#"acp.command="agent", acp.config="{}""#,
-        r#"acp.config="not JSON""#,
+fn api_nodes_cannot_name_an_acp_agent() {
+    for node_attrs in [
+        r#"acp.command="agent""#,
+        r#"backend="api", acp.command="agent""#,
+        r#"acp.config="{\"command\":\"agent\"}""#,
     ] {
-        let graph = lower_ok(&dot(&format!(
+        let text = dot(&format!(
             r#"
-            graph [{graph_attrs}]
-            implicit [prompt="work"]
-            explicit [backend="api", prompt="work"]
-            p [shape=tab, prompt="summarize"]
-            start -> implicit -> explicit -> p -> exit
+            a [prompt="work", {node_attrs}]
+            start -> a -> exit
         "#
-        )));
-        for name in ["implicit", "explicit", "p"] {
-            assert!(
-                node(&graph, name).step.config.get("acp").is_none(),
-                "{name}"
-            );
-        }
+        ));
+        let errors: Vec<_> = diagnostics(&text)
+            .into_iter()
+            .filter(Diagnostic::is_error)
+            .collect();
+        assert_eq!(errors.len(), 1, "{node_attrs}: {errors:?}");
+        assert_eq!(errors[0].code, "attractor.backend_options");
+        assert!(errors[0].hint.is_some(), "{node_attrs}");
     }
 }
 

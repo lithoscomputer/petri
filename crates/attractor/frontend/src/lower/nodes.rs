@@ -3,7 +3,7 @@
 use std::collections::{HashSet, VecDeque};
 use std::time::Duration;
 
-use frontend::Span;
+use frontend::{Diagnostic, Span};
 use ir::placeholder::{ADMISSION_HOOKS_BY_STEP, ADMISSION_HOOKS_META};
 use ir::{Budget, ExprId, StepRef};
 use serde_json::{Map, Value, json};
@@ -17,7 +17,7 @@ use crate::kinds::{
     AGENT_KIND, COMMAND_KIND, HUMAN_KIND, MAX_OUTPUT_RETRIES, PROMPT_KIND, STAGE_KIND, WAIT_KIND,
     WORKFLOW_KIND,
 };
-use crate::model::{NodeDecl, Workflow};
+use crate::model::{Attrs, NodeDecl, Workflow};
 use crate::{labels, template};
 
 impl Ctx<'_> {
@@ -393,24 +393,31 @@ impl Ctx<'_> {
                 Value::from(retries.min(i64::try_from(MAX_OUTPUT_RETRIES).unwrap_or(i64::MAX))),
             );
         }
-        if is_prompt {
-            if node.attrs.text("acp.command").is_some() || node.attrs.text("acp.config").is_some() {
-                self.diags.error(
-                    "attractor.backend_options",
-                    node.span.clone(),
-                    "a prompt node cannot set acp.command or acp.config; prompt nodes are API-only",
-                );
-            }
-        } else if config.get("backend").and_then(Value::as_str) == Some("api") {
-            if node.attrs.text("acp.command").is_some() || node.attrs.text("acp.config").is_some() {
-                self.diags.error(
+        let sets_acp = node.attrs.contains("acp.command") || node.attrs.contains("acp.config");
+        if acp_backend {
+            self.acp(node, workflow, &mut config);
+        } else if sets_acp && is_prompt {
+            self.diags.error(
+                "attractor.backend_options",
+                node.span.clone(),
+                "a prompt node cannot set acp.command or acp.config; prompt nodes are API-only",
+            );
+        } else if sets_acp
+            && matches!(
+                config.get("backend").and_then(Value::as_str),
+                None | Some("api")
+            )
+        {
+            // With no backend anywhere, the node runs on the API, which reads
+            // no ACP agent.
+            self.diags.push(
+                Diagnostic::error(
                     "attractor.backend_options",
                     node.span.clone(),
                     "an API node cannot set acp.command or acp.config",
-                );
-            }
-        } else {
-            self.acp(node, workflow, &mut config, acp_backend);
+                )
+                .with_hint("set `backend=\"acp\"` to run the node on an ACP agent"),
+            );
         }
         // An agent's processes, on either backend, see the workflow's secrets:
         // the ACP agent itself, and a native session's tool shells.
@@ -456,49 +463,73 @@ impl Ctx<'_> {
         }
     }
 
-    /// The node's ACP agent, from the node or the graph. `acp_backend` says
-    /// the node runs on `backend="acp"`, where naming no agent is an error.
-    fn acp(
-        &mut self,
-        node: &NodeDecl,
-        workflow: &Workflow,
-        config: &mut Map<String, Value>,
-        acp_backend: bool,
-    ) {
-        // Command and config are one choice: a node setting either replaces
-        // the whole graph pair. Only ACP agents inherit graph defaults.
-        let attrs = if acp_backend
-            && !node.attrs.contains("acp.command")
-            && !node.attrs.contains("acp.config")
-        {
-            &workflow.attrs
+    /// The ACP agent of a node on `backend="acp"`, from the node or the
+    /// graph. Command and config are one choice: a node setting either
+    /// inherits neither from the graph. Naming no agent is an error.
+    fn acp(&mut self, node: &NodeDecl, workflow: &Workflow, config: &mut Map<String, Value>) {
+        let agent = if node.attrs.contains("acp.command") || node.attrs.contains("acp.config") {
+            self.acp_agent(&node.attrs, &format!("node `{}`", node.id), &node.span)
+        } else if workflow.attrs.contains("acp.command") || workflow.attrs.contains("acp.config") {
+            // The graph's pair was diagnosed once, at the graph.
+            self.graph_acp.clone()
         } else {
-            &node.attrs
+            lints::acp_requires_command(node, &mut self.diags);
+            None
         };
+        if let Some(agent) = agent {
+            config.insert("acp".into(), agent);
+        }
+    }
+
+    /// The ACP agent `attrs` name, as a step's `acp` value: `acp.command`, a
+    /// command line, or `acp.config`, a JSON stdio server with a `command`;
+    /// never both. `owner` names whose attributes they are in diagnostics,
+    /// which point at `span` when the attribute has no position. The rest of
+    /// the stdio shape is the step's to check when it starts the agent.
+    pub(super) fn acp_agent(&mut self, attrs: &Attrs, owner: &str, span: &Span) -> Option<Value> {
         match (attrs.text("acp.command"), attrs.text("acp.config")) {
-            (Some(_), Some(_)) => self.diags.error(
-                "attractor.acp_both",
-                node.attrs.span_of("acp.command", &node.span),
-                format!(
-                    "node `{}` sets both `acp.command` and `acp.config`",
-                    node.id
-                ),
-            ),
-            (Some(command), None) => {
-                config.insert("acp".into(), json!({ "command": command }));
+            (Some(_), Some(_)) => {
+                self.diags.error(
+                    "attractor.acp_both",
+                    attrs.span_of("acp.command", span),
+                    format!("{owner} sets both `acp.command` and `acp.config`"),
+                );
+                None
             }
-            (None, Some(text)) => match serde_json::from_str::<Value>(&text) {
-                Ok(value) => {
-                    config.insert("acp".into(), json!({ "config": value }));
-                }
-                Err(error) => self.diags.error(
+            (Some(command), None) => {
+                let problem = match shlex::split(command.trim()) {
+                    None => "has unbalanced quotes",
+                    Some(words) if words.is_empty() => "is empty",
+                    Some(_) => return Some(json!({ "command": command })),
+                };
+                self.diags.error(
+                    "attractor.bad_acp_command",
+                    attrs.span_of("acp.command", span),
+                    format!("`acp.command` on {owner} {problem}"),
+                );
+                None
+            }
+            (None, Some(text)) => {
+                let problem = match serde_json::from_str::<Value>(&text) {
+                    Ok(value)
+                        if value
+                            .get("command")
+                            .and_then(Value::as_str)
+                            .is_some_and(|command| !command.trim().is_empty()) =>
+                    {
+                        return Some(json!({ "config": value }));
+                    }
+                    Ok(_) => "must be a JSON object with a non-empty `command`".to_string(),
+                    Err(error) => format!("is not JSON: {error}"),
+                };
+                self.diags.error(
                     "attractor.bad_acp_config",
-                    node.attrs.span_of("acp.config", &node.span),
-                    format!("`acp.config` is not JSON: {error}"),
-                ),
-            },
-            (None, None) if acp_backend => lints::acp_requires_command(node, &mut self.diags),
-            (None, None) => {}
+                    attrs.span_of("acp.config", span),
+                    format!("`acp.config` on {owner} {problem}"),
+                );
+                None
+            }
+            (None, None) => None,
         }
     }
 
