@@ -202,6 +202,9 @@ struct Ctx<'a> {
     /// The `(node, property)` pairs the model stylesheet wrote, which are
     /// not the node's own attributes.
     styled:           HashSet<(String, String)>,
+    /// The graph's ACP agent, the step's `acp` value, for `backend="acp"`
+    /// nodes that name none. Diagnosed once, at the graph.
+    graph_acp:        Option<Value>,
 }
 
 /// Lower a semantic workflow. `file` is the name spans carry; `files` reads
@@ -269,6 +272,7 @@ fn lower_nested(
         workflow_name: workflow.name.clone(),
         repository,
         styled: HashSet::new(),
+        graph_acp: None,
     };
     ctx.stack.push(file.to_string());
 
@@ -638,6 +642,7 @@ impl Ctx<'_> {
         for key in ["on_failure", "on_retries_exhausted"] {
             self.check_policy(key, &attrs, &span);
         }
+        self.graph_acp = self.acp_agent(&attrs, "the graph", &span);
         threads::check_graph(workflow, &mut self.diags);
         lints::rankdir(&attrs, &span, &mut self.diags);
         lints::retry_targets(&attrs, &span, workflow, "the graph", &mut self.diags);

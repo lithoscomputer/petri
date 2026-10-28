@@ -762,9 +762,10 @@ fn mixed_backends_inherit_only_their_own_configuration() {
         graph [acp.command="agent-command", default_model="test/model"]
         start [shape=Mdiamond]
         native [backend="api", prompt="native"]
-        external [prompt="ACP"]
+        implicit [prompt="native by default"]
+        external [backend="acp", prompt="ACP"]
         exit [shape=Msquare]
-        start -> native -> external -> exit
+        start -> native -> implicit -> external -> exit
     }"#;
     let result = frontend_attractor::load("mixed.fabro", source, &NoFiles, &CompileInputs::new());
     let graph = result.graph.expect("mixed workflow");
@@ -782,6 +783,14 @@ fn mixed_backends_inherit_only_their_own_configuration() {
         .expect("external");
     assert_eq!(native.step.config["backend"], "api");
     assert!(native.step.config.get("acp").is_none());
+    let implicit = graph
+        .body
+        .nodes
+        .iter()
+        .find(|node| node.name == "implicit")
+        .expect("implicit");
+    assert!(implicit.step.config.get("acp").is_none());
+    assert_eq!(external.step.config["backend"], "acp");
     assert_eq!(external.step.config["acp"]["command"], "agent-command");
 }
 

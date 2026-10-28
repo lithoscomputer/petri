@@ -393,9 +393,7 @@ fn splice(
                 continue;
             }
             let mut attrs = placeholder.defaults.clone();
-            for (key, attr) in node.attrs.iter() {
-                attrs.insert(key, attr.value.clone(), attr.span.clone());
-            }
+            attrs.overlay(&node.attrs);
             remap_retry_targets(&mut attrs, placeholder_id);
             relocate_file_references(&mut attrs, imported_dir, root_base_dir);
             let mut classes = placeholder.classes.clone();

@@ -1570,3 +1570,32 @@ fn workflow_secrets_reach_agent_processes_as_references() {
         );
     }
 }
+
+#[test]
+fn acp_node_overrides_replace_the_graph_agent_through_the_fabro_frontend() {
+    for (graph_attrs, node_attrs, inherited, overridden) in [
+        (
+            r#"acp.command="shared-agent""#,
+            r#"acp.config="{\"command\":\"review-agent\",\"args\":[\"--strict\"]}""#,
+            json!({"command": "shared-agent"}),
+            json!({"config": {"command": "review-agent", "args": ["--strict"]}}),
+        ),
+        (
+            r#"acp.config="{\"command\":\"shared-agent\"}""#,
+            r#"acp.command="review-agent --strict""#,
+            json!({"config": {"command": "shared-agent"}}),
+            json!({"command": "review-agent --strict"}),
+        ),
+    ] {
+        let graph = lower_ok(&dot(&format!(
+            r#"
+            graph [{graph_attrs}]
+            plan [backend="acp", prompt="Plan the change"]
+            review [backend="acp", prompt="Review the change", {node_attrs}]
+            start -> plan -> review -> exit
+        "#
+        )));
+        assert_eq!(node(&graph, "plan").step.config["acp"], inherited);
+        assert_eq!(node(&graph, "review").step.config["acp"], overridden);
+    }
+}
