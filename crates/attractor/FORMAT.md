@@ -474,8 +474,12 @@ the coordinator registers `attractor_steps::workflow::ChildInvoker`.
   the client gives it, is under "ACP products" below. `provider` (or `default_provider`) qualifies the
   model selector, and `reasoning_effort` configures the actual model request.
   The node's backend overrides the graph's backend; model stylesheets can also
-  select it. Graph ACP configuration applies only to ACP nodes. Setting ACP
-  options directly on an API node is an error. An ACP turn that fails after
+  select it. `acp.command` and `acp.config` are inherited as one choice: a node
+  setting either inherits neither graph attribute; otherwise an ACP node
+  inherits the graph's pair. A selected pair containing both attributes is
+  rejected. Graph ACP configuration applies only to ACP nodes; nodes whose
+  backend defaults to API inherit no ACP options. Setting ACP options directly
+  on an API node is an error. An ACP turn that fails after
   the agent started (the process exits before the protocol completes, a
   protocol error, a rejected request, a stop reason other than `end_turn` or
   `refusal`, or a turn that outlives the node's `timeout`) is classed

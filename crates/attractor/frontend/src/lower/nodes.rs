@@ -465,15 +465,17 @@ impl Ctx<'_> {
         config: &mut Map<String, Value>,
         acp_backend: bool,
     ) {
-        let command = node
-            .attrs
-            .text("acp.command")
-            .or_else(|| workflow.attrs.text("acp.command"));
-        let acp_config = node
-            .attrs
-            .text("acp.config")
-            .or_else(|| workflow.attrs.text("acp.config"));
-        match (command, acp_config) {
+        // Command and config are one choice: a node setting either replaces
+        // the whole graph pair. Only ACP agents inherit graph defaults.
+        let attrs = if acp_backend
+            && !node.attrs.contains("acp.command")
+            && !node.attrs.contains("acp.config")
+        {
+            &workflow.attrs
+        } else {
+            &node.attrs
+        };
+        match (attrs.text("acp.command"), attrs.text("acp.config")) {
             (Some(_), Some(_)) => self.diags.error(
                 "attractor.acp_both",
                 node.attrs.span_of("acp.command", &node.span),

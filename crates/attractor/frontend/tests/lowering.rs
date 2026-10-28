@@ -2145,6 +2145,195 @@ fn a_node_id_that_is_a_dot_keyword_warns() {
     assert!(reserved.iter().all(|d| !d.is_error() && d.hint.is_some()));
 }
 
+#[test]
+fn acp_nodes_inherit_or_replace_graph_agents_as_a_pair() {
+    for (graph_attrs, inherited) in [
+        (
+            r#"acp.command="shared-agent""#,
+            json!({"command": "shared-agent"}),
+        ),
+        (
+            r#"acp.config="{\"command\":\"shared-agent\",\"args\":[\"--shared\"]}""#,
+            json!({"config": {"command": "shared-agent", "args": ["--shared"]}}),
+        ),
+    ] {
+        for (node_attrs, expected) in [
+            ("", inherited),
+            (
+                r#"acp.command="node-agent""#,
+                json!({"command": "node-agent"}),
+            ),
+            (
+                r#"acp.config="{\"command\":\"node-agent\",\"args\":[\"--strict\"]}""#,
+                json!({"config": {"command": "node-agent", "args": ["--strict"]}}),
+            ),
+            // Presence, not validity, determines which level supplies the pair.
+            (r#"acp.command="""#, json!({"command": ""})),
+        ] {
+            let graph = lower_ok(&dot(&format!(
+                r#"
+                graph [{graph_attrs}]
+                a [backend="acp", prompt="work", {node_attrs}]
+                start -> a -> exit
+            "#
+            )));
+            assert_eq!(node(&graph, "a").step.config["acp"], expected);
+        }
+    }
+}
+
+#[test]
+fn acp_node_overrides_ignore_conflicting_or_invalid_graph_defaults() {
+    for graph_attrs in [
+        r#"acp.command="shared-agent", acp.config="{}""#,
+        r#"acp.config="not JSON""#,
+    ] {
+        for (node_attrs, expected) in [
+            (
+                r#"acp.command="node-agent""#,
+                json!({"command": "node-agent"}),
+            ),
+            (
+                r#"acp.config="{\"command\":\"node-agent\"}""#,
+                json!({"config": {"command": "node-agent"}}),
+            ),
+        ] {
+            let graph = lower_ok(&dot(&format!(
+                r#"
+                graph [{graph_attrs}]
+                a [backend="acp", prompt="work", {node_attrs}]
+                start -> a -> exit
+            "#
+            )));
+            assert_eq!(node(&graph, "a").step.config["acp"], expected);
+        }
+    }
+}
+
+#[test]
+fn acp_selected_conflicts_and_invalid_configs_are_still_rejected() {
+    for (graph_attrs, node_attrs, code) in [
+        (
+            "",
+            r#"acp.command="agent", acp.config="{}""#,
+            "attractor.acp_both",
+        ),
+        (
+            r#"acp.command="shared-agent""#,
+            r#"acp.command="agent", acp.config="{}""#,
+            "attractor.acp_both",
+        ),
+        (
+            r#"acp.command="agent", acp.config="{}""#,
+            "",
+            "attractor.acp_both",
+        ),
+        (
+            r#"acp.command="agent""#,
+            r#"acp.config="not JSON""#,
+            "attractor.bad_acp_config",
+        ),
+        (
+            r#"acp.command="agent""#,
+            r#"acp.config="""#,
+            "attractor.bad_acp_config",
+        ),
+        (r#"acp.config="not JSON""#, "", "attractor.bad_acp_config"),
+    ] {
+        let text = dot(&format!(
+            r#"
+            graph [{graph_attrs}]
+            a [backend="acp", prompt="work", {node_attrs}]
+            start -> a -> exit
+        "#
+        ));
+        let lowered = load(
+            "w.fabro",
+            &text,
+            &frontend::NoFiles,
+            &frontend::CompileInputs::new(),
+        );
+        assert!(lowered.graph.is_none());
+        assert!(
+            lowered
+                .diagnostics
+                .iter()
+                .any(|d| d.is_error() && d.code == code),
+            "{graph_attrs}; {node_attrs}: {:?}",
+            lowered.diagnostics
+        );
+    }
+}
+
+#[test]
+fn acp_graph_defaults_follow_the_effective_backend() {
+    for (graph_attrs, node_attrs, inherits) in [
+        ("", "", false),
+        ("", r#"backend="api""#, false),
+        ("", r#"backend="acp""#, true),
+        (r#"backend="api""#, "", false),
+        (r#"backend="acp""#, "", true),
+        (r#"backend="acp""#, r#"backend="api""#, false),
+        (r#"backend="api""#, r#"backend="acp""#, true),
+        (r##"model_stylesheet="#a { backend: acp; }""##, "", true),
+        (
+            r##"backend="acp", model_stylesheet="#a { backend: api; }""##,
+            "",
+            false,
+        ),
+        (
+            r##"model_stylesheet="#a { backend: acp; }""##,
+            r#"backend="api""#,
+            false,
+        ),
+    ] {
+        let graph = lower_ok(&dot(&format!(
+            r#"
+            graph [acp.command="shared-agent", {graph_attrs}]
+            a [prompt="work", {node_attrs}]
+            p [shape=tab, prompt="summarize"]
+            c [shape=parallelogram, script="true"]
+            start -> a -> p -> c -> exit
+        "#
+        )));
+        assert_eq!(
+            node(&graph, "a").step.config.get("acp"),
+            inherits.then_some(&json!({"command": "shared-agent"})),
+            "{graph_attrs}; {node_attrs}"
+        );
+        for name in ["start", "p", "c", "exit"] {
+            assert!(
+                node(&graph, name).step.config.get("acp").is_none(),
+                "{name}"
+            );
+        }
+    }
+}
+
+#[test]
+fn acp_invalid_graph_defaults_do_not_reject_api_or_prompt_nodes() {
+    for graph_attrs in [
+        r#"acp.command="agent", acp.config="{}""#,
+        r#"acp.config="not JSON""#,
+    ] {
+        let graph = lower_ok(&dot(&format!(
+            r#"
+            graph [{graph_attrs}]
+            implicit [prompt="work"]
+            explicit [backend="api", prompt="work"]
+            p [shape=tab, prompt="summarize"]
+            start -> implicit -> explicit -> p -> exit
+        "#
+        )));
+        for name in ["implicit", "explicit", "p"] {
+            assert!(
+                node(&graph, name).step.config.get("acp").is_none(),
+                "{name}"
+            );
+        }
+    }
+}
+
 /// Fabro's `backend_valid`, the ACP clauses.
 #[test]
 fn acp_agents_name_an_agent_and_take_no_api_only_attributes() {
