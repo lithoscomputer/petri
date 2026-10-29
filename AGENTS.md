@@ -14,7 +14,8 @@ Use these documents as the authoritative design sources:
 - `crates/core/frontend-native/FORMAT.md` defines the native workflow format.
 - `crates/attractor/FORMAT.md` defines the Attractor language as lowered.
 - `crates/fabro/FORMAT.md` defines the Fabro layer around it: the settings files and the launch.
-- `README.md` maps the design to the workspace and test suites.
+- `README.md` introduces Petri; `docs/architecture.md` maps the workspace and
+  `docs/testing.md` maps the test suites.
 
 ## Rust style
 
@@ -60,3 +61,14 @@ Save plans under `.ai/plans/` and reviews under `.ai/reviews/`.
 
 Use plain language. Prefer short, direct sentences and established project
 terms.
+
+## README.md
+
+Keep the README focused on what Petri does, who it serves, installation,
+complete examples, scope, compatibility, and the Lithos family.
+
+- Put API detail in rustdoc and longer guides in `docs/`.
+- Keep repository file links absolute so they work outside GitHub.
+- README Rust examples are doctests. Run `cargo test --locked -p petri --doc`
+  after changing them.
+- Keep the plugin install revision aligned with `Cargo.lock`.

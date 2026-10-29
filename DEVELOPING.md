@@ -166,8 +166,8 @@ secrets, step output, and environment values are never captured.
 The MCP client is Pebble's dependency. A change to Pebble or `lithos-llm`
 runs that repository's required checks first; only then does Petri move its lock
 and rerun the affected black box scenarios. `Cargo.lock` is the only copy of
-the locked commits. A library test pass never replaces a required Petri scenario. The pending library batch
-is listed in `README.md` under "Library and repository gates".
+the locked commits. A library test pass never replaces a required Petri scenario. Library integration evidence
+is listed in [the test guide](https://github.com/lithoscomputer/petri/blob/main/docs/testing.md#library-and-repository-gates).
 
 ## Rust policy
 
@@ -230,7 +230,8 @@ workflow packages the `petri` executable. It does not publish a crate.
 
 ## Project structure
 
-`README.md` maps Petri's design documents to the workspace and its tests. Keep
+[The architecture guide](https://github.com/lithoscomputer/petri/blob/main/docs/architecture.md) maps the workspace;
+[the test guide](https://github.com/lithoscomputer/petri/blob/main/docs/testing.md) maps the test suites. Keep
 crate dependencies consistent with the layering rules described there.
 `crates/petri/lib/tests/layering.rs` enforces the dependency graph.
 

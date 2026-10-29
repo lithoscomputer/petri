@@ -501,3 +501,7 @@ fn fabro_settings_toml() -> Option<String> {
         .or_else(|| env::var_os("HOME").map(|home| PathBuf::from(home).join(".fabro")))?;
     fs::read_to_string(home.join("settings.toml")).ok()
 }
+
+#[cfg(doctest)]
+#[doc = include_str!("../../../../README.md")]
+pub struct ReadmeDoctests;
