@@ -170,4 +170,4 @@ The [engine specification](https://github.com/lithoscomputer/petri/blob/main/eng
 
 ## License
 
-See [LICENSE](https://github.com/lithoscomputer/petri/blob/main/LICENSE).
+Licensed under MIT OR Apache-2.0, at your option.
