@@ -21,7 +21,9 @@ use executor::{
     DEFAULT_GRACE, Executor, MapSecrets, Masker, ProgressSink, Retention, SecretProvider,
 };
 use executor_sandbox::{InProcessProviders, LeaseLedger, RoutingExecutor, SandboxOptions};
-use frontend::{CompileInputs, DirFiles, FileSource, Frontend, Lowered, REPOSITORY_VAR, Span};
+use frontend::{
+    CompileInputs, DirFiles, FileSource, Frontend, Lowered, REPOSITORY_VAR, Span, absolute_repo,
+};
 use ir::{ExecutionId, Graph, InvocationId};
 use serde_json::Value;
 use smol_str::SmolStr;
@@ -576,14 +578,7 @@ impl Runtime {
         // out. A caller that bound the variable itself keeps its value.
         let mut inputs = inputs.clone();
         if !inputs.vars.contains_key(REPOSITORY_VAR) {
-            // A relative file's root can be the empty path, the current
-            // directory; canonicalize needs a name for it.
-            let base = if repo.as_os_str().is_empty() {
-                Path::new(".")
-            } else {
-                repo.as_path()
-            };
-            let absolute = fs::canonicalize(base).unwrap_or_else(|_| base.to_path_buf());
+            let absolute = absolute_repo(&repo);
             inputs.vars.insert(
                 SmolStr::new(REPOSITORY_VAR),
                 Value::String(absolute.to_string_lossy().into_owned()),

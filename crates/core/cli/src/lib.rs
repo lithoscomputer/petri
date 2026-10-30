@@ -777,11 +777,13 @@ fn default_params(rt: &Runtime, target: &FileArgs, graph: &mut Graph) {
         }
         Err(_) => return,
     };
+    // Absolute, as the runtime binds it at load: a workflow named relative to
+    // the repository root would otherwise hand the format an empty path.
     let repo = target
         .repo
         .clone()
         .unwrap_or_else(|| frontend.repo_root(&target.file));
-    for (key, value) in frontend.default_params(&repo) {
+    for (key, value) in frontend.default_params(&frontend::absolute_repo(&repo)) {
         graph.params.entry(key).or_insert(value);
     }
 }
