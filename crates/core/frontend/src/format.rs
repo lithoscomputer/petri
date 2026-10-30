@@ -5,6 +5,7 @@
 //! a new crate that implements this trait, and one entry in that list.
 
 use std::collections::BTreeMap;
+use std::fs;
 use std::path::{Path, PathBuf};
 
 use serde_json::Value;
@@ -157,8 +158,8 @@ pub trait Frontend: Send + Sync {
 
     /// Run parameters a host owes this format when it has nothing better: fixed
     /// values, so lowering the same file twice yields the identical graph and a
-    /// saved log replays against it. `repo` is the repository root. Default:
-    /// none.
+    /// saved log replays against it. `repo` is the repository root, absolute
+    /// (see [`absolute_repo`]). Default: none.
     fn default_params(&self, _repo: &Path) -> Vec<(SmolStr, Value)> {
         Vec::new()
     }
@@ -198,4 +199,17 @@ pub fn by_name<'a>(frontends: &[&'a dyn Frontend], name: &str) -> Option<&'a dyn
 /// The first frontend that claims `path`.
 pub fn detect<'a>(frontends: &[&'a dyn Frontend], path: &Path) -> Option<&'a dyn Frontend> {
     frontends.iter().copied().find(|f| f.claims(path))
+}
+
+/// `repo` as the absolute path [`REPOSITORY_VAR`] and
+/// [`Frontend::default_params`] take. A relative file's root can be the empty
+/// path, the current directory; canonicalize needs a name for it. A path that
+/// does not resolve is returned as given.
+pub fn absolute_repo(repo: &Path) -> PathBuf {
+    let base = if repo.as_os_str().is_empty() {
+        Path::new(".")
+    } else {
+        repo
+    };
+    fs::canonicalize(base).unwrap_or_else(|_| base.to_path_buf())
 }
