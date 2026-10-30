@@ -1599,3 +1599,37 @@ fn acp_node_overrides_replace_the_graph_agent_through_the_fabro_frontend() {
         assert_eq!(node(&graph, "review").step.config["acp"], overridden);
     }
 }
+
+#[test]
+fn run_agent_permissions_are_typed_defaults_below_graph_and_stage() {
+    let source = dot(
+        r#"a [prompt="review"] b [prompt="edit", permissions="read-write"] start -> a -> b -> exit"#,
+    );
+    let files = files(&[(
+        "wf/workflow.toml",
+        "[run.agent]\npermissions = 'read-only'\n",
+    )]);
+    let lowered = load("wf/workflow.fabro", &source, &files, &CompileInputs::new());
+    let graph = lowered.graph.expect("valid permissions");
+    assert_eq!(node(&graph, "a").step.config["permissions"], "read-only");
+    assert_eq!(node(&graph, "b").step.config["permissions"], "read-write");
+    let source = source.replace(
+        "digraph T {",
+        "digraph T { graph [default_permissions=\"full\"]",
+    );
+    let graph = load("wf/workflow.fabro", &source, &files, &CompileInputs::new())
+        .graph
+        .expect("graph overrides run");
+    assert_eq!(node(&graph, "a").step.config["permissions"], "full");
+    for value in ["'readonly'", "true", "1", "[]"] {
+        let files = support::files(&[(
+            "wf/workflow.toml",
+            &format!("[run.agent]\npermissions = {value}\n"),
+        )]);
+        assert!(
+            load("wf/workflow.fabro", &source, &files, &CompileInputs::new())
+                .graph
+                .is_none()
+        );
+    }
+}

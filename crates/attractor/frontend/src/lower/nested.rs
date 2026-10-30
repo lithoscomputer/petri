@@ -181,6 +181,7 @@ impl Ctx<'_> {
             Diagnostics::new(),
             self.stack.clone(),
             RunSettings {
+                permissions: self.settings.permissions,
                 model: self.settings.model.clone(),
                 model_override: self.settings.model_override.clone(),
                 mcps: self.settings.mcps.clone(),

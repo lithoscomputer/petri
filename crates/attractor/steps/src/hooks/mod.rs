@@ -110,6 +110,9 @@ impl Decision {
 /// prompt or agent hook evaluates. Absent fields are left out.
 #[derive(Clone, Debug, Serialize)]
 pub struct Context {
+    /// Effective access for an agent hook; not part of the hook wire payload.
+    #[serde(skip)]
+    pub permissions:    crate::AgentPermissions,
     pub event:          HookEvent,
     pub run_id:         String,
     pub workflow_name:  String,
@@ -150,6 +153,7 @@ pub struct Context {
 impl Context {
     pub fn new(event: HookEvent, run_id: String, workflow_name: String) -> Self {
         Self {
+            permissions: crate::AgentPermissions::Full,
             event,
             run_id,
             workflow_name,
@@ -291,11 +295,13 @@ struct Config {
 
 /// The local hook service.
 pub struct LocalHooks {
-    config: Mutex<Option<Arc<Config>>>,
-    run:    Mutex<Option<RunInfo>>,
-    client: Mutex<Option<PebbleClient>>,
-    envs:   ScopeEnvironments,
-    http:   executors::HttpClients,
+    ceiling:     Mutex<crate::AgentPermissions>,
+    permissions: Mutex<crate::AgentPermissions>,
+    config:      Mutex<Option<Arc<Config>>>,
+    run:         Mutex<Option<RunInfo>>,
+    client:      Mutex<Option<PebbleClient>>,
+    envs:        ScopeEnvironments,
+    http:        executors::HttpClients,
 }
 
 tokio::task_local! {
@@ -319,6 +325,8 @@ impl Default for LocalHooks {
 impl LocalHooks {
     pub fn new(envs: ScopeEnvironments) -> Self {
         Self {
+            ceiling: Mutex::new(crate::AgentPermissions::Full),
+            permissions: Mutex::new(crate::AgentPermissions::Full),
             config: Mutex::new(None),
             run: Mutex::new(None),
             client: Mutex::new(None),
@@ -337,6 +345,11 @@ impl LocalHooks {
     /// The run this service serves, set by the per-run provisioner.
     pub fn set_run(&self, run: RunInfo) {
         *self.run.lock().unwrap_or_else(PoisonError::into_inner) = Some(run);
+    }
+
+    /// Set the embedding host's ceiling for all local agent hooks.
+    pub fn set_permission_ceiling(&self, ceiling: crate::AgentPermissions) {
+        *self.ceiling.lock().unwrap_or_else(PoisonError::into_inner) = ceiling;
     }
 
     /// The model client prompt and agent hooks use.
@@ -375,6 +388,15 @@ impl LocalHooks {
             .and_then(Value::as_str)
             .unwrap_or_default();
         self.configure(&hooks, workflow);
+        *self
+            .permissions
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) = config
+            .get("default_permissions")
+            .or_else(|| config.get("permissions"))
+            .map_or(crate::AgentPermissions::Full, |value| {
+                serde_json::from_value(value.clone()).unwrap_or(crate::AgentPermissions::ReadOnly)
+            });
         true
     }
 
@@ -421,7 +443,12 @@ impl LocalHooks {
     /// A context with the run's identity filled in.
     pub fn context(&self, event: HookEvent) -> Context {
         let (run_id, workflow_name) = self.run_info();
-        Context::new(event, run_id, workflow_name)
+        let mut context = Context::new(event, run_id, workflow_name);
+        context.permissions = *self
+            .permissions
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        context
     }
 
     /// Run every configured hook matching `context.event`, in order, with
@@ -433,6 +460,11 @@ impl LocalHooks {
         context: &Context,
         env: Option<Arc<dyn ExecEnv>>,
     ) -> (Decision, HookReport) {
+        let mut context = context.clone();
+        context.permissions = context
+            .permissions
+            .min(*self.ceiling.lock().unwrap_or_else(PoisonError::into_inner));
+        let context = &context;
         let mut report = HookReport::proceed(point);
         let Some(config) = self.config() else {
             return (Decision::Proceed, report);
@@ -639,6 +671,15 @@ fn edge_for_target(view: &FiringView, to: &str) -> Option<(u32, EdgeId)> {
 impl LocalHooks {
     fn stage_context(&self, event: HookEvent, view: &FiringView) -> Context {
         let mut context = self.context(event);
+        context.permissions = view
+            .config
+            .as_ref()
+            .and_then(|config| config.get("permissions"))
+            .or_else(|| view.node.step.config.get("permissions"))
+            .or_else(|| view.meta().get("permissions"))
+            .map_or(context.permissions, |value| {
+                serde_json::from_value(value.clone()).unwrap_or(crate::AgentPermissions::ReadOnly)
+            });
         context.node_id = Some(view.node_name().to_owned());
         context.node_label = view
             .meta()

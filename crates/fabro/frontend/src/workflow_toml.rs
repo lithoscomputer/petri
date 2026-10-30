@@ -792,15 +792,17 @@ impl Reader<'_> {
             return;
         };
         // Fabro's `[run.agent]` accepts `fabro_tools` and `mcps` only. Neither
-        // sub-agents (readiness item 9d) nor compaction (item 9e) has a
+        // sub-agents nor compaction has a
         // `workflow.toml` surface at the pinned revision: every native agent
         // gets the sub-agent tools (`super::subagents`), and compaction is
         // always on with Fabro's hardcoded values (`lower::compaction`), so a
         // key asking for either is refused as Fabro refuses it, never passed
-        // silently. `skills` is the standalone
-        // runner's own extension (`skills::read`).
+        // silently. `skills` and `permissions` are Petri extensions.
         for key in agent.keys() {
-            if !matches!(key.as_str(), "fabro_tools" | "mcps" | "skills") {
+            if !matches!(
+                key.as_str(),
+                "fabro_tools" | "mcps" | "skills" | "permissions"
+            ) {
                 let path = self.path;
                 let (message, hint) = if key == "compaction" {
                     (
@@ -833,6 +835,21 @@ impl Reader<'_> {
                     )
                 };
                 self.unsupported("workflow_toml.key", message, hint);
+            }
+        }
+        if let Some(value) = agent.get("permissions") {
+            if let Ok(level) = value
+                .clone()
+                .try_into::<frontend_attractor::AgentPermissions>()
+            {
+                self.settings.run.permissions = level;
+                self.warn("fabro.petri_extension", "`run.agent.permissions` is a Petri extension; the reference Fabro settings schema does not accept it".to_owned());
+            } else {
+                self.unsupported(
+                    "workflow_toml.permissions",
+                    format!("invalid run.agent.permissions in `{}`", self.path),
+                    "use read-only, read-write, or full",
+                );
             }
         }
         if let Some(value) = agent.get("skills") {

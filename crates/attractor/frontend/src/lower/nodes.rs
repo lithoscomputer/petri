@@ -45,9 +45,20 @@ impl Ctx<'_> {
             &mut self.diags,
         );
         let explicit = self.explicit_timeout(node);
+        if let Some(value) = node.attrs.text("permissions")
+            && serde_json::from_value::<crate::AgentPermissions>(Value::String(value)).is_err()
+        {
+            self.diags.error(
+                "attractor.permissions",
+                node.attrs.span_of("permissions", &node.span),
+                "permissions must be read-only, read-write, or full",
+            );
+        }
+        let permissions = self.permissions(node, workflow);
 
         let mut meta = json!({
             "label": label,
+            "permissions": permissions,
             "shape": shape,
             "kind": kind.name(),
             "classes": node.classes,
@@ -77,6 +88,10 @@ impl Ctx<'_> {
                     "node": node.id,
                     "kind": kind.name(),
                     "label": label,
+                    "permissions": permissions,
+                    "default_permissions": workflow.attrs.text("default_permissions")
+                        .map_or(self.settings.permissions, |value| serde_json::from_value(Value::String(value))
+                            .unwrap_or(crate::AgentPermissions::ReadOnly)),
                     "workflow": self.workflow_name,
                     "kv": placeholder(kv),
                 });
@@ -252,6 +267,17 @@ impl Ctx<'_> {
         }
     }
 
+    fn permissions(&self, node: &NodeDecl, workflow: &Workflow) -> crate::AgentPermissions {
+        node.attrs
+            .text("permissions")
+            .or_else(|| workflow.attrs.text("default_permissions"))
+            .map_or(self.settings.permissions, |value| {
+                // Invalid attributes were diagnosed at the node/graph boundary.
+                serde_json::from_value(Value::String(value))
+                    .unwrap_or(crate::AgentPermissions::ReadOnly)
+            })
+    }
+
     fn agent_config(
         &mut self,
         node: &NodeDecl,
@@ -291,6 +317,17 @@ impl Ctx<'_> {
             .or_else(|| workflow.attrs.text("backend"));
         // Fabro's `backend_valid`: an ACP agent reads no API-only attribute.
         let acp_backend = !is_prompt && backend.as_deref() == Some("acp");
+        if !is_prompt {
+            let permissions = self.permissions(node, workflow);
+            config.insert("permissions".into(), json!(permissions));
+            if acp_backend && permissions != crate::AgentPermissions::Full {
+                self.diags.error(
+                    "attractor.permissions_backend",
+                    node.span.clone(),
+                    "backend=acp cannot enforce restricted agent permissions; use backend=api",
+                );
+            }
+        }
         if acp_backend {
             lints::acp_api_only_attributes(node, &self.styled, &mut self.diags);
         }
