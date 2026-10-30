@@ -108,7 +108,7 @@ From the root of a Git repository:
 
 ```sh
 petri check .github/workflows/ci.yml
-petri run .github/workflows/ci.yml --repo "$PWD" --run-dir ../petri-ci-run --sandbox-plugin-dev
+petri run .github/workflows/ci.yml --run-dir ../petri-ci-run --sandbox-plugin-dev
 ```
 
 `actions/checkout` copies your working tree, including uncommitted changes, into the run's workspace.
