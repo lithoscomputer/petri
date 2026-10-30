@@ -600,6 +600,15 @@ impl Ctx<'_> {
         let attrs = workflow.attrs.clone();
         self.unknown_attrs(&attrs, attrs::GRAPH, attrs::GRAPH_IGNORED, "the graph");
         let span = workflow.span.clone();
+        if let Some(value) = attrs.text("default_permissions")
+            && serde_json::from_value::<crate::AgentPermissions>(Value::String(value)).is_err()
+        {
+            self.diags.error(
+                "attractor.permissions",
+                attrs.span_of("default_permissions", &span),
+                "default_permissions must be read-only, read-write, or full",
+            );
+        }
         // The run settings' goal (`[run] goal`, or the launch's) replaces the
         // graph's own, as Fabro's run materialization orders them; the
         // graph's `goal` is the default. The settings' goal arrives

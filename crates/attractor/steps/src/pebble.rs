@@ -62,7 +62,7 @@ use lithos_llm::Client;
 use lithos_llm::catalog::Metadata;
 use lithos_llm::types::{ErrorKind, ReasoningEffort, Request, Speed, Usage};
 use pebble_coding_agent::events::{
-    AgentProfileKind, CodingAgentEvent, CodingEvent, EventSink, EventSinkError, PermissionLevel,
+    AgentProfileKind, CodingAgentEvent, CodingEvent, EventSink, EventSinkError,
 };
 use pebble_coding_agent::extensions::Redactor;
 use pebble_coding_agent::steering::{DroppedSteer, SteeringBus};
@@ -85,7 +85,7 @@ use crate::fallback::{self, Disposition, Plan};
 use crate::hooks::tools::ToolHooks;
 use crate::hooks::{self};
 use crate::subagents::{self, Ledger};
-use crate::{host_tools, route_usage, skills};
+use crate::{host_tools, permissions, route_usage, skills};
 
 /// Host capability supplied by applications embedding the native backend.
 /// Construct the client with the application's catalog, credentials, and
@@ -294,7 +294,13 @@ impl NativeSession {
         let shell_env = executor::layer_exec(env.clone(), Arc::new(InheritedEnv::new(inherited)));
         let provider = questions.clone();
         let tool_hooks = hook_service.map(|handle| {
-            let view = hooks::step_view(ctx, "agent", &config.label, &config.kv);
+            let view = hooks::view_of(
+                ctx,
+                "agent",
+                &config.label,
+                &config.kv,
+                Some(json!({"permissions": config.permissions})),
+            );
             let binding = hooks::ToolHookBinding::new(
                 handle.0.clone(),
                 view,
@@ -307,6 +313,7 @@ impl NativeSession {
         let mcps = config.mcps.clone();
         let secrets = ctx.secrets.clone();
         let session_events = events.clone();
+        let permissions = permissions::pebble(permissions::effective(config.permissions, ctx));
         let build = async {
             let environment = PebbleEnvironment::prepare(shell_env, cancel.clone(), kill.clone())
                 .await
@@ -346,7 +353,7 @@ impl NativeSession {
             builder = builder
                 .options(options)
                 .fallback_routes(fallback_routes)
-                .permission_level(PermissionLevel::Full)
+                .permission_level(permissions)
                 .event_sink(sink)
                 .redactor(redactor)
                 .human_input(provider)

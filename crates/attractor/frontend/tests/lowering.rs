@@ -2636,3 +2636,49 @@ fn full_fidelity_on_a_parallel_branch_warns_that_it_is_degraded() {
     assert!(degraded.iter().any(|d| d.message.contains("`a`")));
     assert!(degraded.iter().any(|d| d.message.contains("fork -> b")));
 }
+
+#[test]
+fn agent_permissions_resolve_defaults_and_stage_overrides() {
+    let graph = lower_ok(&dot(r#"
+        graph [default_permissions="read-only"]
+        a [prompt="review"]
+        b [prompt="edit", permissions="read-write"]
+        c [prompt="test", permissions="full"]
+        start -> a -> b -> c -> exit
+    "#));
+    assert_eq!(node(&graph, "a").step.config["permissions"], "read-only");
+    assert_eq!(node(&graph, "b").step.config["permissions"], "read-write");
+    assert_eq!(node(&graph, "c").step.config["permissions"], "full");
+    let graph = lower_ok(&dot(r#"a [prompt="work"] start -> a -> exit"#));
+    assert_eq!(node(&graph, "a").step.config["permissions"], "full");
+}
+
+#[test]
+fn invalid_permissions_and_restricted_acp_are_rejected() {
+    for attr in [
+        r#"permissions="readonly""#,
+        "permissions=true",
+        "permissions=1",
+    ] {
+        assert!(
+            codes(&dot(&format!(
+                r#"a [prompt="work", {attr}] start -> a -> exit"#
+            )))
+            .contains(&"attractor.permissions".to_owned())
+        );
+    }
+    assert!(
+        codes(&dot(r#"
+        graph [default_permissions="invalid"]
+        a [prompt="work", permissions="full"] start -> a -> exit
+    "#))
+        .contains(&"attractor.permissions".to_owned())
+    );
+    assert!(
+        codes(&dot(r#"
+        graph [default_permissions="read-only", backend="acp"]
+        a [prompt="work"] start -> a -> exit
+    "#))
+        .contains(&"attractor.permissions_backend".to_owned())
+    );
+}

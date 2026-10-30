@@ -83,3 +83,14 @@ workflow environment for the same name. That is the reverse of Fabro, where
 the workflow environment won. As in Fabro, an ACP agent gets no product API
 key the workflow does not name. Secret values never enter the admitted graph or
 unmasked run records. See "ACP products" in the Attractor format.
+
+## Agent permissions (Petri extension)
+
+`[run.agent] permissions = "read-only"` sets the default for native agent tools.
+The other values are `read-write` and `full`; omission preserves `full`. A graph's
+`default_permissions` overrides the run default and a node's `permissions`
+overrides the graph. The settings key emits `fabro.petri_extension`, since the
+reference Fabro settings schema does not accept it. Invalid values are errors.
+The host's `AgentPermissionCeiling` caps the effective access regardless of these
+settings. See [Agent permissions](../../docs/agent-permissions.md) for an example
+and enforcement details, including the restriction on shell commands.

@@ -35,6 +35,7 @@ const PLACEHOLDER_ATTRS: &[&str] = &[
     "reasoning_effort",
     "speed",
     "backend",
+    "permissions",
     "acp.command",
     "acp.config",
     "fidelity",
