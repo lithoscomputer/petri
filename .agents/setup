@@ -1,0 +1,112 @@
+#!/usr/bin/env bash
+# Prepare an Amp orb: the locked mise tools, the Rust style guide, a warm
+# Cargo build of the routine test suite, the sandbox plugins, Docker, and
+# the review bundle's Python requirements. Amp runs this on fresh orbs and
+# again on stale snapshots, so every step skips work that is already done.
+set -euo pipefail
+
+repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+cd "$repo_root"
+
+step() {
+  local name=$1
+  shift
+  local started=$SECONDS
+  echo "==> $name"
+  "$@"
+  echo "<== $name ($((SECONDS - started))s)"
+}
+
+# The version CI installs. Pinned by digest, like elan in CI.
+mise_version=2026.6.11
+mise_bin="$HOME/.local/bin/mise"
+install_mise() {
+  if [[ -x "$mise_bin" ]] && [[ "$("$mise_bin" --version)" == "$mise_version "* ]]; then
+    return
+  fi
+  local arch sha256
+  case "$(uname -m)" in
+    x86_64)
+      arch=x64
+      sha256=89c88e407c6e3a19f5f86af2cbbf88c6ef6147d55a7098c84da12b36f44f1ff3
+      ;;
+    aarch64)
+      arch=arm64
+      sha256=0318f90fccf8bad6547ad6b2191764233309ceb3b6cece94c48454f385f091f5
+      ;;
+    *)
+      echo "no pinned mise build for $(uname -m)" >&2
+      return 1
+      ;;
+  esac
+  local tmp
+  tmp="$(mktemp -d)"
+  curl --fail --silent --show-error --location --output "$tmp/mise.tar.gz" \
+    "https://github.com/jdx/mise/releases/download/v$mise_version/mise-v$mise_version-linux-$arch.tar.gz"
+  echo "$sha256  $tmp/mise.tar.gz" | sha256sum --check --strict --quiet
+  tar -xzf "$tmp/mise.tar.gz" -C "$tmp"
+  install -D -m 0755 "$tmp/mise/bin/mise" "$mise_bin"
+  rm -rf -- "$tmp"
+}
+step "mise $mise_version" install_mise
+
+# Amp and orb services start non-interactive login shells, which read
+# ~/.bash_profile. The shims put the locked tools, Cargo's binaries, and the
+# review bundle's Python on PATH there.
+profile_marker="# petri orb toolchain"
+if ! grep -Fqx "$profile_marker" "$HOME/.bash_profile" 2>/dev/null; then
+  cat >>"$HOME/.bash_profile" <<'EOF'
+
+# petri orb toolchain
+export PATH="$HOME/.venvs/fabro-python/bin:$HOME/.local/share/mise/shims:$HOME/.cargo/bin:$HOME/.local/bin:$PATH"
+EOF
+fi
+export PATH="$HOME/.venvs/fabro-python/bin:$HOME/.local/share/mise/shims:$HOME/.cargo/bin:$HOME/.local/bin:$PATH"
+
+step "mise tools" bash -c 'mise trust --quiet && mise install --locked --jobs=1'
+
+# Mise can record a Rust toolchain whose rustup components are missing, as
+# CI notes. Reconcile them; rustup does nothing when they are present.
+step "rust toolchains" bash -c '
+  rustup toolchain install 1.97.1 --profile minimal --component clippy
+  rustup toolchain install 1.89.0 --profile minimal
+  rustup toolchain install nightly-2026-04-14 --profile minimal --component rustfmt
+'
+
+step "style guide" mise run setup
+
+# Docker is installed but stopped. Systemd keeps it running in orbs restored
+# from the snapshot. Amp's processes do not carry the docker group, so the
+# socket admits every local user; the orb has one user, with sudo.
+setup_docker() {
+  local dropin=/etc/systemd/system/docker.socket.d/amp-orb.conf
+  if [[ ! -f "$dropin" ]]; then
+    sudo install -D -m 0644 /dev/stdin "$dropin" <<'EOF'
+[Socket]
+SocketMode=0666
+EOF
+    sudo systemctl daemon-reload
+    sudo systemctl restart docker.socket
+  fi
+  sudo systemctl enable --now docker.socket docker.service
+  # CI pre-pulls the test image so a registry failure does not fail a test.
+  docker image inspect alpine:3.20 >/dev/null 2>&1 || docker pull --quiet alpine:3.20
+}
+step "docker" setup_docker
+
+# The code-review bundle's rule loader imports PyYAML; CI installs the
+# bundle's hash-pinned requirements into a virtual environment first on PATH.
+setup_python() {
+  local venv="$HOME/.venvs/fabro-python"
+  [[ -x "$venv/bin/python" ]] || python3 -m venv "$venv"
+  "$venv/bin/python" -m pip install --quiet --disable-pip-version-check --require-hashes \
+    -r crates/fabro/acceptance/bundles/code-review/.fabro/workflows/code-review/requirements-rules.txt
+}
+step "python requirements" setup_python
+
+step "sandbox plugins" mise run plugins:build
+
+# Compile what `mise run test` runs, with its profile, so the first test run
+# in an orb only builds what changed.
+step "cargo test build" env CARGO_PROFILE_TEST_DEBUG=0 \
+  cargo nextest run --locked --workspace --all-targets --all-features --no-run
