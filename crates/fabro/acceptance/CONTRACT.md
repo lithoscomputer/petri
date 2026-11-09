@@ -109,45 +109,14 @@ records the tests write.
 
 ## Required bundles
 
-`crates/fabro/acceptance/bundles.lock.json` (schema version 1) is the
-replacement set. Every bundle's files are vendored in this repository under
-`crates/fabro/acceptance/bundles/<id>/<path>` (the file's path in its source
-repository), copied once from the source at the locked revision;
-`crates/fabro/acceptance/bundles/PROVENANCE.md` records the copy and the
-sources' license files. The lock keeps each source's repository, revision,
-working-tree state, and every file's mode, size, and SHA-256, with
-`vendored: true` on the source. `scripts/corpus-fetch-fabro-bundles.sh`
-(`mise run check:bundles`, in the routine gate and in every CI job) verifies
-the tracked tree against those digests and fails on a missing, changed, or
-extra file; it fetches nothing. The two private sources needed no deploy key
-after this: CI reads only this repository.
-
-| Bundle | Source and revision | Status | Scenario obligations |
-|---|---|---|---|
-| `code-review` | `lithoscomputer/code-review` `0c81ffb4f68039ca56842ab3328fde03b9714350` (private source, vendored; HEAD, clean) | required | empty diff; findings in multiple branches; no surviving findings; invalid output repaired; repair exhausted; one failed branch; reverse branch completion; multi-level fan-out |
-| `security-review` | `lithoscomputer/security-review` `c14279e9cdac4f7553b5e010718ada1a76e5c1f8` (public source, vendored; HEAD, clean) | required | no vulnerabilities; several verified; rejected candidate; partial branch failure; malformed response; timeout and cancel |
-| `fix-ci` | `veniceai/factory` `1b50f791ac4811aad62788c2a4282a75d1e92422` (internal source, vendored; bundle files match HEAD, other files in that working tree were dirty) | excluded (owner decision 2026-09-07) | none; see below |
-| `implement-issue` (with `implement-plan`) | `fabro-sh/fabro` at the pin (public source, vendored) | required | child runs (host and Docker); input and model inheritance; multiple manager cycles; stop condition; child failure; parent cancellation |
-| `interview` | `fabro-sh/fabro` at the pin (public source, vendored) | required | scripted choice, refusal, free text; repeated and concurrent questions; child interviews; delayed and withheld reply; invalid, unexpected and unused answers; timeout and cancel; terminal EOF |
-
-"Blocked" names a required bundle whose scenarios cannot run yet. The
-blockers are listed per bundle in the lock file. They are not exclusions.
-
-`fix-ci` is excluded by an owner decision of 2026-09-07: `fix_ci.py` resolves
-its target through `api.github.com` and clones `veniceai/interface`, and its
-setup step needs yarn 4.12.0 through corepack with no network, so a
-deterministic run needs a scripted stand-in for the GitHub API and an
-offline-installable Node target. The owner judged that overkill. The repair
-loop's behavior that does not depend on GitHub is covered elsewhere: a real
-deterministic check driving a repair loop until it passes, with the visit
-totals surviving the return to the retry target, is `routing/goal-gate-restart-and-visit-limit`;
-a provider failure, an exhausted retry budget, a hanging request and a
-cancellation are the `provider-faults` family; a failing stage's policy is
-`routing/failure-policy`. What stays uncovered is the bundle's own GitHub
-target resolution and its `publish` step's single push after success. The
-bundle keeps its provenance in `bundles.lock.json` with
-`status: "excluded"` and the reason, so the decision is visible and
-reversible.
+The vendored Fabro workflow bundles (`code-review`, `security-review`,
+`fix-ci`, `implement-issue`, `interview`), their lock file
+`bundles.lock.json`, and the scenarios that ran them were removed on
+2026-11-09. They served Petri's development and are no longer needed. The
+remaining scenarios run inline graphs from their own directories, and the
+`interview` differential cell keeps its own copy of the workflow under
+`scenarios/interview/.fabro/`. Git history has the removed files and the
+obligation tables this section held.
 
 ### Inventory and classification
 
@@ -538,10 +507,10 @@ names the decision record under `decisions/`; "gap" names the owner.
 | Rows | Evidence |
 |---|---|
 | start, exit, `rankdir`, `label`; command nodes with `script`, `timeout`, `output_schema="routing"`, `stdin_source` (run id and `parallel.results`) | `petri-fabro-acceptance::routing::every_case_matches_the_fabro_oracle` (24 cases at the pin), `fabro_blackbox::contract_branch_envelopes_carry_index_status_and_context_updates`, `fabro_blackbox::contract_helper_merges_both_findings_into_the_report`, the code-review and security-review cells of `fabro_scenarios_blackbox`, differential `parallel_results_matches_the_pinned_fabro` |
-| agent nodes (`prompt`, `@prompts/*.j2`, includes), `output_schema="@schemas/*.json"`, `output_retries` | `fabro_blackbox::edit_and_verify_through_native_openai`, `fabro_blackbox::edit_and_verify_through_native_anthropic`, `fabro_blackbox::malformed_agent_output_fails_the_stage_routably`, cells `code-review/invalid-output-repaired`, `code-review/repair-exhausted`, `security-review/malformed-response`; differential `edit_and_verify_matches_the_pinned_fabro` |
+| agent nodes (`prompt`, `@prompts/*.j2`, includes), `output_schema="@schemas/*.json"`, `output_retries` | `fabro_blackbox::edit_and_verify_through_native_openai`, `fabro_blackbox::edit_and_verify_through_native_anthropic`, `fabro_blackbox::malformed_agent_output_fails_the_stage_routably`; differential `edit_and_verify_matches_the_pinned_fabro` |
 | `on_failure` `route`, `exit`, `succeed`; `max_retries`, `default_max_retries` | oracle cases `succeed_keeps_a_failure_an_explicit_edge_matches`, `succeed_keeps_a_failure_a_preferred_label_matches`, `succeed_promotes_a_failure_no_explicit_edge_matches`; cell `routing/failure-policy`; `fabro_terminal_blackbox::a_retry_is_announced_on_the_firing_that_retries`, `fabro_fallback_blackbox::a_workflow_retry_is_not_a_failover`. `partially_succeed`: accepted difference `partially-succeed-extension` |
 | `component` with `for_each`, `max_parallel`, `tripleoctagon` fan-in | `petri-attractor-steps::parallel` (`static_branches_return_envelopes_that_never_merge_into_the_parent`, `mixed_failures_join_partially_and_all_failed_fails_the_fan_in`, `an_empty_for_each_list_joins_with_no_branches_and_no_child`, `a_repeated_fork_publishes_results_per_visit_with_its_own_children`, `a_nested_fork_runs_inside_its_branch_and_reports_its_own_results`, `cancelling_the_run_settles_every_branch_child`, `resume_keeps_a_finished_branch_and_finishes_the_unfinished_one`), `petri-execution::admission` (`one_slot_serializes_the_attempts_of_a_fork_and_two_slots_let_them_overlap`, `a_backoff_releases_the_fork_slot_so_a_queued_branch_runs_first`, `the_limit_counts_finished_children_and_names_the_refused_call`), `fabro_blackbox::for_each_branches_keep_distinct_values_under_one_key_in_item_order`, `fabro_blackbox::an_empty_for_each_list_joins_without_calling_the_model`, `fabro_blackbox::nested_joins_report_the_inner_results_inside_the_outer_envelope`, `fabro_blackbox::parallel_gates_bind_each_answer_to_its_own_branch`, cells `backend/dynamic-parallelism@host` and `@docker`, both readiness suites. Accepted differences `parallel-branches-in-path`, `empty-for-each-placeholder`; a branch's `context_updates` now follow the reference (`petri-attractor-steps::parallel::an_unchanged_write_back_is_reported_in_the_branch_updates`, the `branch_updates` unit tests). **Scale**: two successive 1,000-item forks (`petri-fabro-acceptance::e2e::two_successive_thousand_item_forks_stay_under_the_ceiling`, in the routine suite since 2026-09-08: 71 s in a debug build at 337 MB peak RSS). Since 2026-09-07 a fork has at most `max_parallel` live children (`petri-execution::admission::a_fork_of_fifty_children_keeps_four_live_and_starts_them_in_order`, `cancelling_the_parent_finishes_every_queued_child_as_cancelled`, `resume_redispatches_queued_children_under_the_bound`), the coordinator store applies each record in place (`petri-execution::store::tests::a_rejected_event_leaves_the_state_and_the_log_untouched`, `a_failed_write_leaves_the_state_unchanged_and_is_reported`), and since 2026-09-08 the `attractor/fork` step offloads the fork snapshot so every branch child is declared from references (`petri-attractor-steps::parallel::a_fifty_item_fork_declares_its_children_from_references`, `a_resumed_run_reads_the_offloaded_results_after_the_fork`, `two_forks_in_sequence_keep_every_child_small`, `fabro_blackbox::a_fifty_item_fork_declares_small_children_and_prompts_still_see_the_list`, lowering `a_static_fork_keeps_a_nested_for_each_list_inline_in_its_snapshot`). Measured with one probe (`.ai/reviews/fabro-unified/fanout-offload-snapshot.md`): one 1,000-item fork went from 43 s, 8.1 GB peak RSS and a 266 MB `coordinator.jsonl` to 28.5 s, 161 MB and 2.7 MB; bytes per child are flat at about 2.7 KB from 100 to 1,000 items; the two-fork run went from 133 s, 39 GB and 1.66 GB to 58 s, 343 MB and 5.7 MB (release). What remains is the `fsync` per coordinator record (five per child, about 25 ms of the 28 ms per child) and the one O(N) `NodeExpanded` record per fork. The 10,000-invocation ceiling itself is proven by `exactly_ten_thousand_invocations_are_admitted_and_the_next_is_refused` in `test:long` |
-| `class` with `model_stylesheet`, `model`, `provider`, `reasoning_effort`, `speed`, `max_tokens` | `petri-frontend-attractor::lowering`, cell `routing/bundle-defaults-and-overrides`, `fabro_blackbox::run_model_defaults_reach_openrouter_through_chat_completions`, `fabro_fallback_blackbox::reasoning_effort_maps_per_target_and_unfit_targets_are_skipped`, `petri-frontend-fabro::hooks::speed_and_max_tokens_reach_the_model_requests` |
+| `class` with `model_stylesheet`, `model`, `provider`, `reasoning_effort`, `speed`, `max_tokens` | `petri-frontend-attractor::lowering`, `fabro_blackbox::run_model_defaults_reach_openrouter_through_chat_completions`, `fabro_fallback_blackbox::reasoning_effort_maps_per_target_and_unfit_targets_are_skipped`, `petri-frontend-fabro::hooks::speed_and_max_tokens_reach_the_model_requests` |
 | `default_fidelity`, `fidelity=*`, `thread_id`, `default_thread`, `project_memory` | `petri-frontend-fabro::hooks::full_fidelity_nodes_continue_their_thread_and_others_start_fresh`, `petri-frontend-fabro::hooks::edge_fidelity_wins_and_a_lost_thread_degrades_to_summary_high`, `petri-frontend-fabro::hooks::project_memory_follows_the_profile_and_the_node_kind`, `fabro_hooks_blackbox::full_fidelity_nodes_share_one_conversation_through_the_binary`, `fabro_compaction_blackbox::a_node_that_lost_its_conversation_starts_at_summary_high`, `fabro_fallback_blackbox::a_retained_thread_continues_on_the_fallback_route`, both readiness suites (the `notes` and `docs` threads, the memory rule in the first request). Across `petri resume` a retained thread restarts from the `summary:high` preamble under Fabro's discarded-session rule (`petri-attractor-steps::subagents::a_resumed_run_restarts_the_stage_and_keeps_an_unfinished_childs_files`); this matches the pinned Fabro, whose `AgentApiBackend` keeps full-fidelity sessions in an in-memory map per worker, so it is parity, not a gap (owner decision of 2026-09-08; persisting threads would be an improvement beyond Fabro) |
 | sub-agents | the C4 row above; `fabro_subagents_blackbox` (8), `petri-attractor-steps::subagents` (14), both readiness suites (a hooked child, cancellation inside the child's tool). Accepted difference `subagent-usage-separate` (nesting under the open-session bound and inherited MCP tools are the reference's behaviour too since `05ebd0f`) |
 | `stall_timeout`, `loop_restart_signature_limit`, `goal_gate`, `retry_target`, `max_visits`, `max_node_visits` | `petri::controls::an_idle_run_is_cancelled_by_the_watchdog`, `petri::controls::a_pending_question_parks_the_watchdog`, `fabro_blackbox::a_stalled_run_is_cancelled_by_the_watchdog`, `petri::controls::a_repeated_deterministic_failure_trips_the_breaker_across_restarts`, `petri::controls::a_restart_edge_admits_only_transient_failures`, `petri::controls::the_breaker_state_is_restored_on_resume`, `petri::controls::node_visit_totals_survive_a_restart_while_context_resets`, cell `routing/goal-gate-restart-and-visit-limit`, the oracle |
@@ -860,13 +829,13 @@ it.
 | Extended variations and repeated process-isolation runs in `check:nightly` | `mise run check:nightly` on every nightly runner: `test:fabro:blackbox:repeat` (three runs under different schedules), `test:long`, `test:fabro:differential`, `check:msrv`, `test:release`; the nightly workflow then runs `check:fabro:readiness` (the strict set, `test:fabro:blackbox:strict`, plus the readiness verdict) on the runners that have Docker, since the strict task requires a daemon | met |
 | Library changes run the owning repository's checks before Petri pins them | [Library and repository gates](https://github.com/lithoscomputer/petri/blob/main/docs/testing.md#library-and-repository-gates), `DEVELOPING.md`; the "Pinned revisions" table above | met; the batch is locked |
 | Protocol retry, Pebble replay, Petri retry, and cross-layer cases distinct; a provider interruption after a non-idempotent tool effect | `llm_client.rs`, `fabro_fallback_blackbox::a_tool_effect_is_not_repeated_across_a_failover`, `client_retries_are_spent_before_the_chain_advances`, `a_workflow_retry_is_not_a_failover`, `fallback_events.rs` | met |
-| Required CI verifies the vendored bundles and the pinned twins, requires the corpus, fails on an absent asset, binary, scenario, or backend | `.github/workflows/ci.yml`; `PETRI_REQUIRE_*`; `tests/support/fabro/require.rs`; `mise run check:bundles` | met: the push runs on `67f4cb0` (34325364222), `97fb247` (34379457228) and `2463979` (34394908040) passed every job with no fetch and no key (2026-09-09) |
+| Required CI verifies the pinned twins, requires the corpus, fails on an absent asset, binary, scenario, or backend | `.github/workflows/ci.yml`; `PETRI_REQUIRE_*`; `tests/support/fabro/require.rs` | met: the push runs on `67f4cb0` (34325364222), `97fb247` (34379457228) and `2463979` (34394908040) passed every job with no fetch and no key (2026-09-09) |
 | Every required host scenario in routine CI; the Docker subset on Linux | `mise run check` runs the whole suite on both runners; Docker cases skip on macOS and are required on Linux; every planned cell of `matrix.json` has a test | met; hosted on the runs above (Linux with Docker required, macOS host cells) |
 | The pinned Fabro comparison matrix as a required compatibility job; nightly adds repetitions | `fabro compatibility (ubuntu-24.04)`: cached pinned build, `test:fabro:differential` (five live cells, zero unresolved differences) | met; the compatibility job passed on the runs above and in the nightly on `2463979` (34405186288, 34476177672) |
 | A machine-readable record per scenario | `tests/support/fabro/record.rs`, one record per scenario cell, `compatibility.differential` from the engine records | met |
 | Full failure bundles and compact success results retained in CI | the two `actions/upload-artifact` steps per job; the job summary carries `coverage.md` | met; artifacts and summaries on the runs above |
 | Coverage report with required, passed, failed, blocked, excluded; skips and exclusions never count | `scripts/fabro-coverage-report.py`, `--strict` in routine CI (a blocked cell is shown, not failed) and `--readiness` in `mise run check:fabro:readiness` (the final gate: every required cell passed, blocked cells included); with bundles fetched and every gate required: required 99 since 2026-09-13 (54 host cells: the three readiness cells, the five differential cells and the routing oracle included; 45 Docker cells, one per scenario file), blocked 0 (the `implement/child-runs-successfully@docker/openrouter` cell has run in a container since 2026-09-10), excluded 6 (`fix-ci`). A pinned-Fabro assertion a decision record lists under `known_defects` counts as passed with a note naming the record; any other failed assertion fails the cell | met |
-| Every bundle materializes with verified dependencies and concrete inputs | `bundles.lock.json`, the fetcher (5 of 5 verified locally); concrete inputs per scenario | met; `implement-issue` runs as inline graphs of the bundle's shape on both backends (the pinned bundle's own verify node needs the Fabro toolchain) |
+| Every bundle materializes with verified dependencies and concrete inputs | retired with the bundles on 2026-11-09 | not applicable |
 | Every required scenario and backend cell passes with no skips, unmatched calls, unexpected interviews, or unused replies | the strict coverage report plus each record's `services[].unmatched_requests` and interview receipt | met; no blocked cell since 2026-09-10 |
 | Final context, files, side effects meet independent expectations | each scenario's assertions, recorded per record; the readiness suites assert files, Git state and the public stream | met |
 | No unresolved result, routing, or side-effect difference | the differential decisions and the "Tracked departures" section (none tracked; `interview-run-model-migration` retired) | met |
@@ -875,8 +844,7 @@ it.
 | ACP agent backend | the `acp` scenario family of `fabro_scenarios_blackbox` (`acp_turn_and_directive`, `acp_turn_and_directive_docker`, `acp_exit_before_answer_is_retried`, `acp_permission_request_and_hook`, `acp_cancel_during_turn`): a scripted ACP agent (`scenarios/acp/fixtures/scripted_acp_agent.py`, committed into the fixture repository and started by `acp.command` in the run workspace) through the shipped binary on the host and in a Docker container: the turn's text, a routing directive with `context_updates` and `preferred_next_label`, a retry when the agent exits before answering (`max_retries`, two attempts in one firing), a `pre_tool_use` command hook answering `session/request_permission` with the rejecting option plus the `attractor.hook.warning` lines for the boundaries ACP does not offer, and a terminal cancel during a turn (`session/cancel` reaches the agent, nothing leaks). In-process: `petri-attractor-steps::agent` (`an_agent_that_exits_before_answering_is_retried_while_attempts_remain`, `an_agent_that_exits_early_fails_the_stage_routably`), `petri-frontend-fabro::hooks::acp_tool_hooks_are_best_effort_with_explicit_warnings` | claimed for a scripted agent; not claimed: real ACP client products (Claude Code, Gemini CLI) and ACP as a differential cell against the pinned Fabro |
 | Additional cutover requirements (Daytona, crash resume) gated separately | out of the initial scope by decision; not claimed | not claimed |
 
-What a passing hosted run shows, in order: "Verify the vendored Fabro
-bundles" passes on every job with no fetch and no key; the compatibility job
+What a passing hosted run shows, in order: the compatibility job
 restores or builds the pinned `fabro` binary and the "Build the pinned fabro
 binary" step reports its time; `test:fabro:differential` passes its five
 cells; every `check` job writes `coverage.md` to the summary with zero
@@ -893,9 +861,6 @@ after `2463979` has a hosted run yet.
 | Artefact | Path |
 |---|---|
 | Pin | `crates/fabro/corpus-pin.txt` |
-| Bundle manifest | `crates/fabro/acceptance/bundles.lock.json` |
-| Vendored bundles and their provenance | `crates/fabro/acceptance/bundles/<id>/`, `crates/fabro/acceptance/bundles/PROVENANCE.md` |
-| Bundle verifier | `scripts/corpus-fetch-fabro-bundles.sh` (`mise run check:bundles`) |
 | Fabro fetcher | `scripts/corpus-fetch-fabro.sh` |
 | Parity harness | `crates/fabro/oracle/harness/` (`oracle_harness.py`, `scripted_acp_agent.py`) |
 | Fixture regeneration | `scripts/oracle-regenerate.sh` |

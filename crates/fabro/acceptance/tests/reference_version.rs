@@ -9,7 +9,6 @@ use std::path::{Path, PathBuf};
 use std::{env, fs};
 
 use serde_json::Value;
-use sha2::{Digest as _, Sha256};
 
 fn root() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -267,53 +266,6 @@ fn every_decision_record_is_complete() {
         "no decision records under {}",
         dir.display()
     );
-}
-
-/// Every vendored bundle keeps its files byte-identical to
-/// `bundles.lock.json`, except a file a migration decision names by its new
-/// digest. The scenarios read the vendored tree
-/// (`crates/fabro/acceptance/bundles/<id>`, tracked in the repository with
-/// its provenance in `PROVENANCE.md` there), so that is what this checks. A
-/// missing bundle directory is a failure: the tree is tracked, so nothing
-/// fetches it.
-#[test]
-fn staged_bundles_match_the_lock_file_or_a_recorded_migration() {
-    let lock = json(&root().join("crates/fabro/acceptance/bundles.lock.json"));
-    let decisions_dir = root().join("crates/fabro/acceptance/decisions");
-    let migrations: String = fs::read_dir(&decisions_dir)
-        .expect("decisions")
-        .filter_map(Result::ok)
-        .filter_map(|entry| fs::read_to_string(entry.path()).ok())
-        .collect();
-    let mut checked = 0;
-    for bundle in lock["bundles"].as_array().expect("bundles") {
-        let id = bundle["id"].as_str().unwrap_or_default();
-        let dir = root().join("crates/fabro/acceptance/bundles").join(id);
-        assert!(
-            dir.is_dir(),
-            "{}: the vendored bundle `{id}` is missing",
-            dir.display()
-        );
-        for file in bundle["files"].as_array().expect("files") {
-            let relative = file["path"].as_str().unwrap_or_default();
-            let expected = file["sha256"].as_str().unwrap_or_default();
-            let path = dir.join(relative);
-            let bytes = fs::read(&path)
-                .unwrap_or_else(|e| panic!("{}: the bundle file is missing: {e}", path.display()));
-            let actual = format!("{:x}", Sha256::digest(&bytes));
-            checked += 1;
-            if actual == expected {
-                continue;
-            }
-            assert!(
-                migrations.contains(&actual),
-                "{}: differs from bundles.lock.json ({expected}) and no migration decision names its \
-                 digest {actual}",
-                path.display()
-            );
-        }
-    }
-    assert!(checked > 0, "the lock lists no bundle files");
 }
 
 /// Evidence records a differential run left (under `PETRI_EVIDENCE_DIR` or

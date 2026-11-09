@@ -156,19 +156,6 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
 
-      - name: Verify the vendored Fabro bundles
-        if: steps.update.outputs.changed == 'true'
-        run: scripts/corpus-fetch-fabro-bundles.sh
-
-      # The code-review bundle's rule loader imports PyYAML; see ci.yml.
-      - name: Install the review bundle's Python requirements
-        if: steps.update.outputs.changed == 'true'
-        run: |
-          python3 -m venv "$RUNNER_TEMP/fabro-python"
-          "$RUNNER_TEMP/fabro-python/bin/python" -m pip install --quiet --require-hashes \
-            -r crates/fabro/acceptance/bundles/code-review/.fabro/workflows/code-review/requirements-rules.txt
-          echo "$RUNNER_TEMP/fabro-python/bin" >> "$GITHUB_PATH"
-
       - name: Name the evidence directory
         if: steps.update.outputs.changed == 'true'
         run: |
@@ -195,7 +182,6 @@ jobs:
           PETRI_REQUIRE_DOCKER: '1'
           PETRI_REQUIRE_CORPUS: '1'
           PETRI_REQUIRE_FABRO_CORPUS: '1'
-          PETRI_REQUIRE_FABRO_BUNDLES: '1'
 
       # A newer library can raise the compiler floor.
       - name: Check the minimum Rust version

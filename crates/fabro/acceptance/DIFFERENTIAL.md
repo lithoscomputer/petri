@@ -192,7 +192,5 @@ Fixture state must reach both engines the same way: Fabro's `local`
 environment runs inside the staged bundle, and Petri's workspace starts
 empty, so a scenario that needs files in the workspace copies them there
 itself (`parallel-results` and `skills-precedence` do it in a `setup` node
-from the bundle path they receive as an input). Stage the bundle byte-identical to
-`bundles.lock.json`; a changed file needs a migration decision naming both
-digests (`reference_version.rs` checks it). Record the reference once with
+from the bundle path they receive as an input). Record the reference once with
 the binary, review it, and commit it.

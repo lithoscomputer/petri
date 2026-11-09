@@ -23,10 +23,6 @@ reason = "why the difference is intentional, or why it is tracked"
 acceptance = "what the comparison may accept, and when to retire the record"
 known_defects = ["assertion name"]   # optional: independent expectations the pinned Fabro fails
 
-[migration]                            # only when a bundle file changed
-old_bundle = "file and sha256 in bundles.lock.json"
-new_bundle = "file and sha256 under scenarios/"
-
 [[accepts]]                            # zero or more
 kind = "path.skipped_stage"            # a difference kind the comparison emits
 field = "path[*]"                      # optional glob on the difference's field
@@ -42,8 +38,6 @@ Rules:
 - A tracked departure (not intentional) says so in `reason` and names the
   retirement condition in `acceptance`; example:
   `interview-run-model-migration`.
-- A migration names the old and new bundle file digests; the staged
-  bundle's other files stay byte-identical to `bundles.lock.json`.
 - A baseline defect of the pinned Fabro is never accepted as Petri
   behaviour. The record lists the failed assertion's exact name under
   `known_defects` and names the scenario in `scenarios` (no glob); the

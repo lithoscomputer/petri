@@ -1,6 +1,5 @@
-//! Required assets of the black box battery: the materialized bundles, the
-//! pinned Fabro binary, the Fabro corpus, a Docker daemon, and a Daytona
-//! account.
+//! Required assets of the black box battery: the pinned Fabro binary, the Fabro
+//! corpus, a Docker daemon, and a Daytona account.
 //!
 //! Every check follows the convention `PETRI_REQUIRE_DOCKER` set: an absent
 //! asset skips with a visible notice on a developer machine, and fails when
@@ -10,7 +9,6 @@
 //!
 //! | Asset | Variable | Materialized by |
 //! |---|---|---|
-//! | bundles | `PETRI_REQUIRE_FABRO_BUNDLES` | tracked under `crates/fabro/acceptance/bundles/<id>`; `scripts/corpus-fetch-fabro-bundles.sh` verifies the tree |
 //! | fabro binary | `PETRI_REQUIRE_FABRO_BINARY` | `scripts/fabro-provision.sh` (handed over as `FABRO_BIN`) |
 //! | corpus | `PETRI_REQUIRE_FABRO_CORPUS` | `scripts/corpus-fetch-fabro.sh` |
 //! | Docker | `PETRI_REQUIRE_DOCKER` | a reachable daemon and the Docker plugin |
@@ -63,31 +61,6 @@ pub(crate) fn require_or_skip(present: bool, variable: &str, what: &str) -> bool
 pub(crate) fn workspace_root() -> PathBuf {
     let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../..");
     root.canonicalize().unwrap_or(root)
-}
-
-/// The vendored bundle `crates/fabro/acceptance/bundles/<id>`, or `None`
-/// (with a notice) when its directory is absent. The bundles are tracked in
-/// the repository, so an absent one means an incomplete checkout, not a
-/// fetch that did not run. Their digests are checked against
-/// `bundles.lock.json` by `scripts/corpus-fetch-fabro-bundles.sh`
-/// (`mise run check:bundles`) and by the acceptance crate's
-/// `staged_bundles_match_the_lock_file_or_a_recorded_migration`.
-///
-/// # Panics
-///
-/// Panics when `PETRI_REQUIRE_FABRO_BUNDLES` is set and the bundle is absent.
-pub(crate) fn bundle(id: &str) -> Option<PathBuf> {
-    let root = workspace_root().join("crates/fabro/acceptance/bundles");
-    let dir = root.join(id);
-    require_or_skip(
-        dir.is_dir(),
-        "PETRI_REQUIRE_FABRO_BUNDLES",
-        &format!(
-            "the Fabro bundle `{id}` is not under {} (the vendored tree is incomplete)",
-            root.display()
-        ),
-    )
-    .then_some(dir)
 }
 
 /// The pinned `fabro` binary `FABRO_BIN` names, or the one at the cache

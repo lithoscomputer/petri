@@ -50,17 +50,7 @@ Fabro crates (`crates/fabro/`) read Fabro's settings files around it and prove
 compatibility with the pinned Fabro. `fabro` may depend on `attractor`, never
 the other way; `crates/petri/lib/tests/layering.rs` enforces the direction.
 
-## Fabro bundles
-
-The Fabro workflow bundles the black box battery runs are vendored under
-`crates/fabro/acceptance/bundles/<id>/`, one directory per bundle, with each
-file at its path in the source repository. `bundles.lock.json` beside them
-records the source repository, revision, and every file's digest;
-`bundles/PROVENANCE.md` records the copy and the sources' licenses. Two of
-the sources are not public, so nothing fetches them: `mise run check:bundles`
-(part of `mise run check` and of every CI job) verifies the tracked files
-against the lock and fails on a missing, changed, or extra file. To update a
-bundle, follow "Updating a bundle" in `PROVENANCE.md`.
+## Native Pebble tests
 
 Native Pebble tests use a scripted model and real execution scopes. They need
 no provider credentials. `crates/attractor/steps/tests/pebble.rs` covers tool
@@ -80,7 +70,6 @@ bounded output capture, and the Pebble environment contract on Host and Docker.
 | `mise run lean:build` | Build the Lean model in `lean/` and check every proof |
 | `mise run test:lean` | Check the engine core against the Lean model, with the model required |
 | `mise run check` | Run the complete routine verification gate |
-| `mise run check:bundles` | Verify the vendored Fabro bundles against `bundles.lock.json`, digest by digest |
 | `mise run test:fabro:blackbox` | Run the required Fabro black box scenarios and write their evidence records and coverage report |
 | `mise run test:fabro:blackbox:repeat` | The same set three times, each in fresh processes under a different schedule |
 | `mise run test:fabro:differential` | Compare the shipped binary with the pinned `fabro` binary (built from the corpus on first use, about three minutes) |
@@ -263,20 +252,14 @@ Each package builds its same-named plugin executable.
 Nextest is the normal test runner. `mise run test` also uses Cargo to run
 doctests, which Nextest does not run.
 
-The Fabro side has three more fetched assets. `scripts/corpus-fetch-fabro.sh`
+The Fabro side has two more fetched assets. `scripts/corpus-fetch-fabro.sh`
 fetches the Fabro corpus at the pin in `crates/fabro/corpus-pin.txt`.
-`scripts/corpus-fetch-fabro-bundles.sh` materializes the bundle set in
-`crates/fabro/acceptance/bundles.lock.json` and verifies every digest; the two
-private sources need SSH read access, or `FABRO_BUNDLE_SOURCE_<OWNER>_<REPO>`
-pointing at a local checkout (for example
-`FABRO_BUNDLE_SOURCE_LITHOSCOMPUTER_CODE_REVIEW=../code-review`).
 `scripts/fabro-provision.sh` builds the pinned `fabro` binary from the fetched
 corpus into `crates/fabro/corpus/fabro-target/` and checks it reports the pin;
 a `fabro` on `PATH` is never used.
 
 CI sets `PETRI_REQUIRE_DOCKER=1` on Linux and `PETRI_REQUIRE_CORPUS=1`,
-`PETRI_REQUIRE_FABRO_CORPUS=1`, and `PETRI_REQUIRE_FABRO_BUNDLES=1` on all
-runners; the compatibility job also sets `PETRI_REQUIRE_FABRO_BINARY=1`. These
+and `PETRI_REQUIRE_FABRO_CORPUS=1` on all runners; the compatibility job also sets `PETRI_REQUIRE_FABRO_BINARY=1`. These
 variables turn an unexpected skip into a failure. Do not set them for ordinary
 local work unless the resources are available. Without them an absent asset
 prints a `skipping:` notice, and the coverage report shows the scenario as
@@ -337,14 +320,6 @@ schedules, reruns the comparison matrix (required on Linux x86_64, best effort
 on the other runners), and runs the full test suite in release mode. You can start it manually from GitHub
 Actions. Nightly includes Linux arm64 coverage. Keep arm64 in Nightly until its
 Docker and corpus runs are reliable enough for the routine gate.
-
-The code-review bundle's host scenario cells resolve `python3` from `PATH` and
-need PyYAML, which its rule loader imports. Locally, any `python3` on `PATH`
-that imports `yaml` satisfies the scenario runner; without one those cells
-fail with a message naming the module. CI installs the bundle's own pinned
-requirements (`requirements-rules.txt`, with hash checking) into a virtual
-environment placed first on `PATH`. A Docker scope needs nothing: the pinned
-runner image carries the same modules.
 
 A test that starts a Python `http.server.HTTPServer` must override
 `server_bind` so it does not call `socket.getfqdn`. On the macOS runner that

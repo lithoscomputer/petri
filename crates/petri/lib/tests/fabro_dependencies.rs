@@ -152,17 +152,15 @@ fn skip_dir(path: &Path, root: &Path) -> bool {
         return true;
     }
     // A nested git checkout is not this repository's build input: a worktree
-    // under `.claude/worktrees/` (with its own fetched corpus), the Fabro
-    // corpus checkout itself, or a fetched bundle source. `.git` is a
-    // directory in a plain checkout and a file in a worktree.
+    // under `.claude/worktrees/` (with its own fetched corpus) or the Fabro
+    // corpus checkout itself. `.git` is a directory in a plain checkout and a
+    // file in a worktree.
     if path != root && path.join(".git").exists() {
         return true;
     }
-    // Test data, never a build input: the Fabro corpus checkout, the vendored
-    // black box bundles, and a fetched bundle source under `.sources`.
-    path.strip_prefix(root).is_ok_and(|rel| {
-        rel.starts_with("crates/fabro/corpus") || rel.starts_with("crates/fabro/acceptance/bundles")
-    })
+    // Test data, never a build input: the Fabro corpus checkout.
+    path.strip_prefix(root)
+        .is_ok_and(|rel| rel.starts_with("crates/fabro/corpus"))
 }
 
 fn walk(dir: &Path, root: &Path, out: &mut Vec<PathBuf>) {
@@ -185,8 +183,8 @@ fn walk(dir: &Path, root: &Path, out: &mut Vec<PathBuf>) {
 }
 
 /// Every nested Cargo manifest line and build script line under `root` that
-/// reaches a Fabro crate, outside `target/`, `.git/`, `.ai/`, the fetched
-/// corpus and the fetched bundle sources. This catches a separate Cargo
+/// reaches a Fabro crate, outside `target/`, `.git/`, `.ai/`, and the fetched
+/// corpus. This catches a separate Cargo
 /// workspace inside the repository, which the main `cargo metadata` never sees.
 fn forbidden_fabro_manifests(root: &Path) -> Vec<String> {
     let mut files = Vec::new();
@@ -489,10 +487,6 @@ fn nested_manifests_and_build_scripts_are_scanned_and_the_corpus_is_skipped() {
         "[dependencies]\nfabro-core = { path = \"lib/foundation/fabro-core\" }\n",
     );
     write("target/debug/build/x/Cargo.toml", "fabro-core = \"1\"\n");
-    write(
-        "crates/fabro/acceptance/bundles/.sources/fabro-sh/fabro/Cargo.toml",
-        "fabro-core = { path = \"lib/foundation/fabro-core\" }\n",
-    );
     // A nested worktree is its own checkout (`.git` is a file there) and
     // carries its own fetched corpus; the scan must not enter it.
     write(
