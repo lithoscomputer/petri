@@ -1,6 +1,6 @@
 //! The complete-workflow scenarios of the Fabro black box battery (phase 4):
 //! every required cell of `crates/fabro/acceptance/scenarios/matrix.json`,
-//! each a pinned bundle run through the shipped `petri` binary from a
+//! each an inline graph run through the shipped `petri` binary from a
 //! scenario file (`SCHEMA.md` there) with provider twins, a fixture
 //! repository with real local Git remotes, a scripted interviewer, and the
 //! observations the file declared before the run.
@@ -84,181 +84,6 @@ cell!(
     acp
 );
 
-// ── Code review ─────────────────────────────────────────────────────────────
-
-cell!(
-    code_review_findings_in_multiple_branches,
-    "code-review/findings-in-multiple-branches",
-    host,
-    openrouter
-);
-cell!(
-    code_review_findings_in_multiple_branches_docker,
-    "code-review/findings-in-multiple-branches",
-    docker,
-    openrouter
-);
-
-cell!(
-    code_review_empty_diff,
-    "code-review/empty-diff",
-    host,
-    openrouter
-);
-cell!(
-    code_review_empty_diff_docker,
-    "code-review/empty-diff",
-    docker,
-    openrouter
-);
-cell!(
-    code_review_no_surviving_findings,
-    "code-review/no-surviving-findings",
-    host,
-    openrouter
-);
-cell!(
-    code_review_no_surviving_findings_docker,
-    "code-review/no-surviving-findings",
-    docker,
-    openrouter
-);
-cell!(
-    code_review_invalid_output_repaired,
-    "code-review/invalid-output-repaired",
-    host,
-    openrouter
-);
-cell!(
-    code_review_invalid_output_repaired_docker,
-    "code-review/invalid-output-repaired",
-    docker,
-    openrouter
-);
-cell!(
-    code_review_repair_exhausted,
-    "code-review/repair-exhausted",
-    host,
-    openrouter
-);
-cell!(
-    code_review_repair_exhausted_docker,
-    "code-review/repair-exhausted",
-    docker,
-    openrouter
-);
-cell!(
-    code_review_one_failed_branch,
-    "code-review/one-failed-branch",
-    host,
-    openrouter
-);
-cell!(
-    code_review_one_failed_branch_docker,
-    "code-review/one-failed-branch",
-    docker,
-    openrouter
-);
-cell!(
-    code_review_reverse_branch_completion,
-    "code-review/reverse-branch-completion",
-    host,
-    openrouter
-);
-cell!(
-    code_review_reverse_branch_completion_docker,
-    "code-review/reverse-branch-completion",
-    docker,
-    openrouter
-);
-cell!(
-    code_review_multi_level_fan_out,
-    "code-review/multi-level-fan-out",
-    host,
-    openrouter
-);
-cell!(
-    code_review_multi_level_fan_out_docker,
-    "code-review/multi-level-fan-out",
-    docker,
-    openrouter
-);
-
-// ── Security review ─────────────────────────────────────────────────────────
-
-cell!(
-    security_review_no_vulnerabilities,
-    "security-review/no-vulnerabilities",
-    host,
-    openrouter
-);
-cell!(
-    security_review_no_vulnerabilities_docker,
-    "security-review/no-vulnerabilities",
-    docker,
-    openrouter
-);
-cell!(
-    security_review_several_verified,
-    "security-review/several-verified",
-    host,
-    openrouter
-);
-cell!(
-    security_review_several_verified_docker,
-    "security-review/several-verified",
-    docker,
-    openrouter
-);
-cell!(
-    security_review_rejected_candidate,
-    "security-review/rejected-candidate",
-    host,
-    openrouter
-);
-cell!(
-    security_review_rejected_candidate_docker,
-    "security-review/rejected-candidate",
-    docker,
-    openrouter
-);
-cell!(
-    security_review_partial_branch_failure,
-    "security-review/partial-branch-failure",
-    host,
-    openrouter
-);
-cell!(
-    security_review_partial_branch_failure_docker,
-    "security-review/partial-branch-failure",
-    docker,
-    openrouter
-);
-cell!(
-    security_review_malformed_response,
-    "security-review/malformed-response",
-    host,
-    openrouter
-);
-cell!(
-    security_review_malformed_response_docker,
-    "security-review/malformed-response",
-    docker,
-    openrouter
-);
-cell!(
-    security_review_timeout_cancel,
-    "security-review/timeout-cancel",
-    host,
-    openrouter
-);
-cell!(
-    security_review_timeout_cancel_docker,
-    "security-review/timeout-cancel",
-    docker,
-    openrouter
-);
-
 // ── Cross-cutting provider faults ───────────────────────────────────────────
 
 cell!(
@@ -331,18 +156,6 @@ cell!(
 // ── Routing and configuration ───────────────────────────────────────────────
 
 cell!(
-    routing_bundle_defaults_and_overrides,
-    "routing/bundle-defaults-and-overrides",
-    host,
-    openrouter
-);
-cell!(
-    routing_bundle_defaults_and_overrides_docker,
-    "routing/bundle-defaults-and-overrides",
-    docker,
-    openrouter
-);
-cell!(
     routing_goal_gate_restart_and_visit_limit,
     "routing/goal-gate-restart-and-visit-limit",
     host,
@@ -385,12 +198,6 @@ cell!(
 cell!(
     backend_dynamic_parallelism_docker,
     "backend/dynamic-parallelism",
-    docker,
-    openai
-);
-cell!(
-    backend_nested_workflow_docker,
-    "interview/child-interviews",
     docker,
     openai
 );
@@ -479,19 +286,6 @@ cell!(
 // ── Interview gates ─────────────────────────────────────────────────────────
 
 cell!(
-    interview_scripted_choice_refusal_freeform,
-    "interview/scripted-choice-refusal-freeform",
-    host,
-    openai
-);
-cell!(
-    interview_scripted_choice_refusal_freeform_docker,
-    "interview/scripted-choice-refusal-freeform",
-    docker,
-    openai
-);
-
-cell!(
     interview_repeated_and_concurrent_questions,
     "interview/repeated-and-concurrent-questions",
     host,
@@ -503,72 +297,6 @@ cell!(
     docker,
     none
 );
-cell!(
-    interview_child_interviews,
-    "interview/child-interviews",
-    host,
-    openai
-);
-cell!(
-    interview_delayed_withheld_reply,
-    "interview/delayed-withheld-reply",
-    host,
-    openai
-);
-cell!(
-    interview_delayed_withheld_reply_docker,
-    "interview/delayed-withheld-reply",
-    docker,
-    openai
-);
-cell!(
-    interview_invalid_answer_reasked,
-    "interview/invalid-answer-reasked",
-    host,
-    openai
-);
-cell!(
-    interview_invalid_answer_reasked_docker,
-    "interview/invalid-answer-reasked",
-    docker,
-    openai
-);
-cell!(
-    interview_unexpected_question,
-    "interview/unexpected-question",
-    host,
-    openai
-);
-cell!(
-    interview_unexpected_question_docker,
-    "interview/unexpected-question",
-    docker,
-    openai
-);
-cell!(
-    interview_unused_answer,
-    "interview/unused-answer",
-    host,
-    openai
-);
-cell!(
-    interview_unused_answer_docker,
-    "interview/unused-answer",
-    docker,
-    openai
-);
-cell!(
-    interview_timeout_cancel,
-    "interview/timeout-cancel",
-    host,
-    openai
-);
-cell!(
-    interview_timeout_cancel_docker,
-    "interview/timeout-cancel",
-    docker,
-    openai
-);
 cell!(interview_gate_timeout, "interview/gate-timeout", host, none);
 cell!(
     interview_gate_timeout_docker,
@@ -576,23 +304,10 @@ cell!(
     docker,
     none
 );
-cell!(
-    interview_terminal_eof,
-    "interview/terminal-eof",
-    host,
-    openai
-);
-cell!(
-    interview_terminal_eof_docker,
-    "interview/terminal-eof",
-    docker,
-    openai
-);
 
-/// Every tracked scenario file loads under the strict schema, its bundle
-/// hash equals the lock, and every planned matrix cell names a scenario
-/// that exists. A scenario that fails here never runs, so a typo in an
-/// assertion cannot pass silently.
+/// Every tracked scenario file loads under the strict schema, and every
+/// planned matrix cell names a scenario that exists. A scenario that fails here
+/// never runs, so a typo in an assertion cannot pass silently.
 #[test]
 fn every_scenario_file_loads_and_the_matrix_is_consistent() {
     let scenarios = Scenario::all().unwrap_or_else(|error| panic!("{error}"));

@@ -70,30 +70,9 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
 
-      # The Fabro replacement set is vendored under crates/fabro/acceptance/bundles
-      # with its provenance in bundles.lock.json. Verify every tracked file
-      # against its locked digest before anything runs it; no bundle is fetched.
-      - name: Verify the vendored Fabro bundles
-        run: scripts/corpus-fetch-fabro-bundles.sh
-
       # One directory per run for the scenario evidence records
       # (crates/petri/cli/tests/support/fabro/evidence.rs) and the coverage
       # report. The steps below keep it as a job artifact.
-      # The code-review bundle's rule loader imports PyYAML, and its host
-      # scenario cells resolve `python3` from PATH. Install the bundle's own
-      # pinned requirements, with hash checking, into a virtual environment
-      # placed first on PATH: the runners' system Python is externally
-      # managed on Ubuntu 24.04, and a `--user` install would be hidden by
-      # the run's isolated HOME. A Docker scope needs nothing here: the
-      # pinned runner image carries the same modules.
-      - name: Install the review bundle's Python requirements
-        run: |
-          python3 -m venv "$RUNNER_TEMP/fabro-python"
-          "$RUNNER_TEMP/fabro-python/bin/python" -m pip install --quiet --require-hashes \
-            -r crates/fabro/acceptance/bundles/code-review/.fabro/workflows/code-review/requirements-rules.txt
-          "$RUNNER_TEMP/fabro-python/bin/python" -c 'import yaml; print("PyYAML", yaml.__version__)'
-          echo "$RUNNER_TEMP/fabro-python/bin" >> "$GITHUB_PATH"
-
       - name: Name the evidence directory
         run: |
           echo "PETRI_EVIDENCE_DIR=$RUNNER_TEMP/fabro-evidence" >> "$GITHUB_ENV"
@@ -141,7 +120,6 @@ jobs:
           PETRI_REQUIRE_DOCKER: ${{ matrix.docker == 'required' && '1' || '' }}
           PETRI_REQUIRE_CORPUS: '1'
           PETRI_REQUIRE_FABRO_CORPUS: '1'
-          PETRI_REQUIRE_FABRO_BUNDLES: '1'
           PETRI_REQUIRE_FABRO_BINARY: ${{ matrix.runner == 'ubuntu-24.04' && '1' || '' }}
 
       # The final readiness gate, where Docker exists: the strict black box

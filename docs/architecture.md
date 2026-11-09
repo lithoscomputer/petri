@@ -23,7 +23,7 @@ crates/github/acceptance the acceptance battery: corpus harness and end-to-end r
 crates/attractor/frontend    the Attractor frontend: lowers Graphviz DOT workflows to the IR; reads no settings file
 crates/attractor/steps       the Attractor step kinds: command, wait, human, agent over ACP or native Pebble, prompt, nested workflow, the stage step, the local hook service, MCP servers as Pebble tool sources (`pebble::mcp`), fidelity preambles, retained threads, project memory, Fabro's skill directories, context compaction, the output store, and the stub registry
 crates/fabro/frontend    the Fabro frontend: Fabro's settings layers (`workflow.toml`, `.fabro/project.toml`, the user settings) and launch precedence around the Attractor frontend
-crates/fabro/acceptance  the Fabro battery: corpus harness, runs under stubs, the Fabro oracle, real steps, the compatibility contract and bundle manifest
+crates/fabro/acceptance  the Fabro battery: corpus harness, runs under stubs, the Fabro oracle, real steps, and the compatibility contract
 crates/petri/lib       the distribution: core plus every component
 crates/petri/cli       the shipped `petri` binary: the distribution handed to core's CLI
 ```

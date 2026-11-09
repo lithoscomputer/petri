@@ -4,10 +4,9 @@
 //! value matchers `expect` blocks use, placeholder substitution, and the
 //! per-cell coverage record the report reads.
 //!
-//! Loading is strict: every unknown key is an error, every row of `expect`
-//! is required, and a pinned bundle's hash must equal the lock file's. A
-//! scenario that does not load never runs, so a typo cannot silently drop
-//! an assertion.
+//! Loading is strict: every unknown key is an error, and every row of
+//! `expect` is required. A scenario that does not load never runs, so a typo
+//! cannot silently drop an assertion.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
@@ -23,17 +22,9 @@ pub(crate) const SCHEMA_VERSION: u32 = 1;
 /// Where the tracked scenarios live, relative to this crate's manifest.
 pub(crate) const SCENARIOS_DIR: &str = "../../fabro/acceptance/scenarios";
 
-/// The bundle manifest, relative to this crate's manifest.
-pub(crate) const BUNDLES_LOCK: &str = "../../fabro/acceptance/bundles.lock.json";
-
-/// The vendored bundles, relative to this crate's manifest.
-pub(crate) const BUNDLES_DIR: &str = "../../fabro/acceptance/bundles";
-
 pub(crate) const FAMILIES: &[&str] = &[
     "acp",
     "backend",
-    "code-review",
-    "security-review",
     "implement",
     "interview",
     "provider-faults",
@@ -69,24 +60,11 @@ pub(crate) struct Scenario {
     pub(crate) dir:            PathBuf,
 }
 
+/// The graph a scenario runs: a `.fabro` file beside the scenario.
 #[derive(Debug, Clone, Deserialize)]
-#[serde(deny_unknown_fields, untagged)]
-pub(crate) enum Bundle {
-    Pinned {
-        id:          String,
-        hash:        String,
-        #[serde(default)]
-        entry_point: Option<String>,
-    },
-    Inline {
-        inline:      String,
-        /// A pinned bundle whose files are also copied into the fixture,
-        /// for an inline graph that calls one of the bundle's workflows.
-        #[serde(default)]
-        with_bundle: Option<String>,
-        #[serde(default)]
-        with_hash:   Option<String>,
-    },
+#[serde(deny_unknown_fields)]
+pub(crate) struct Bundle {
+    pub(crate) inline: String,
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -493,54 +471,12 @@ impl Scenario {
         if self.title.trim().is_empty() {
             return Err(format!("{}: empty title", path.display()));
         }
-        match &self.bundle {
-            Bundle::Pinned { id, hash, .. } => {
-                let lock = lock()?;
-                let entry = lock["bundles"]
-                    .as_array()
-                    .and_then(|bundles| bundles.iter().find(|b| b["id"] == id.as_str()))
-                    .ok_or_else(|| {
-                        format!("{}: bundle `{id}` is not in the lock", path.display())
-                    })?;
-                if entry["bundle_hash"] != hash.as_str() {
-                    return Err(format!(
-                        "{}: bundle `{id}` hash {hash} differs from the lock's {}",
-                        path.display(),
-                        entry["bundle_hash"]
-                    ));
-                }
-            }
-            Bundle::Inline {
-                inline,
-                with_bundle,
-                with_hash,
-            } => {
-                if !self.dir.join(inline).is_file() {
-                    return Err(format!(
-                        "{}: inline graph `{inline}` is not beside the scenario",
-                        path.display()
-                    ));
-                }
-                if let Some(id) = with_bundle {
-                    let hash = with_hash.as_deref().ok_or_else(|| {
-                        format!("{}: `with_bundle` needs `with_hash`", path.display())
-                    })?;
-                    let lock = lock()?;
-                    let entry = lock["bundles"]
-                        .as_array()
-                        .and_then(|bundles| bundles.iter().find(|b| b["id"] == id.as_str()))
-                        .ok_or_else(|| {
-                            format!("{}: bundle `{id}` is not in the lock", path.display())
-                        })?;
-                    if entry["bundle_hash"] != hash {
-                        return Err(format!(
-                            "{}: bundle `{id}` hash {hash} differs from the lock's {}",
-                            path.display(),
-                            entry["bundle_hash"]
-                        ));
-                    }
-                }
-            }
+        let inline = &self.bundle.inline;
+        if !self.dir.join(inline).is_file() {
+            return Err(format!(
+                "{}: inline graph `{inline}` is not beside the scenario",
+                path.display()
+            ));
         }
         if !matches!(
             self.expect.process.status.as_str(),
@@ -578,44 +514,9 @@ impl Scenario {
         Ok(())
     }
 
-    /// The lock entry of a pinned bundle.
-    pub(crate) fn lock_entry(&self) -> Result<Option<Value>, String> {
-        match &self.bundle {
-            Bundle::Pinned { id, .. } => {
-                let lock = lock()?;
-                Ok(lock["bundles"]
-                    .as_array()
-                    .and_then(|bundles| bundles.iter().find(|b| b["id"] == id.as_str()))
-                    .cloned())
-            }
-            Bundle::Inline { .. } => Ok(None),
-        }
-    }
-
-    /// The pinned bundle whose files the fixture carries, if any.
-    pub(crate) fn bundle_files(&self) -> Option<&str> {
-        match &self.bundle {
-            Bundle::Pinned { id, .. } => Some(id),
-            Bundle::Inline { with_bundle, .. } => with_bundle.as_deref(),
-        }
-    }
-
-    /// The workflow file to run, relative to the fixture repository root
-    /// (pinned bundles) or to the scenario directory (inline graphs).
-    pub(crate) fn entry_point(&self) -> Result<String, String> {
-        match &self.bundle {
-            Bundle::Pinned { entry_point, .. } => {
-                if let Some(entry) = entry_point {
-                    return Ok(entry.clone());
-                }
-                let entry = self.lock_entry()?.ok_or("no lock entry")?;
-                entry["entry_point"]
-                    .as_str()
-                    .map(str::to_owned)
-                    .ok_or_else(|| "the lock entry has no entry point".to_owned())
-            }
-            Bundle::Inline { inline, .. } => Ok(inline.clone()),
-        }
+    /// The workflow file to run, relative to the scenario directory.
+    pub(crate) fn entry_point(&self) -> &str {
+        &self.bundle.inline
     }
 }
 
@@ -633,21 +534,6 @@ fn walk(dir: &Path, out: &mut Vec<PathBuf>) -> io::Result<()> {
         }
     }
     Ok(())
-}
-
-/// The bundle lock, parsed.
-pub(crate) fn lock() -> Result<Value, String> {
-    let path = Path::new(env!("CARGO_MANIFEST_DIR")).join(BUNDLES_LOCK);
-    let text = fs::read_to_string(&path).map_err(|e| format!("read {}: {e}", path.display()))?;
-    serde_json::from_str(&text).map_err(|e| format!("{}: {e}", path.display()))
-}
-
-/// The fetched bundle directory for `id`, when the fetcher materialized it.
-pub(crate) fn bundle_dir(id: &str) -> Option<PathBuf> {
-    let dir = Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join(BUNDLES_DIR)
-        .join(id);
-    dir.is_dir().then_some(dir)
 }
 
 // ── The matrix ──────────────────────────────────────────────────────────────

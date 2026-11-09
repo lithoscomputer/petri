@@ -19,9 +19,7 @@ use serde_json::{Map, Value, json};
 use tokio::time::{Instant, sleep};
 
 use super::launch::{Case, Finished, Launch, sanitized_path};
-use super::scenario::{
-    Agent, Backend, Bindings, Bundle, CellRecord, FileSpec, Scenario, bundle_dir, matches,
-};
+use super::scenario::{Agent, Backend, Bindings, CellRecord, FileSpec, Scenario, matches};
 use super::twins::{Provider, Twin, model, requested_effort, wire_model};
 use super::{inspect, interview};
 
@@ -43,26 +41,9 @@ pub(crate) struct Ran {
 ///
 /// Panics with the first failed expectation. The cell's coverage record
 /// stays `failed` then; it becomes `passed` only when every row holds.
-#[expect(
-    clippy::print_stderr,
-    reason = "the skip notice belongs to the test runner's output, which no subscriber reads"
-)]
 pub(crate) async fn run_cell(cell: &str, id: &str, backend: Backend, agent: Agent) -> Option<Ran> {
     let record = CellRecord::start(cell);
     let scenario = Scenario::from_id(id).unwrap_or_else(|error| panic!("{error}"));
-    if let Some(bundle) = scenario.bundle_files()
-        && bundle_dir(bundle).is_none()
-    {
-        assert!(
-            !env::var("PETRI_REQUIRE_FABRO_BUNDLES").is_ok_and(|v| !v.is_empty()),
-            "PETRI_REQUIRE_FABRO_BUNDLES is set, but bundle `{bundle}` is not fetched \
-             (scripts/corpus-fetch-fabro-bundles.sh)"
-        );
-        eprintln!("skipping: bundle `{bundle}` is not fetched");
-        drop(record);
-        CellRecord::skip(cell, &format!("bundle `{bundle}` is not fetched"));
-        return None;
-    }
     if backend == Backend::Docker && !testkit::is_docker_ready().await {
         drop(record);
         CellRecord::skip(cell, "no Docker daemon");
@@ -97,26 +78,20 @@ async fn run(scenario: Scenario, backend: Backend, agent: Agent, cell: &str) -> 
     let fixture = case.root.join("fixture");
     let repo = fixture.join("repo");
     fs::create_dir_all(&repo).expect("fixture repository");
-    if let Some(id) = scenario.bundle_files() {
-        let source = bundle_dir(id).expect("bundle fetched");
-        copy_tree(&source, &repo);
-    }
-    if let Bundle::Inline { inline, .. } = &scenario.bundle {
-        // Every graph of the scenario's directory lands flat at the
-        // repository root, so a parent's `stack.child_workflow` names its
-        // child by file name; a `workflow.toml` beside them comes along.
-        let source = scenario.dir.join(inline);
-        let dir = source.parent().unwrap_or(&scenario.dir).to_path_buf();
-        for entry in fs::read_dir(&dir).expect("read the graph directory") {
-            let entry = entry.expect("dir entry");
-            let path = entry.path();
-            let name = entry.file_name();
-            let is_graph = path
-                .extension()
-                .is_some_and(|extension| extension == "fabro" || extension == "dot");
-            if is_graph || name == "workflow.toml" {
-                fs::copy(&path, repo.join(&name)).expect("copy the inline graph");
-            }
+    // Every graph of the scenario's directory lands flat at the repository
+    // root, so a parent's `stack.child_workflow` names its child by file
+    // name; a `workflow.toml` beside them comes along.
+    let source = scenario.dir.join(scenario.entry_point());
+    let graphs = source.parent().unwrap_or(&scenario.dir).to_path_buf();
+    for entry in fs::read_dir(&graphs).expect("read the graph directory") {
+        let entry = entry.expect("dir entry");
+        let path = entry.path();
+        let name = entry.file_name();
+        let is_graph = path
+            .extension()
+            .is_some_and(|extension| extension == "fabro" || extension == "dot");
+        if is_graph || name == "workflow.toml" {
+            fs::copy(&path, repo.join(&name)).expect("copy the inline graph");
         }
     }
     git(&repo, &["init", "-q", "-b", "main"]);
@@ -290,16 +265,11 @@ async fn run(scenario: Scenario, backend: Backend, agent: Agent, cell: &str) -> 
     }
 
     // ── Launch ──────────────────────────────────────────────────────────
-    let entry = scenario
-        .entry_point()
-        .unwrap_or_else(|error| panic!("{error}"));
-    let entry = match &scenario.bundle {
-        Bundle::Inline { .. } => Path::new(&entry)
-            .file_name()
-            .map(|name| name.to_string_lossy().into_owned())
-            .unwrap_or(entry),
-        Bundle::Pinned { .. } => entry,
-    };
+    let entry = scenario.entry_point();
+    let entry = Path::new(entry).file_name().map_or_else(
+        || entry.to_owned(),
+        |name| name.to_string_lossy().into_owned(),
+    );
     let workflow = repo.join(&entry);
     assert!(
         workflow.is_file(),

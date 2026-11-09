@@ -74,7 +74,7 @@ crates/core/execution/tests/simulation.rs   §10 simulation: seeded invocation t
 crates/petri/cli/tests/fabro_blackbox.rs     the Fabro black box battery: the shipped binary against provider twins on loopback, scripted interviews, retention, a smoke run with no `fabro` on PATH; every read of a finished run goes through `petri inspect --json`
 crates/petri/cli/tests/fabro_scenarios_blackbox.rs black box phase 4: every required (scenario, backend, agent) cell of `crates/fabro/acceptance/scenarios/matrix.json`, each a scenario file in the versioned format `scenarios/SCHEMA.md` documents, run through the shipped binary with provider twins, a fixture repository with real local Git remotes, and a scripted interviewer; `scripts/fabro-coverage-report.py` merges the per-cell records into `coverage.json`
 crates/petri/cli/tests/fabro_differential.rs black box phase 5: every scenario through the shipped binary and the pinned Fabro binary, independent expectations per engine, the committed reference, and the comparison under `tests/support/fabro/compare.rs` with decision records (`crates/fabro/acceptance/decisions/`)
-crates/fabro/acceptance/tests/reference_version.rs  every oracle fixture, scenario reference, decision record, staged bundle and evidence record names the pinned Fabro revision
+crates/fabro/acceptance/tests/reference_version.rs  every oracle fixture, scenario reference, decision record and evidence record names the pinned Fabro revision
 crates/petri/lib/tests/interview.rs          the interview dispatcher on the standalone host: parallel gates, sensitive masking, a failing interviewer, cancellation, occurrence across a loop, nested invocation paths, the re-ask, expiry
 crates/petri/lib/tests/controls.rs           the circuit breaker across restarts and resume, node visit totals across `loop_restart`, the stall watchdog, pause, cancel while paused, steering; the durable pause (a pause survives a dropped coordinator and holds admission on resume until an unpause; a paused resumed run can be cancelled)
 crates/petri/lib/tests/interrupt.rs          the interrupt control: an interrupt with text during a native tool call ends the turn, keeps the session, and the text opens the next turn; a plain interrupt parks the turn until the next steer; a gate with no turn refuses it by name; the ACP backend's `session/cancel` without ending the agent
@@ -111,12 +111,8 @@ crates/petri/cli/tests/standalone.rs          the binary runs a Fabro workflow w
 ## The Fabro compatibility contract
 
 `crates/fabro/acceptance/CONTRACT.md` freezes the Fabro reference revision
-(`crates/fabro/corpus-pin.txt`), the required workflow bundles
-(`crates/fabro/acceptance/bundles.lock.json`; their files are vendored under
-`crates/fabro/acceptance/bundles/` with their provenance and verified against
-the lock by `scripts/corpus-fetch-fabro-bundles.sh`), the feature matrix for every
-construct and `workflow.toml` option those bundles use, and the accepted
-differences. Petri production code never links or launches Fabro. The parity
+(`crates/fabro/corpus-pin.txt`), the feature matrix for every Fabro construct
+and `workflow.toml` option Petri supports, and the accepted differences. Petri production code never links or launches Fabro. The parity
 harness in `crates/fabro/oracle/harness/` builds the pinned `fabro` binary from
 the fetched corpus and drives it as a subprocess through its CLI and server
 API; `scripts/oracle-regenerate.sh` uses it to refresh the oracle fixtures, and
@@ -129,14 +125,14 @@ a difference only through a committed decision record.
 
 The complete-workflow scenarios are data, not code: one versioned JSON file
 per scenario under `crates/fabro/acceptance/scenarios/`
-(`SCHEMA.md` there is the format, `README.md` the layout), naming the pinned
-bundle and its digest, the fixture repository and its local remotes, the twin
+(`SCHEMA.md` there is the format, `README.md` the layout), naming the inline
+graph it runs, the fixture repository and its local remotes, the twin
 scripts, the interview entries, the controls and faults, and every expected
 observation, written before the run. `crates/fabro/acceptance/scenarios/matrix.json`
 lists every required (scenario, backend, agent) cell with its state, so a
 filtered or skipped case stays visible; `mise run test:fabro:blackbox` runs
 them and reports the coverage, and `mise run test:fabro:blackbox:strict`
-requires Docker, the vendored bundles, and no skipped cell.
+requires Docker and no skipped cell.
 `mise run check:fabro:readiness` is the final readiness gate: the same
 strict run, then a coverage report that fails unless every required cell
 passed, blocked cells included; the nightly workflow runs it on the runners
@@ -145,12 +141,10 @@ that have Docker.
 ## CI, evidence, and the readiness gate
 
 Required CI (`.github/workflows/ci.yml`, job `check` on Linux and macOS)
-fetches the GitHub Actions corpus and the Fabro corpus, verifies the vendored
-Fabro bundle set (`scripts/corpus-fetch-fabro-bundles.sh`: every tracked file
-against its locked digest, never skipped, no fetch), builds the sandbox
+fetches the GitHub Actions corpus and the Fabro corpus, builds the sandbox
 plugins, and runs
-`mise run check` with `PETRI_REQUIRE_CORPUS`, `PETRI_REQUIRE_FABRO_CORPUS`,
-`PETRI_REQUIRE_FABRO_BUNDLES` and, on Linux, `PETRI_REQUIRE_DOCKER` set, so a
+`mise run check` with `PETRI_REQUIRE_CORPUS`, `PETRI_REQUIRE_FABRO_CORPUS`
+and, on Linux, `PETRI_REQUIRE_DOCKER` set, so a
 missing asset, binary, scenario, or backend fails instead of skipping. Every
 required host scenario runs on both runners; the Docker subset runs on Linux,
 which also checks that no `petri-` container is left behind. The provider

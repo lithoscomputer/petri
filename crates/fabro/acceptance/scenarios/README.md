@@ -1,8 +1,8 @@
 # Black box scenarios
 
 The complete-workflow scenarios of the Fabro black box battery (black box
-plan phases 3 to 5). Each scenario runs a pinned bundle from
-`../bundles.lock.json` through the shipped `petri` binary with provider
+plan phases 3 to 5). Each scenario runs an inline graph from its own
+directory through the shipped `petri` binary with provider
 twins on loopback, real shell, file and Git tools, and a scripted
 interviewer, and asserts the final context, files, side effects, provider
 requests, interviews, and lifecycle it declared before the run.
@@ -20,7 +20,7 @@ scenarios/
   parallel-results/             task 3's regression (its own CONTRACT.md and Fabro capture)
 ```
 
-Families: `code-review`, `security-review`, `implement`, `interview`,
+Families: `implement`, `interview`,
 `provider-faults`, `routing`, `backend` (the backend-matrix cases), and
 `acp` (the ACP agent backend). The `acp` family runs inline graphs whose
 `acp.command` starts `acp/fixtures/scripted_acp_agent.py`, a standard-library
@@ -28,9 +28,7 @@ Python agent the fixture commits into the repository together with a JSON
 script that says what each prompt does (text chunks, a routing directive, a
 file written, an exit before answering, a permission request, a wait for
 `session/cancel`); the agent reads nothing from the environment, so the same
-fixture runs on the host and in a container. The
-`fix-ci` bundle is excluded by an owner decision of 2026-09-07; `../CONTRACT.md`
-records the reason and where its behavior is covered instead. The family's minimum scenarios
+fixture runs on the host and in a container. The family's minimum scenarios
 and critical outcomes are the phase 4 table of
 `.ai/plans/fabro-black-box-e2e.md`; `../CONTRACT.md` records which
 obligation each scenario satisfies and which remain blocked.
@@ -55,18 +53,13 @@ the full gate cannot starve them past their deadlines.
 `mise run test:fabro:blackbox` runs every planned cell of `matrix.json` and
 then the coverage report, allowing a skipped cell (a machine with no Docker).
 `mise run test:fabro:blackbox:strict` requires Docker
-(`PETRI_REQUIRE_DOCKER=1`) and the vendored bundles
-(`PETRI_REQUIRE_FABRO_BUNDLES=1`) and fails on any skipped cell; the nightly
+(`PETRI_REQUIRE_DOCKER=1`) and fails on any skipped cell; the nightly
 workflow runs it on the runners that have Docker (through
 `check:fabro:readiness`), so the repeated container work stays out of the
 routine subset. `mise run check:fabro:readiness` is the final readiness gate: the
 same strict run, then the coverage report with `--readiness`, which fails
 unless every required cell passed; a cell the matrix declares `blocked`
-fails it, where the routine `--strict` report only shows it. The bundles are
-tracked under `../bundles/<id>/` (provenance in
-`../bundles/PROVENANCE.md`); `mise run check:bundles` verifies them against
-`../bundles.lock.json`. A bundle missing from the checkout skips its
-scenarios in the routine task and fails them in the strict one.
+fails it, where the routine `--strict` report only shows it.
 
 Each cell is one Nextest test in `crates/petri/cli/tests/fabro_scenarios_blackbox.rs`.
 The test stages the fixture repository under a fresh directory, starts the

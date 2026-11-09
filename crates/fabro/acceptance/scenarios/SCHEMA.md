@@ -1,7 +1,7 @@
 # Black box scenario format, version 1
 
 A scenario is one JSON file, `<family>/<name>.scenario.json`, under this
-directory. It names a pinned bundle, the inputs and fixture state the run
+directory. It names the graph it runs, the inputs and fixture state the run
 starts from, the execution modes it runs in, the scripts every external
 service answers with, the interview answers, the controls and faults the
 harness applies, the time bounds, and the observations the run must produce.
@@ -19,9 +19,9 @@ of silently disabling an assertion. Task 18's differential adapter and task
 | --- | --- | --- |
 | `schema_version` | yes | `1` |
 | `id` | yes | `<family>/<name>`, equal to the file's path without `.scenario.json` |
-| `family` | yes | one of `code-review`, `security-review`, `implement`, `interview`, `provider-faults`, `routing`, `backend` (the backend-matrix cases: what a container scope must do that a host scope already does), `acp` (the ACP agent backend through a scripted agent the fixture commits) |
+| `family` | yes | one of `implement`, `interview`, `provider-faults`, `routing`, `backend` (the backend-matrix cases: what a container scope must do that a host scope already does), `acp` (the ACP agent backend through a scripted agent the fixture commits) |
 | `title` | yes | one sentence |
-| `obligation` | no | the `scenario_obligations` entry of `bundles.lock.json` this scenario satisfies |
+| `obligation` | no | the obligation in `../CONTRACT.md` this scenario satisfies |
 | `bundle` | yes | see "Bundle" |
 | `inputs` | no | `--input` values, `{"key": value}`; a string value may use placeholders |
 | `fixture` | no | see "Fixture" |
@@ -35,23 +35,13 @@ of silently disabling an assertion. Task 18's differential adapter and task
 ## Bundle
 
 ```json
-"bundle": { "id": "code-review", "hash": "c43a461a…" }
+"bundle": { "inline": "graphs/workflow.fabro" }
 ```
 
-`id` names an entry of `crates/fabro/acceptance/bundles.lock.json`; `hash` is
-that entry's `bundle_hash` and the loader refuses a scenario whose hash
-differs from the lock (the scenario was written against a different bundle).
-The bundle's files are copied into the fixture repository under their
-repository paths and committed in the first commit. `entry_point` defaults
-to the lock's entry point and may name another graph of the bundle.
-
-`"bundle": { "inline": "workflow.fabro" }` runs a graph file that lives in
-the scenario's directory instead of a pinned bundle, for a shape the pinned
-bundles cannot express (a loop, a fork, a parent that calls a bundle). With
-`"with_bundle": "<id>", "with_hash": "<hash>"` the pinned bundle's files
-are copied into the fixture too, so the inline graph can call one of its
-workflows (`stack.child_workflow="fabro/workflows/<name>/workflow.fabro"`).
-A scenario's title says which shape the bundle lacks.
+`inline` names a graph file in the scenario's directory. Every graph file
+(`.fabro` or `.dot`) and `workflow.toml` beside it is copied flat to the root
+of the fixture repository and committed in the first commit, so a parent's
+`stack.child_workflow` can name its child by file name.
 
 ## Fixture
 

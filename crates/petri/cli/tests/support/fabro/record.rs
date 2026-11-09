@@ -259,8 +259,8 @@ impl Recorder {
         self.directory.join("bundles").join(&self.record_id)
     }
 
-    /// The scenario family (`review`, `interview`, ...) and the bundle id
-    /// from `bundles.lock.json`, when the scenario runs a required bundle.
+    /// The scenario family (`interview`, `routing`, ...) and the bundle id,
+    /// when the scenario names one.
     pub(crate) fn scenario_meta(&mut self, family: &str, bundle: Option<&str>) {
         self.scenario.insert("family".into(), json!(family));
         self.scenario.insert("bundle".into(), json!(bundle));

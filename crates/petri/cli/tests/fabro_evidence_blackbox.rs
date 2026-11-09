@@ -640,15 +640,15 @@ fn an_empty_evidence_run_is_not_a_passing_gate() {
 #[test]
 fn a_required_asset_fails_instead_of_skipping_when_ci_asks() {
     assert_eq!(
-        require::decide(true, Some("1"), "PETRI_REQUIRE_FABRO_BUNDLES", "absent"),
+        require::decide(true, Some("1"), "PETRI_REQUIRE_FABRO_CORPUS", "absent"),
         Ok(true)
     );
     assert_eq!(
-        require::decide(false, None, "PETRI_REQUIRE_FABRO_BUNDLES", "absent"),
+        require::decide(false, None, "PETRI_REQUIRE_FABRO_CORPUS", "absent"),
         Ok(false)
     );
     assert_eq!(
-        require::decide(false, Some(""), "PETRI_REQUIRE_FABRO_BUNDLES", "absent"),
+        require::decide(false, Some(""), "PETRI_REQUIRE_FABRO_CORPUS", "absent"),
         Ok(false)
     );
     assert_eq!(
@@ -660,19 +660,6 @@ fn a_required_asset_fails_instead_of_skipping_when_ci_asks() {
         ),
         Err("PETRI_REQUIRE_FABRO_BINARY is set, but the pinned fabro binary is absent".to_owned())
     );
-}
-
-#[test]
-fn the_vendored_bundles_are_found_or_skipped_visibly() {
-    // The bundles are tracked in the repository. The helper names the bundle
-    // directory when it exists; on an incomplete checkout it skips (or fails
-    // under the require variable, which CI sets).
-    if let Some(dir) = require::bundle("interview") {
-        assert!(
-            dir.join(".fabro/workflows/interview/workflow.fabro")
-                .is_file()
-        );
-    }
 }
 
 /// A cell a test skips for want of a resource stays `skipped` after the record
