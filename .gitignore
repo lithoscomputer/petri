@@ -20,3 +20,4 @@ tmp
 /crates/fabro/corpus/fabro-target/
 /crates/fabro/acceptance/bundles/.sources/
 .env
+.amp/portals/*
