@@ -191,6 +191,7 @@ not into the cell. Add the cell to `scenarios/matrix.json` as
 Fixture state must reach both engines the same way: Fabro's `local`
 environment runs inside the staged bundle, and Petri's workspace starts
 empty, so a scenario that needs files in the workspace copies them there
-itself (`parallel-results` and `skills-precedence` do it in a `setup` node
-from the bundle path they receive as an input). Record the reference once with
+itself (`skills-precedence` does it in a `setup` node from the bundle path
+it receives as an input). `parallel-results` needs no files: its helper runs
+from the bundle path input and writes its state under `runtime/`. Record the reference once with
 the binary, review it, and commit it.

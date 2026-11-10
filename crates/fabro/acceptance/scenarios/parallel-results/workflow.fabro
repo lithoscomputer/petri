@@ -1,44 +1,13 @@
 digraph ParallelResults {
-    graph [goal="Fan two command finders out, join them, and merge through the pinned Conveyor code-review helper."]
+    graph [goal="Fan two command finders out, join them, and merge their branch results through a helper that reads context.parallel.results."]
     rankdir=LR
 
     start [shape=Mdiamond]
     exit  [shape=Msquare]
 
-    // The Conveyor helper runs from the repository root and keeps its state under
-    // .fabro/workflows/code-review/runtime. The workspace starts empty under
-    // Petri, so this node seeds it: copy the pinned helper, then give `git
-    // rev-parse HEAD` a commit to read. Signing is off so a developer's global
-    // signing key is never used.
-    setup [
-        shape=parallelogram,
-        script="mkdir -p .fabro/workflows/code-review/scripts .fabro/workflows/code-review/runtime && cp {{ inputs.helper }} .fabro/workflows/code-review/scripts/code_review.py && git init -q . && git -c commit.gpgsign=false -c user.name=petri-blackbox -c user.email=petri-blackbox@example.invalid commit -q --allow-empty -m seed && echo seeded"
-    ]
-
-    // The same hash check and prepare invocation as the Conveyor merge-node
-    // graph (conveyor/.fabro/workflows/code-review/workflow.fabro, node `prepare`).
-    prepare [
-        shape=parallelogram,
-        output_schema="routing",
-        script="python3 -c \"import hashlib,sys; pairs=list(zip(sys.argv[1::2],sys.argv[2::2])); sys.exit(0 if pairs and all(hashlib.sha256(open(path,'rb').read()).hexdigest()==expected for path,expected in pairs) else 91)\" .fabro/workflows/code-review/scripts/code_review.py 58ab01ff37f0bbb7c0f94f9d634b3e5c54f66f36ea43750d81616e80b8201d3f && python3 .fabro/workflows/code-review/scripts/code_review.py prepare --level {{ inputs.level }} --target {{ inputs.target }}"
-    ]
-
-    // A command stands in for the scope agent: it writes the agent's structured
-    // output under `output.scope`, where the real graph's merge_scope reads it.
-    scope [
-        shape=parallelogram,
-        output_schema="routing",
-        script="printf '%s' '{\"context_updates\":{\"output.scope\":{\"diffCommand\":\"git diff main...HEAD\",\"files\":[\"src/pager.py\",\"src/render.py\"],\"claudeMdFiles\":[],\"summary\":\"two files\",\"conventions\":\"\"}}}'"
-    ]
-    merge_scope [
-        shape=parallelogram,
-        stdin_source="context.output.scope",
-        script="python3 .fabro/workflows/code-review/scripts/code_review.py merge scope",
-        output_schema="routing"
-    ]
-
-    // Two finders, each a command in place of the review agent. Each writes a
-    // distinct candidate under the same context key `output.finder`.
+    // Two finders. Each writes a distinct candidate under the same context
+    // key `output.finder`, so the merge only sees both through the branch
+    // envelopes.
     find [shape=component, label="Finders"]
     finder_a [
         shape=parallelogram,
@@ -54,13 +23,13 @@ digraph ParallelResults {
     merge_find [
         shape=parallelogram,
         stdin_source="context.parallel.results",
-        script="python3 .fabro/workflows/code-review/scripts/code_review.py merge find",
+        script="python3 {{ inputs.helper }} merge find",
         output_schema="routing"
     ]
     verify_gate [shape=diamond, label="Any candidates to verify?"]
 
-    // Two verifiers, one per pooled location, in the order merge_find grouped them.
-    verify [shape=component, label="Verify locations"]
+    // Two verifiers, one per candidate, in the order merge_find pooled them.
+    verify [shape=component, label="Verify candidates"]
     verifier_a [
         shape=parallelogram,
         output_schema="routing",
@@ -75,39 +44,29 @@ digraph ParallelResults {
     merge_verify [
         shape=parallelogram,
         stdin_source="context.parallel.results",
-        script="python3 .fabro/workflows/code-review/scripts/code_review.py merge verify",
+        script="python3 {{ inputs.helper }} merge verify",
         output_schema="routing"
     ]
 
-    tally [
-        shape=parallelogram,
-        script="python3 .fabro/workflows/code-review/scripts/code_review.py tally",
-        output_schema="routing"
-    ]
-    finalize [
-        shape=parallelogram,
-        script="python3 .fabro/workflows/code-review/scripts/code_review.py finalize",
-        output_schema="routing"
-    ]
     // The workspace does not outlive the run, so the report is read back into
     // the command output where the harness can see it.
     report [
         shape=parallelogram,
-        script="cat .fabro/workflows/code-review/runtime/report.md"
+        script="python3 {{ inputs.helper }} report"
     ]
 
-    start -> setup -> prepare -> scope -> merge_scope -> find
+    start -> find
     find -> finder_a
     find -> finder_b
     finder_a -> find_join
     finder_b -> find_join
     find_join -> merge_find -> verify_gate
     verify_gate -> verify [condition="context.run_verify=true"]
-    verify_gate -> tally
+    verify_gate -> report
     verify -> verifier_a
     verify -> verifier_b
     verifier_a -> verify_join
     verifier_b -> verify_join
-    verify_join -> merge_verify -> tally
-    tally -> finalize -> report -> exit
+    verify_join -> merge_verify -> report
+    report -> exit
 }

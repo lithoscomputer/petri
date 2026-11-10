@@ -14,8 +14,7 @@ Sources, in order of authority:
    are relative to the Fabro repository root. Line numbers are from that
    revision.
 2. The Fabro capture in `fabro-reference/` (see `PROVENANCE.md`).
-3. The consumer: `helper/code_review.py`, function `parallel_values`
-   (lines 475 to 499).
+3. The consumer: `helper/merge_branches.py`, function `branch_values`.
 
 Where Petri's engine spec and this contract meet, Petri keeps its core
 invariants. Branch results ride the fan-in's output and tokens. They do not
@@ -35,9 +34,10 @@ Branch order is dispatch order, never completion order:
   edge or item order regardless of which branch finishes first (lines 632 to
   634, comment "Awaiting in dispatch order keeps `results` aligned").
 
-Evidence: in `fabro-reference/raw/events.jsonl`, `finder_b` started before
-`finder_a` (`parallel.branch.started` events), yet `parallel.completed` lists
-`finder_a` (index 0) before `finder_b` (index 1).
+Evidence: in `fabro-reference/raw/events.jsonl`, `verifier_b` started before
+`verifier_a` (`parallel.branch.started` events, index 1 then index 0), yet
+`parallel.completed` lists `verifier_a` (index 0) before `verifier_b`
+(index 1).
 
 ## 2. One branch envelope
 
@@ -140,7 +140,7 @@ Consequences the consumer relies on:
 
 The parent does not apply branch updates to its own context. After the
 fan-out in the capture, the exit-time context has no `output.finder` and no
-`output.verifier` key (`normalized.json`, `final_context`).
+`output.verifier` key (`reference.json`, `projection.context`).
 
 Value offloading: Fabro replaces large leaves with `blob://sha256/...`
 references in event payloads (`parallel.rs` lines 721 to 733). In the capture
@@ -184,11 +184,12 @@ succeeds with the note `Joined N parallel branches` (`fan_in.rs`, lines 103 to
 above, and `stdin_source="context.parallel.results"` on a later command reads
 that output.
 
-## 9. Where Petri stands today
+## 9. The regression this contract closed
 
-Petri `9cea20d` emits, per branch, `{ "id", "status", "output" }` with Petri's
-own status tag and the raw step output. Missing: `index`, `context_updates`,
-the Fabro status vocabulary, and `parallel.branch_count`. The pinned helper
-therefore skips every branch (`parallel_values` requires `context_updates` to
-be an object) and the review report ends with zero findings. The test
-`fabro_blackbox.rs` records both the current shape and this contract.
+When this contract was captured, Petri `9cea20d` emitted, per branch,
+`{ "id", "status", "output" }` with Petri's own status tag and the raw step
+output. It had no `index`, no `context_updates`, no Fabro status vocabulary,
+and no `parallel.branch_count`, so a consumer of the branch results found no
+findings. `helper/merge_branches.py` now fails on any envelope that breaks
+sections 1 and 2, and the `contract_*` tests in `fabro_blackbox.rs` compare
+Petri's envelopes with the Fabro capture.

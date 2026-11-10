@@ -1,27 +1,21 @@
     Run: <RUN_ID>
-    Sandbox: local (ready in 193ms)
+    Sandbox: local (ready in 115ms)
     ✓ start  0ms
-    ✓ setup  119ms
-    ✓ prepare  215ms
-    ✓ scope  59ms
-    ✓ merge_scope  146ms
-        ✓ finder_b  57ms
-        ✓ finder_a  60ms
-    ✓ Finders  61ms
-    ✓ Gather finder candidates  3ms
-    ✓ merge_find  129ms
-    ✓ Any candidates to verify?  8ms
-        ✓ verifier_a  45ms
-        ✓ verifier_b  46ms
-    ✓ Verify locations  48ms
-    ✓ Gather verdicts  2ms
-    ✓ merge_verify  156ms
-    ✓ tally  168ms
-    ✓ finalize  134ms
-    ✓ report  68ms
+        ✓ finder_a  40ms
+        ✓ finder_b  40ms
+    ✓ Finders  41ms
+    ✓ Gather finder candidates  0ms
+    ✓ merge_find  62ms
+    ✓ Any candidates to verify?  0ms
+        ✓ verifier_a  35ms
+        ✓ verifier_b  36ms
+    ✓ Verify candidates  37ms
+    ✓ Gather verdicts  0ms
+    ✓ merge_verify  56ms
+    ✓ report  55ms
     ✓ exit  0ms
 
 === Run Result ===
 Run:       <RUN_ID>
 Status:    SUCCEEDED
-Duration:  2 seconds
+Duration:  0 seconds
