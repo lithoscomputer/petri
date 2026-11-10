@@ -6,7 +6,7 @@
 //!
 //! The parallel regression from the readiness assessment lives in this file
 //! too: two command branches write distinct findings under the same context
-//! key, a fan-in joins them, and the pinned Conveyor `code_review.py` merges
+//! key, a fan-in joins them, and the scenario's `merge_branches.py` merges
 //! them. The `contract_*` tests state the contract in
 //! `crates/fabro/acceptance/scenarios/parallel-results/CONTRACT.md` and
 //! compare the envelopes with the capture from the pinned Fabro; the
@@ -1461,8 +1461,8 @@ const SCENARIO: &str = "parallel-results";
 const FINDERS: [&str; 2] = ["finder_a", "finder_b"];
 const CONTRACT: &str = "parallel result contract:";
 
-/// The report the pinned helper writes when both findings survive, as Fabro
-/// produced it (`fabro-reference/raw/report.md`).
+/// The report the scenario helper writes when both findings survive, as
+/// Fabro produced it (`fabro-reference/raw/report.md`).
 fn expected_report() -> String {
     fs::read_to_string(Scenario::source_file(
         SCENARIO,
@@ -1472,22 +1472,18 @@ fn expected_report() -> String {
 }
 
 /// The branch envelopes Fabro produced for the finder fan-out, from the
-/// normalized capture, without `command.output` (Petri's command output ends
-/// with a newline; the value is compared on its own).
+/// `parallel_results.json` its dump wrote, without `command.output` (Petri's
+/// command output ends with a newline; the value is compared on its own).
 fn fabro_finder_envelopes() -> Vec<BranchEnvelope> {
     let text = fs::read_to_string(Scenario::source_file(
         SCENARIO,
-        "fabro-reference/normalized.json",
+        "fabro-reference/raw/find-parallel_results.json",
     ))
-    .expect("the normalized Fabro capture is tracked");
-    let capture: Value = serde_json::from_str(&text).expect("normalized.json is JSON");
-    let group = capture["parallel_groups"]
+    .expect("the Fabro finder results are tracked");
+    let results: Value = serde_json::from_str(&text).expect("the dumped results are JSON");
+    results
         .as_array()
-        .and_then(|groups| groups.iter().find(|g| g["node"] == "find"))
-        .expect("the capture has the `find` group");
-    group["results_from_dump"]
-        .as_array()
-        .expect("the group has dumped results")
+        .expect("the dump holds a list of envelopes")
         .iter()
         .map(|value| {
             let mut value = value.clone();
@@ -1501,11 +1497,9 @@ fn fabro_finder_envelopes() -> Vec<BranchEnvelope> {
 
 fn run_scenario(label: &str) -> (Scenario, RunOutput) {
     let scenario = Scenario::stage(SCENARIO);
-    let helper = scenario.file("helper/code_review.py");
+    let helper = scenario.file("helper/merge_branches.py");
     let output = Petri::run_workflow(&scenario.file("workflow.fabro"), &scenario.run_dir(label))
         .input("helper", helper.to_string_lossy())
-        .input("level", "high")
-        .input("target", "review-fixture")
         .run();
     assert!(
         output.success(),

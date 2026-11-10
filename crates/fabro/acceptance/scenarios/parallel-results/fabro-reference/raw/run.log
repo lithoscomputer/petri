@@ -1,87 +1,57 @@
-2026-09-13T15:14:13.254684Z  INFO run{id=<RUN_ID>}:create{provider_kind=host}: fabro_workflow::event::events: Sandbox driver operation started event=sandbox.create.started
-2026-09-13T15:14:13.285980Z  INFO run{id=<RUN_ID>}:create{provider_kind=host}: fabro_workflow::event::events: Sandbox driver operation completed event=sandbox.create.completed duration_ms=31
-2026-09-13T15:14:13.446419Z  INFO run{id=<RUN_ID>}: fabro_workflow::event::events: Sandbox ready provider="local" duration_ms=193
-2026-09-13T15:14:13.446580Z  INFO run{id=<RUN_ID>}: fabro_workflow::event::events: Sandbox initialized working_directory="<WORKDIR>" provider=local id="host-g18d4ea32306b7e68-89020-1"
-2026-09-13T15:14:13.446630Z  INFO run{id=<RUN_ID>}: fabro_workflow::event::events: Git identity resolved name=Fabro email=noreply@fabro.sh source=default
-2026-09-13T15:14:13.453839Z  INFO run{id=<RUN_ID>}: fabro_workflow::event::events: Workflow run started workflow="ParallelResults" run_id=<RUN_ID>
-2026-09-13T15:14:13.453896Z  INFO run{id=<RUN_ID>}: fabro_workflow::event::events: Run running
-2026-09-13T15:14:13.453964Z  INFO run{id=<RUN_ID>}: fabro_workflow::lifecycle::fidelity: Fidelity resolved node=start fidelity=compact source="default"
-2026-09-13T15:14:13.454057Z  INFO run{id=<RUN_ID>}: fabro_workflow::event::events: Stage started node_id="start" stage="start" index=0 handler_type="start" attempt=1 max_attempts=1
-2026-09-13T15:14:13.454191Z  INFO run{id=<RUN_ID>}: fabro_workflow::event::events: Stage completed node_id="start" stage="start" index=0 wall_time_ms=0 active_time_ms=0 inference_time_ms=0 tool_time_ms=0 status="succeeded" attempt=1 max_attempts=1
-2026-09-13T15:14:13.454272Z  INFO run{id=<RUN_ID>}: fabro_workflow::event::events: Edge selected from_node="start" to_node="setup" label="" reason="unconditional"
-2026-09-13T15:14:13.454366Z  INFO run{id=<RUN_ID>}: fabro_workflow::event::events: Checkpoint completed node_id="start" status="succeeded" completed_count=1
-2026-09-13T15:14:13.454429Z  INFO run{id=<RUN_ID>}: fabro_workflow::lifecycle::fidelity: Fidelity resolved node=setup fidelity=compact source="default"
-2026-09-13T15:14:13.454473Z  INFO run{id=<RUN_ID>}: fabro_workflow::event::events: Stage started node_id="setup" stage="setup" index=1 handler_type="command" attempt=1 max_attempts=1
-2026-09-13T15:14:13.574257Z  INFO run{id=<RUN_ID>}: fabro_workflow::event::events: Stage completed node_id="setup" stage="setup" index=1 wall_time_ms=119 active_time_ms=116 inference_time_ms=0 tool_time_ms=116 status="succeeded" attempt=1 max_attempts=1
-2026-09-13T15:14:13.575680Z  INFO run{id=<RUN_ID>}: fabro_workflow::event::events: Edge selected from_node="setup" to_node="prepare" label="" reason="unconditional"
-2026-09-13T15:14:13.575773Z  INFO run{id=<RUN_ID>}: fabro_workflow::event::events: Checkpoint completed node_id="setup" status="succeeded" completed_count=2
-2026-09-13T15:14:13.575845Z  INFO run{id=<RUN_ID>}: fabro_workflow::lifecycle::fidelity: Fidelity resolved node=prepare fidelity=compact source="default"
-2026-09-13T15:14:13.577337Z  INFO run{id=<RUN_ID>}: fabro_workflow::event::events: Stage started node_id="prepare" stage="prepare" index=2 handler_type="command" attempt=1 max_attempts=1
-2026-09-13T15:14:13.792848Z  INFO run{id=<RUN_ID>}: fabro_workflow::event::events: Stage completed node_id="prepare" stage="prepare" index=2 wall_time_ms=215 active_time_ms=207 inference_time_ms=0 tool_time_ms=207 status="succeeded" attempt=1 max_attempts=1
-2026-09-13T15:14:13.794006Z  INFO run{id=<RUN_ID>}: fabro_workflow::event::events: Edge selected from_node="prepare" to_node="scope" label="" reason="unconditional"
-2026-09-13T15:14:13.794138Z  INFO run{id=<RUN_ID>}: fabro_workflow::event::events: Checkpoint completed node_id="prepare" status="succeeded" completed_count=3
-2026-09-13T15:14:13.794208Z  INFO run{id=<RUN_ID>}: fabro_workflow::lifecycle::fidelity: Fidelity resolved node=scope fidelity=compact source="default"
-2026-09-13T15:14:13.796530Z  INFO run{id=<RUN_ID>}: fabro_workflow::event::events: Stage started node_id="scope" stage="scope" index=3 handler_type="command" attempt=1 max_attempts=1
-2026-09-13T15:14:13.855667Z  INFO run{id=<RUN_ID>}: fabro_workflow::event::events: Stage completed node_id="scope" stage="scope" index=3 wall_time_ms=59 active_time_ms=42 inference_time_ms=0 tool_time_ms=42 status="succeeded" attempt=1 max_attempts=1
-2026-09-13T15:14:13.856463Z  INFO run{id=<RUN_ID>}: fabro_workflow::event::events: Edge selected from_node="scope" to_node="merge_scope" label="" reason="unconditional"
-2026-09-13T15:14:13.856566Z  INFO run{id=<RUN_ID>}: fabro_workflow::event::events: Checkpoint completed node_id="scope" status="succeeded" completed_count=4
-2026-09-13T15:14:13.856637Z  INFO run{id=<RUN_ID>}: fabro_workflow::lifecycle::fidelity: Fidelity resolved node=merge_scope fidelity=compact source="default"
-2026-09-13T15:14:13.860230Z  INFO run{id=<RUN_ID>}: fabro_workflow::event::events: Stage started node_id="merge_scope" stage="merge_scope" index=4 handler_type="command" attempt=1 max_attempts=1
-2026-09-13T15:14:14.006770Z  INFO run{id=<RUN_ID>}: fabro_workflow::event::events: Stage completed node_id="merge_scope" stage="merge_scope" index=4 wall_time_ms=146 active_time_ms=143 inference_time_ms=0 tool_time_ms=143 status="succeeded" attempt=1 max_attempts=1
-2026-09-13T15:14:14.007772Z  INFO run{id=<RUN_ID>}: fabro_workflow::event::events: Edge selected from_node="merge_scope" to_node="find" label="" reason="unconditional"
-2026-09-13T15:14:14.007921Z  INFO run{id=<RUN_ID>}: fabro_workflow::event::events: Checkpoint completed node_id="merge_scope" status="succeeded" completed_count=5
-2026-09-13T15:14:14.008169Z  INFO run{id=<RUN_ID>}: fabro_workflow::lifecycle::fidelity: Fidelity resolved node=find fidelity=compact source="default"
-2026-09-13T15:14:14.012804Z  INFO run{id=<RUN_ID>}: fabro_workflow::event::events: Stage started node_id="find" stage="Finders" index=5 handler_type="parallel" attempt=1 max_attempts=1
-2026-09-13T15:14:14.074856Z  INFO run{id=<RUN_ID>}: fabro_workflow::event::events: Stage completed node_id="find" stage="Finders" index=5 wall_time_ms=61 active_time_ms=0 inference_time_ms=0 tool_time_ms=0 status="succeeded" attempt=1 max_attempts=1
-2026-09-13T15:14:14.074973Z  INFO run{id=<RUN_ID>}: fabro_workflow::event::events: Edge selected from_node="find" to_node="find_join" label="" reason="jump"
-2026-09-13T15:14:14.075152Z  INFO run{id=<RUN_ID>}: fabro_workflow::event::events: Checkpoint completed node_id="find" status="succeeded" completed_count=6
-2026-09-13T15:14:14.075282Z  INFO run{id=<RUN_ID>}: fabro_workflow::lifecycle::fidelity: Fidelity resolved node=find_join fidelity=compact source="default"
-2026-09-13T15:14:14.086727Z  INFO run{id=<RUN_ID>}: fabro_workflow::event::events: Stage started node_id="find_join" stage="Gather finder candidates" index=6 handler_type="parallel.fan_in" attempt=1 max_attempts=1
-2026-09-13T15:14:14.089832Z  INFO run{id=<RUN_ID>}: fabro_workflow::event::events: Stage completed node_id="find_join" stage="Gather finder candidates" index=6 wall_time_ms=3 active_time_ms=0 inference_time_ms=0 tool_time_ms=0 status="succeeded" attempt=1 max_attempts=1
-2026-09-13T15:14:14.091053Z  INFO run{id=<RUN_ID>}: fabro_workflow::event::events: Edge selected from_node="find_join" to_node="merge_find" label="" reason="unconditional"
-2026-09-13T15:14:14.091173Z  INFO run{id=<RUN_ID>}: fabro_workflow::event::events: Checkpoint completed node_id="find_join" status="succeeded" completed_count=7
-2026-09-13T15:14:14.091263Z  INFO run{id=<RUN_ID>}: fabro_workflow::lifecycle::fidelity: Fidelity resolved node=merge_find fidelity=compact source="default"
-2026-09-13T15:14:14.098579Z  INFO run{id=<RUN_ID>}: fabro_workflow::event::events: Stage started node_id="merge_find" stage="merge_find" index=7 handler_type="command" attempt=1 max_attempts=1
-2026-09-13T15:14:14.228640Z  INFO run{id=<RUN_ID>}: fabro_workflow::event::events: Stage completed node_id="merge_find" stage="merge_find" index=7 wall_time_ms=129 active_time_ms=125 inference_time_ms=0 tool_time_ms=125 status="succeeded" attempt=1 max_attempts=1
-2026-09-13T15:14:14.229700Z  INFO run{id=<RUN_ID>}: fabro_workflow::event::events: Edge selected from_node="merge_find" to_node="verify_gate" label="" reason="unconditional"
-2026-09-13T15:14:14.229815Z  INFO run{id=<RUN_ID>}: fabro_workflow::event::events: Checkpoint completed node_id="merge_find" status="succeeded" completed_count=8
-2026-09-13T15:14:14.229923Z  INFO run{id=<RUN_ID>}: fabro_workflow::lifecycle::fidelity: Fidelity resolved node=verify_gate fidelity=compact source="default"
-2026-09-13T15:14:14.256880Z  INFO run{id=<RUN_ID>}: fabro_workflow::event::events: Stage started node_id="verify_gate" stage="Any candidates to verify?" index=8 handler_type="conditional" attempt=1 max_attempts=1
-2026-09-13T15:14:14.265189Z  INFO run{id=<RUN_ID>}: fabro_workflow::event::events: Stage completed node_id="verify_gate" stage="Any candidates to verify?" index=8 wall_time_ms=8 active_time_ms=0 inference_time_ms=0 tool_time_ms=0 status="succeeded" attempt=1 max_attempts=1
-2026-09-13T15:14:14.269589Z  INFO run{id=<RUN_ID>}: fabro_workflow::event::events: Edge selected from_node="verify_gate" to_node="verify" label="" reason="condition"
-2026-09-13T15:14:14.269742Z  INFO run{id=<RUN_ID>}: fabro_workflow::event::events: Checkpoint completed node_id="verify_gate" status="succeeded" completed_count=9
-2026-09-13T15:14:14.269872Z  INFO run{id=<RUN_ID>}: fabro_workflow::lifecycle::fidelity: Fidelity resolved node=verify fidelity=compact source="default"
-2026-09-13T15:14:14.300873Z  INFO run{id=<RUN_ID>}: fabro_workflow::event::events: Stage started node_id="verify" stage="Verify locations" index=9 handler_type="parallel" attempt=1 max_attempts=1
-2026-09-13T15:14:14.349866Z  INFO run{id=<RUN_ID>}: fabro_workflow::event::events: Stage completed node_id="verify" stage="Verify locations" index=9 wall_time_ms=48 active_time_ms=0 inference_time_ms=0 tool_time_ms=0 status="succeeded" attempt=1 max_attempts=1
-2026-09-13T15:14:14.349966Z  INFO run{id=<RUN_ID>}: fabro_workflow::event::events: Edge selected from_node="verify" to_node="verify_join" label="" reason="jump"
-2026-09-13T15:14:14.350057Z  INFO run{id=<RUN_ID>}: fabro_workflow::event::events: Checkpoint completed node_id="verify" status="succeeded" completed_count=10
-2026-09-13T15:14:14.350170Z  INFO run{id=<RUN_ID>}: fabro_workflow::lifecycle::fidelity: Fidelity resolved node=verify_join fidelity=compact source="default"
-2026-09-13T15:14:14.359191Z  INFO run{id=<RUN_ID>}: fabro_workflow::event::events: Stage started node_id="verify_join" stage="Gather verdicts" index=10 handler_type="parallel.fan_in" attempt=1 max_attempts=1
-2026-09-13T15:14:14.361930Z  INFO run{id=<RUN_ID>}: fabro_workflow::event::events: Stage completed node_id="verify_join" stage="Gather verdicts" index=10 wall_time_ms=2 active_time_ms=0 inference_time_ms=0 tool_time_ms=0 status="succeeded" attempt=1 max_attempts=1
-2026-09-13T15:14:14.362723Z  INFO run{id=<RUN_ID>}: fabro_workflow::event::events: Edge selected from_node="verify_join" to_node="merge_verify" label="" reason="unconditional"
-2026-09-13T15:14:14.362916Z  INFO run{id=<RUN_ID>}: fabro_workflow::event::events: Checkpoint completed node_id="verify_join" status="succeeded" completed_count=11
-2026-09-13T15:14:14.363064Z  INFO run{id=<RUN_ID>}: fabro_workflow::lifecycle::fidelity: Fidelity resolved node=merge_verify fidelity=compact source="default"
-2026-09-13T15:14:14.371368Z  INFO run{id=<RUN_ID>}: fabro_workflow::event::events: Stage started node_id="merge_verify" stage="merge_verify" index=11 handler_type="command" attempt=1 max_attempts=1
-2026-09-13T15:14:14.528130Z  INFO run{id=<RUN_ID>}: fabro_workflow::event::events: Stage completed node_id="merge_verify" stage="merge_verify" index=11 wall_time_ms=156 active_time_ms=152 inference_time_ms=0 tool_time_ms=152 status="succeeded" attempt=1 max_attempts=1
-2026-09-13T15:14:14.529396Z  INFO run{id=<RUN_ID>}: fabro_workflow::event::events: Edge selected from_node="merge_verify" to_node="tally" label="" reason="unconditional"
-2026-09-13T15:14:14.529560Z  INFO run{id=<RUN_ID>}: fabro_workflow::event::events: Checkpoint completed node_id="merge_verify" status="succeeded" completed_count=12
-2026-09-13T15:14:14.529708Z  INFO run{id=<RUN_ID>}: fabro_workflow::lifecycle::fidelity: Fidelity resolved node=tally fidelity=compact source="default"
-2026-09-13T15:14:14.551400Z  INFO run{id=<RUN_ID>}: fabro_workflow::event::events: Stage started node_id="tally" stage="tally" index=12 handler_type="command" attempt=1 max_attempts=1
-2026-09-13T15:14:14.719632Z  INFO run{id=<RUN_ID>}: fabro_workflow::event::events: Stage completed node_id="tally" stage="tally" index=12 wall_time_ms=168 active_time_ms=162 inference_time_ms=0 tool_time_ms=162 status="succeeded" attempt=1 max_attempts=1
-2026-09-13T15:14:14.731237Z  INFO run{id=<RUN_ID>}: fabro_workflow::event::events: Edge selected from_node="tally" to_node="finalize" label="" reason="unconditional"
-2026-09-13T15:14:14.731423Z  INFO run{id=<RUN_ID>}: fabro_workflow::event::events: Checkpoint completed node_id="tally" status="succeeded" completed_count=13
-2026-09-13T15:14:14.731666Z  INFO run{id=<RUN_ID>}: fabro_workflow::lifecycle::fidelity: Fidelity resolved node=finalize fidelity=compact source="default"
-2026-09-13T15:14:14.744240Z  INFO run{id=<RUN_ID>}: fabro_workflow::event::events: Stage started node_id="finalize" stage="finalize" index=13 handler_type="command" attempt=1 max_attempts=1
-2026-09-13T15:14:14.879006Z  INFO run{id=<RUN_ID>}: fabro_workflow::event::events: Stage completed node_id="finalize" stage="finalize" index=13 wall_time_ms=134 active_time_ms=128 inference_time_ms=0 tool_time_ms=128 status="succeeded" attempt=1 max_attempts=1
-2026-09-13T15:14:14.884432Z  INFO run{id=<RUN_ID>}: fabro_workflow::event::events: Edge selected from_node="finalize" to_node="report" label="" reason="unconditional"
-2026-09-13T15:14:14.884653Z  INFO run{id=<RUN_ID>}: fabro_workflow::event::events: Checkpoint completed node_id="finalize" status="succeeded" completed_count=14
-2026-09-13T15:14:14.884831Z  INFO run{id=<RUN_ID>}: fabro_workflow::lifecycle::fidelity: Fidelity resolved node=report fidelity=compact source="default"
-2026-09-13T15:14:14.927634Z  INFO run{id=<RUN_ID>}: fabro_workflow::event::events: Stage started node_id="report" stage="report" index=14 handler_type="command" attempt=1 max_attempts=1
-2026-09-13T15:14:14.995841Z  INFO run{id=<RUN_ID>}: fabro_workflow::event::events: Stage completed node_id="report" stage="report" index=14 wall_time_ms=68 active_time_ms=56 inference_time_ms=0 tool_time_ms=56 status="succeeded" attempt=1 max_attempts=1
-2026-09-13T15:14:14.998801Z  INFO run{id=<RUN_ID>}: fabro_workflow::event::events: Edge selected from_node="report" to_node="exit" label="" reason="unconditional"
-2026-09-13T15:14:14.998983Z  INFO run{id=<RUN_ID>}: fabro_workflow::event::events: Checkpoint completed node_id="report" status="succeeded" completed_count=15
-2026-09-13T15:14:14.999122Z  INFO run{id=<RUN_ID>}: fabro_workflow::event::events: Stage started node_id="exit" stage="exit" index=15 handler_type="exit" attempt=1 max_attempts=1
-2026-09-13T15:14:14.999146Z  INFO run{id=<RUN_ID>}: fabro_workflow::event::events: Stage completed node_id="exit" stage="exit" index=15 wall_time_ms=0 active_time_ms=0 inference_time_ms=0 tool_time_ms=0 status="succeeded" attempt=1 max_attempts=1
-2026-09-13T15:14:15.131270Z  INFO run{id=<RUN_ID>}: fabro_workflow::event::events: Workflow run completed wall_time_ms=1545 active_time_ms=1131 inference_time_ms=0 tool_time_ms=1131 artifact_count=0 status="succeeded"
-2026-09-13T15:14:15.131370Z  INFO run{id=<RUN_ID>}:stop{provider_kind="host" sandbox_id=host-g18d4ea32306b7e68-89020-1}: fabro_workflow::event::events: Sandbox driver operation started event=sandbox.stop.started
-2026-09-13T15:14:15.238262Z  INFO run{id=<RUN_ID>}:stop{provider_kind="host" sandbox_id=host-g18d4ea32306b7e68-89020-1}: fabro_workflow::event::events: Sandbox driver operation completed event=sandbox.stop.completed duration_ms=106
+2026-11-10T14:45:06.772565Z  INFO run{id=<RUN_ID>}:create{provider_kind=host}: fabro_workflow::event::events: Sandbox driver operation started event=sandbox.create.started
+2026-11-10T14:45:06.782719Z  INFO run{id=<RUN_ID>}:create{provider_kind=host}: fabro_workflow::event::events: Sandbox driver operation completed event=sandbox.create.completed duration_ms=10
+2026-11-10T14:45:06.887747Z  INFO run{id=<RUN_ID>}: fabro_workflow::event::events: Sandbox ready provider="local" duration_ms=115
+2026-11-10T14:45:06.887943Z  INFO run{id=<RUN_ID>}: fabro_workflow::event::events: Sandbox initialized working_directory="<WORKDIR>" provider=local id="host-dir-2f707269766174652f746d702f636c617564652d3530312f2d55736572732d6268656c6d6b616d702d702d6c6974686f73636f6d70757465722f34336331633734322d373335622d343561392d613631622d3933643633336338356637382f736372617463687061642f70722d636170747572652f776f726b"
+2026-11-10T14:45:06.888118Z  INFO run{id=<RUN_ID>}: fabro_workflow::event::events: Git identity resolved name=Fabro email=noreply@fabro.sh source=default
+2026-11-10T14:45:06.890621Z  INFO run{id=<RUN_ID>}: fabro_workflow::event::events: Workflow run started workflow="ParallelResults" run_id=<RUN_ID>
+2026-11-10T14:45:06.890661Z  INFO run{id=<RUN_ID>}: fabro_workflow::event::events: Run running
+2026-11-10T14:45:06.890708Z  INFO run{id=<RUN_ID>}: fabro_workflow::lifecycle::fidelity: Fidelity resolved node=start fidelity=compact source="default"
+2026-11-10T14:45:06.891136Z  INFO run{id=<RUN_ID>}: fabro_workflow::event::events: Stage started node_id="start" stage="start" index=0 handler_type="start" attempt=1 max_attempts=1
+2026-11-10T14:45:06.891624Z  INFO run{id=<RUN_ID>}: fabro_workflow::event::events: Stage completed node_id="start" stage="start" index=0 wall_time_ms=0 active_time_ms=0 inference_time_ms=0 tool_time_ms=0 status="succeeded" attempt=1 max_attempts=1
+2026-11-10T14:45:06.891693Z  INFO run{id=<RUN_ID>}: fabro_workflow::event::events: Edge selected from_node="start" to_node="find" label="" reason="unconditional"
+2026-11-10T14:45:06.891771Z  INFO run{id=<RUN_ID>}: fabro_workflow::event::events: Checkpoint completed node_id="start" status="succeeded" completed_count=1
+2026-11-10T14:45:06.891810Z  INFO run{id=<RUN_ID>}: fabro_workflow::lifecycle::fidelity: Fidelity resolved node=find fidelity=compact source="default"
+2026-11-10T14:45:06.891848Z  INFO run{id=<RUN_ID>}: fabro_workflow::event::events: Stage started node_id="find" stage="Finders" index=1 handler_type="parallel" attempt=1 max_attempts=1
+2026-11-10T14:45:06.933069Z  INFO run{id=<RUN_ID>}: fabro_workflow::event::events: Stage completed node_id="find" stage="Finders" index=1 wall_time_ms=41 active_time_ms=0 inference_time_ms=0 tool_time_ms=0 status="succeeded" attempt=1 max_attempts=1
+2026-11-10T14:45:06.933116Z  INFO run{id=<RUN_ID>}: fabro_workflow::event::events: Edge selected from_node="find" to_node="find_join" label="" reason="jump"
+2026-11-10T14:45:06.933159Z  INFO run{id=<RUN_ID>}: fabro_workflow::event::events: Checkpoint completed node_id="find" status="succeeded" completed_count=2
+2026-11-10T14:45:06.933203Z  INFO run{id=<RUN_ID>}: fabro_workflow::lifecycle::fidelity: Fidelity resolved node=find_join fidelity=compact source="default"
+2026-11-10T14:45:06.934283Z  INFO run{id=<RUN_ID>}: fabro_workflow::event::events: Stage started node_id="find_join" stage="Gather finder candidates" index=2 handler_type="parallel.fan_in" attempt=1 max_attempts=1
+2026-11-10T14:45:06.934806Z  INFO run{id=<RUN_ID>}: fabro_workflow::event::events: Stage completed node_id="find_join" stage="Gather finder candidates" index=2 wall_time_ms=0 active_time_ms=0 inference_time_ms=0 tool_time_ms=0 status="succeeded" attempt=1 max_attempts=1
+2026-11-10T14:45:06.934866Z  INFO run{id=<RUN_ID>}: fabro_workflow::event::events: Edge selected from_node="find_join" to_node="merge_find" label="" reason="unconditional"
+2026-11-10T14:45:06.934906Z  INFO run{id=<RUN_ID>}: fabro_workflow::event::events: Checkpoint completed node_id="find_join" status="succeeded" completed_count=3
+2026-11-10T14:45:06.934944Z  INFO run{id=<RUN_ID>}: fabro_workflow::lifecycle::fidelity: Fidelity resolved node=merge_find fidelity=compact source="default"
+2026-11-10T14:45:06.935857Z  INFO run{id=<RUN_ID>}: fabro_workflow::event::events: Stage started node_id="merge_find" stage="merge_find" index=3 handler_type="command" attempt=1 max_attempts=1
+2026-11-10T14:45:06.998175Z  INFO run{id=<RUN_ID>}: fabro_workflow::event::events: Stage completed node_id="merge_find" stage="merge_find" index=3 wall_time_ms=62 active_time_ms=60 inference_time_ms=0 tool_time_ms=60 status="succeeded" attempt=1 max_attempts=1
+2026-11-10T14:45:06.998507Z  INFO run{id=<RUN_ID>}: fabro_workflow::event::events: Edge selected from_node="merge_find" to_node="verify_gate" label="" reason="unconditional"
+2026-11-10T14:45:06.998718Z  INFO run{id=<RUN_ID>}: fabro_workflow::event::events: Checkpoint completed node_id="merge_find" status="succeeded" completed_count=4
+2026-11-10T14:45:06.998768Z  INFO run{id=<RUN_ID>}: fabro_workflow::lifecycle::fidelity: Fidelity resolved node=verify_gate fidelity=compact source="default"
+2026-11-10T14:45:07.000185Z  INFO run{id=<RUN_ID>}: fabro_workflow::event::events: Stage started node_id="verify_gate" stage="Any candidates to verify?" index=4 handler_type="conditional" attempt=1 max_attempts=1
+2026-11-10T14:45:07.001033Z  INFO run{id=<RUN_ID>}: fabro_workflow::event::events: Stage completed node_id="verify_gate" stage="Any candidates to verify?" index=4 wall_time_ms=0 active_time_ms=0 inference_time_ms=0 tool_time_ms=0 status="succeeded" attempt=1 max_attempts=1
+2026-11-10T14:45:07.001280Z  INFO run{id=<RUN_ID>}: fabro_workflow::event::events: Edge selected from_node="verify_gate" to_node="verify" label="" reason="condition"
+2026-11-10T14:45:07.001324Z  INFO run{id=<RUN_ID>}: fabro_workflow::event::events: Checkpoint completed node_id="verify_gate" status="succeeded" completed_count=5
+2026-11-10T14:45:07.001361Z  INFO run{id=<RUN_ID>}: fabro_workflow::lifecycle::fidelity: Fidelity resolved node=verify fidelity=compact source="default"
+2026-11-10T14:45:07.002641Z  INFO run{id=<RUN_ID>}: fabro_workflow::event::events: Stage started node_id="verify" stage="Verify candidates" index=5 handler_type="parallel" attempt=1 max_attempts=1
+2026-11-10T14:45:07.040542Z  INFO run{id=<RUN_ID>}: fabro_workflow::event::events: Stage completed node_id="verify" stage="Verify candidates" index=5 wall_time_ms=37 active_time_ms=0 inference_time_ms=0 tool_time_ms=0 status="succeeded" attempt=1 max_attempts=1
+2026-11-10T14:45:07.040587Z  INFO run{id=<RUN_ID>}: fabro_workflow::event::events: Edge selected from_node="verify" to_node="verify_join" label="" reason="jump"
+2026-11-10T14:45:07.040632Z  INFO run{id=<RUN_ID>}: fabro_workflow::event::events: Checkpoint completed node_id="verify" status="succeeded" completed_count=6
+2026-11-10T14:45:07.040677Z  INFO run{id=<RUN_ID>}: fabro_workflow::lifecycle::fidelity: Fidelity resolved node=verify_join fidelity=compact source="default"
+2026-11-10T14:45:07.042415Z  INFO run{id=<RUN_ID>}: fabro_workflow::event::events: Stage started node_id="verify_join" stage="Gather verdicts" index=6 handler_type="parallel.fan_in" attempt=1 max_attempts=1
+2026-11-10T14:45:07.043104Z  INFO run{id=<RUN_ID>}: fabro_workflow::event::events: Stage completed node_id="verify_join" stage="Gather verdicts" index=6 wall_time_ms=0 active_time_ms=0 inference_time_ms=0 tool_time_ms=0 status="succeeded" attempt=1 max_attempts=1
+2026-11-10T14:45:07.043346Z  INFO run{id=<RUN_ID>}: fabro_workflow::event::events: Edge selected from_node="verify_join" to_node="merge_verify" label="" reason="unconditional"
+2026-11-10T14:45:07.043389Z  INFO run{id=<RUN_ID>}: fabro_workflow::event::events: Checkpoint completed node_id="verify_join" status="succeeded" completed_count=7
+2026-11-10T14:45:07.043431Z  INFO run{id=<RUN_ID>}: fabro_workflow::lifecycle::fidelity: Fidelity resolved node=merge_verify fidelity=compact source="default"
+2026-11-10T14:45:07.045132Z  INFO run{id=<RUN_ID>}: fabro_workflow::event::events: Stage started node_id="merge_verify" stage="merge_verify" index=7 handler_type="command" attempt=1 max_attempts=1
+2026-11-10T14:45:07.101492Z  INFO run{id=<RUN_ID>}: fabro_workflow::event::events: Stage completed node_id="merge_verify" stage="merge_verify" index=7 wall_time_ms=56 active_time_ms=54 inference_time_ms=0 tool_time_ms=54 status="succeeded" attempt=1 max_attempts=1
+2026-11-10T14:45:07.101814Z  INFO run{id=<RUN_ID>}: fabro_workflow::event::events: Edge selected from_node="merge_verify" to_node="report" label="" reason="unconditional"
+2026-11-10T14:45:07.101878Z  INFO run{id=<RUN_ID>}: fabro_workflow::event::events: Checkpoint completed node_id="merge_verify" status="succeeded" completed_count=8
+2026-11-10T14:45:07.101935Z  INFO run{id=<RUN_ID>}: fabro_workflow::lifecycle::fidelity: Fidelity resolved node=report fidelity=compact source="default"
+2026-11-10T14:45:07.103984Z  INFO run{id=<RUN_ID>}: fabro_workflow::event::events: Stage started node_id="report" stage="report" index=8 handler_type="command" attempt=1 max_attempts=1
+2026-11-10T14:45:07.159117Z  INFO run{id=<RUN_ID>}: fabro_workflow::event::events: Stage completed node_id="report" stage="report" index=8 wall_time_ms=55 active_time_ms=53 inference_time_ms=0 tool_time_ms=53 status="succeeded" attempt=1 max_attempts=1
+2026-11-10T14:45:07.159401Z  INFO run{id=<RUN_ID>}: fabro_workflow::event::events: Edge selected from_node="report" to_node="exit" label="" reason="unconditional"
+2026-11-10T14:45:07.159467Z  INFO run{id=<RUN_ID>}: fabro_workflow::event::events: Checkpoint completed node_id="report" status="succeeded" completed_count=9
+2026-11-10T14:45:07.159532Z  INFO run{id=<RUN_ID>}: fabro_workflow::event::events: Stage started node_id="exit" stage="exit" index=9 handler_type="exit" attempt=1 max_attempts=1
+2026-11-10T14:45:07.159553Z  INFO run{id=<RUN_ID>}: fabro_workflow::event::events: Stage completed node_id="exit" stage="exit" index=9 wall_time_ms=0 active_time_ms=0 inference_time_ms=0 tool_time_ms=0 status="succeeded" attempt=1 max_attempts=1
+2026-11-10T14:45:07.171323Z  INFO run{id=<RUN_ID>}: fabro_workflow::event::events: Workflow run completed wall_time_ms=269 active_time_ms=167 inference_time_ms=0 tool_time_ms=167 artifact_count=0 status="succeeded"
+2026-11-10T14:45:07.171365Z  INFO run{id=<RUN_ID>}:stop{provider_kind="host" sandbox_id=host-dir-2f707269766174652f746d702f636c617564652d3530312f2d55736572732d6268656c6d6b616d702d702d6c6974686f73636f6d70757465722f34336331633734322d373335622d343561392d613631622d3933643633336338356637382f736372617463687061642f70722d636170747572652f776f726b}: fabro_workflow::event::events: Sandbox driver operation started event=sandbox.stop.started
+2026-11-10T14:45:07.213156Z  INFO run{id=<RUN_ID>}:stop{provider_kind="host" sandbox_id=host-dir-2f707269766174652f746d702f636c617564652d3530312f2d55736572732d6268656c6d6b616d702d702d6c6974686f73636f6d70757465722f34336331633734322d373335622d343561392d613631622d3933643633336338356637382f736372617463687061642f70722d636170747572652f776f726b}: fabro_workflow::event::events: Sandbox driver operation completed event=sandbox.stop.completed duration_ms=41

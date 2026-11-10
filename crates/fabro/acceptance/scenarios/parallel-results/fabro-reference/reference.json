@@ -4,9 +4,9 @@
   "fabro_repository": "https://github.com/fabro-sh/fabro",
   "fabro_revision": "05ebd0fd1beec214b558f4b478e36bd08b507dc7",
   "fabro_version": "fabro 0.355.0-nightly.0 (05ebd0f 2026-09-13 debug)",
-  "captured_on": "2026-09-13",
+  "captured_on": "2026-11-10",
   "captured_by": "crates/petri/cli/tests/fabro_differential.rs through tests/support/fabro/fabro_adapter.rs",
-  "bundle_digest": "9047b88a77614b5bf870b92c6254659ff25299712ef11663393d846e475a6162",
+  "bundle_digest": "58cf2deacdef7cb9e786a7e7abbe933836f2939170b181e4d5ea224ef26e8c21",
   "twins": [],
   "normalization": [
     "generated run id -> <RUN_ID>",
@@ -20,22 +20,6 @@
     "path": [
       {
         "node": "start",
-        "outcome": "succeeded"
-      },
-      {
-        "node": "setup",
-        "outcome": "succeeded"
-      },
-      {
-        "node": "prepare",
-        "outcome": "succeeded"
-      },
-      {
-        "node": "scope",
-        "outcome": "succeeded"
-      },
-      {
-        "node": "merge_scope",
         "outcome": "succeeded"
       },
       {
@@ -64,14 +48,6 @@
       },
       {
         "node": "merge_verify",
-        "outcome": "succeeded"
-      },
-      {
-        "node": "tally",
-        "outcome": "succeeded"
-      },
-      {
-        "node": "finalize",
         "outcome": "succeeded"
       },
       {
@@ -195,110 +171,30 @@
     ],
     "context": {
       "candidate_count": 2,
-      "finder_count": 4,
-      "finder_jobs": [
-        {
-          "assignment": "Run the diff command recorded in the review scope and review ONLY through the lens of your assigned angle:\n\n### Angle A — line-by-line diff scan\n\nRead every hunk in the diff, line by line. Then Read the enclosing function for\neach hunk — bugs in unchanged lines of a touched function are in scope (the PR\nre-exposes or fails to fix them). For every line ask: what input, state, timing,\nor platform makes this line wrong? Look for inverted/wrong conditions,\noff-by-one, null/undefined deref, missing `await`, falsy-zero checks,\nwrong-variable copy-paste, error swallowed in catch, unescaped regex metachars.\n\nSurface up to 6 candidate findings.",
-          "cap": 6,
-          "job_id": "find-angle-a",
-          "kind": "correctness",
-          "label": "angle-A"
-        },
-        {
-          "assignment": "Run the diff command recorded in the review scope and review ONLY through the lens of your assigned angle:\n\n### Angle B — removed-behavior auditor\n\nFor every line the diff DELETES or replaces, name the invariant or behavior it\nenforced, then search the new code for where that invariant is re-established.\nIf you can't find it, that's a candidate: a removed guard, a dropped error\npath, a narrowed validation, a deleted test that was covering a real case.\n\nSurface up to 6 candidate findings.",
-          "cap": 6,
-          "job_id": "find-angle-b",
-          "kind": "correctness",
-          "label": "angle-B"
-        },
-        {
-          "assignment": "Run the diff command recorded in the review scope and review ONLY through the lens of your assigned angle:\n\n### Angle C — cross-file tracer\n\nFor each function the diff changes, find its callers (Grep for the symbol) and\ncheck whether the change breaks any call site: a new precondition, a changed\nreturn shape, a new exception, a timing/ordering dependency. Also check callees:\ndoes a parallel change in the same PR make a call unsafe?\n\nSurface up to 6 candidate findings.",
-          "cap": 6,
-          "job_id": "find-angle-c",
-          "kind": "correctness",
-          "label": "angle-C"
-        },
-        {
-          "assignment": "Run the diff command recorded in the review scope and review through EACH of the following cleanup lenses:\n\n### Reuse\n\nFlag new code that re-implements something the codebase\nalready has — Grep shared/utility modules and files adjacent to the change,\nand name the existing helper to call instead.\n\n\n### Simplification\n\nFlag unnecessary complexity the diff adds: redundant or derivable state,\ncopy-paste with slight variation, deep nesting, dead code left behind. Name\nthe simpler form that does the same job.\n\n\n### Efficiency\n\nFlag wasted work the diff introduces: redundant computation or repeated I/O,\nindependent operations run sequentially, blocking work added to startup or\nhot paths. Also flag long-lived objects built from closures or captured\nenvironments — they keep the entire enclosing scope alive for the object's\nlifetime (a memory leak when that scope holds large values); prefer a\nclass/struct that copies only the fields it needs. Name the cheaper\nalternative.\n\n\n### Altitude\n\nCheck that each change is implemented at the right depth, not as a fragile\nbandaid. Special cases layered on shared infrastructure are a sign the fix\nisn't deep enough — prefer generalizing the underlying mechanism over adding\nspecial cases.\n\n\n### Conventions (CLAUDE.md)\n\nFind the CLAUDE.md files that govern the changed code: the user-level\n~/.claude/CLAUDE.md, the repo-root CLAUDE.md, plus any CLAUDE.md or\nCLAUDE.local.md in a directory that is an ancestor of a changed file (a\ndirectory's CLAUDE.md only applies to files at or below it). Read each one\nthat exists, then check the diff for clear violations of the rules they state.\n\nOnly flag a violation when you can quote the exact rule and the exact line\nthat breaks it — no style preferences, no vague \"spirit of the doc\"\ninferences. In the finding, name the CLAUDE.md path and quote the rule so the\nreport can cite it. If no CLAUDE.md applies, return nothing for this angle.\n\nCleanup, altitude, and conventions candidates use the same\n`file`/`line`/`summary` shape; in `failure_scenario`, state the concrete\ncost (what is duplicated, wasted, harder to maintain, or which CLAUDE.md rule\nis broken) instead of a crash. Correctness bugs always outrank cleanup,\naltitude, and conventions findings when the output cap forces a cut.\n\nSurface up to 30 candidate findings. Cover whichever lenses apply — you do not need findings from every lens; prioritize the highest-cost issues across all of them.",
-          "cap": 30,
-          "job_id": "find-cleanup",
-          "kind": "cleanup",
-          "label": "cleanup"
-        }
-      ],
-      "kept_count": 2,
-      "output.scope": {
-        "claudeMdFiles": [],
-        "conventions": "",
-        "diffCommand": "git diff main...HEAD",
-        "files": [
-          "src/pager.py",
-          "src/render.py"
-        ],
-        "summary": "two files"
-      },
       "reported": 2,
-      "review_empty": false,
-      "review_level": "high",
-      "run_sweep": false,
-      "run_synthesize": true,
       "run_verify": true,
-      "verified_count": 2,
-      "verify_jobs": [
-        {
-          "candidates": [
-            {
-              "failure_scenario": "7 items with page size 3 reports 2 pages, so item 7 is unreachable",
-              "index": 0,
-              "summary": "page_count drops the final partial page"
-            }
-          ],
-          "file": "src/pager.py",
-          "job_id": "verify-000-src-pager-py-12",
-          "line": 12,
-          "loc": "src/pager.py:12"
-        },
-        {
-          "candidates": [
-            {
-              "failure_scenario": "a title containing & renders as &amp;amp;",
-              "index": 0,
-              "summary": "render escapes the title twice"
-            }
-          ],
-          "file": "src/render.py",
-          "job_id": "verify-001-src-render-py-40",
-          "line": 40,
-          "loc": "src/render.py:40"
-        }
-      ]
+      "verified_count": 2
     },
     "bookkeeping": {
       "command.output": "<BLOB_1>",
       "current_node": "report",
       "failure_class": "",
       "failure_signature": "",
-      "graph.goal": "Fan two command finders out, join them, and merge through the pinned Conveyor code-review helper.",
+      "graph.goal": "Fan two command finders out, join them, and merge their branch results through a helper that reads context.parallel.results.",
       "graph.rankdir": "LR",
       "internal.fidelity": "compact",
       "internal.node_visit_count": 1,
-      "internal.retry_count.finalize": 0,
       "internal.retry_count.find": 0,
       "internal.retry_count.find_join": 0,
       "internal.retry_count.merge_find": 0,
-      "internal.retry_count.merge_scope": 0,
       "internal.retry_count.merge_verify": 0,
-      "internal.retry_count.prepare": 0,
       "internal.retry_count.report": 0,
-      "internal.retry_count.scope": 0,
-      "internal.retry_count.setup": 0,
       "internal.retry_count.start": 0,
-      "internal.retry_count.tally": 0,
       "internal.retry_count.verify": 0,
       "internal.retry_count.verify_gate": 0,
       "internal.retry_count.verify_join": 0,
       "internal.run_id": "<RUN_ID>",
-      "internal.thread_id": "finalize",
+      "internal.thread_id": "merge_verify",
       "outcome": "succeeded",
       "parallel.branch_count": 2,
       "parallel.results": [
@@ -337,23 +233,17 @@
           "status": "succeeded"
         }
       ],
-      "thread.finalize.current_node": "report",
       "thread.find.current_node": "find_join",
       "thread.find_join.current_node": "merge_find",
       "thread.merge_find.current_node": "verify_gate",
-      "thread.merge_scope.current_node": "find",
-      "thread.merge_verify.current_node": "tally",
-      "thread.prepare.current_node": "scope",
-      "thread.scope.current_node": "merge_scope",
-      "thread.setup.current_node": "prepare",
-      "thread.start.current_node": "setup",
-      "thread.tally.current_node": "finalize",
+      "thread.merge_verify.current_node": "report",
+      "thread.start.current_node": "find",
       "thread.verify.current_node": "verify_join",
       "thread.verify_gate.current_node": "verify",
       "thread.verify_join.current_node": "merge_verify"
     },
     "artifacts": {
-      ".fabro/workflows/code-review/runtime/report.md": "# Code review (high)\n\nTarget: review-fixture\nDiff command: git diff main...HEAD\n\nSynthesis step was skipped or its decisions were unusable — returning verified findings ranked, unmerged.\n\n## Findings (2)\n\n### 1. src/pager.py:12 (CONFIRMED)\n\npage_count drops the final partial page\n\nFailure scenario: 7 items with page size 3 reports 2 pages, so item 7 is unreachable\n\n### 2. src/render.py:40 (PLAUSIBLE)\n\nrender escapes the title twice\n\nFailure scenario: a title containing & renders as &amp;amp;\n\n## Refuted candidates (0)\n\n\n## Stats\n\n- candidates: 2\n- finders: 4\n- level: high\n- refuted: 0\n- reported: 2\n- verified: 2\n- verifierAgents: 2\n"
+      "runtime/report.md": "# Findings (2)\n\n1. src/pager.py:12 (CONFIRMED): page_count drops the final partial page\n   Failure scenario: 7 items with page size 3 reports 2 pages, so item 7 is unreachable\n2. src/render.py:40 (PLAUSIBLE): render escapes the title twice\n   Failure scenario: a title containing & renders as &amp;amp;\n"
     },
     "interviews": [],
     "requests": [],

@@ -461,7 +461,7 @@ async fn run_cell(cell: Cell) {
 // Scenario: parallel-results (command-only, the first regression of phase 2)
 // ---------------------------------------------------------------------------
 
-/// The Conveyor helper's report, byte-exact, from the phase 2 capture.
+/// The scenario helper's report, byte-exact, from the phase 2 capture.
 fn parallel_results_report() -> String {
     fs::read_to_string(scenarios_dir().join("parallel-results/fabro-reference/raw/report.md"))
         .expect("the reference report is tracked")
@@ -503,11 +503,7 @@ fn expect_parallel_results(p: &Projection) -> Vec<Check> {
             json!(context.get(key)),
         ));
     }
-    let report = p
-        .artifacts
-        .get(".fabro/workflows/code-review/runtime/report.md")
-        .cloned()
-        .flatten();
+    let report = p.artifacts.get("runtime/report.md").cloned().flatten();
     checks.push(check(
         "the report is byte-identical to the reference report",
         report.as_deref() == Some(parallel_results_report().as_str()),
@@ -569,12 +565,8 @@ async fn parallel_results_matches_the_pinned_fabro() {
     run_cell(Cell {
         scenario:    "parallel-results",
         workflow:    "workflow.fabro",
-        bundle:      vec!["workflow.fabro", "helper/code_review.py"],
-        inputs:      vec![
-            ("helper", "{bundle}/helper/code_review.py".to_owned()),
-            ("level", "high".to_owned()),
-            ("target", "review-fixture".to_owned()),
-        ],
+        bundle:      vec!["workflow.fabro", "helper/merge_branches.py"],
+        inputs:      vec![("helper", "{bundle}/helper/merge_branches.py".to_owned())],
         rules:       compare::rules(
             // Named bookkeeping of each engine, kept beside the compared
             // context. Fabro: its engine-internal keys. Petri: its
@@ -599,7 +591,7 @@ async fn parallel_results_matches_the_pinned_fabro() {
                 "parallel.results",
                 "parallel.branch_count",
             ],
-            &[".fabro/workflows/code-review/runtime/report.md"],
+            &["runtime/report.md"],
         ),
         script:      None,
         twins:       Vec::new(),
