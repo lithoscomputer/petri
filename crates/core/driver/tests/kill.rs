@@ -16,10 +16,10 @@ use support::*;
 use tokio::time;
 
 /// work → cleanup, with cleanup opted in to run after a cancel.
-fn cleanup_graph(cleanup_script: &str) -> ir::Graph {
+fn cleanup_graph(work_script: &str, cleanup_script: &str) -> ir::Graph {
     let mut b = GraphBuilder::new();
     let scope = ScopeId::new(0);
-    let work = add_script(&mut b, "work", scope, "echo ready > ready && sleep 300");
+    let work = add_script(&mut b, "work", scope, work_script);
     let cleanup = add_script(&mut b, "cleanup", scope, cleanup_script);
     b.link(work, cleanup);
     b.node_mut(cleanup).run_on_cancel = true;
@@ -64,7 +64,10 @@ fn assert_kill_in_log(report: &driver::ExecutionReport) {
 #[tokio::test]
 async fn cleanup_runs_after_a_cancel() {
     let dir = RunDir::new("cleanup-after-cancel");
-    let graph = cleanup_graph("echo cleaned > cleaned.txt");
+    let graph = cleanup_graph(
+        "echo ready > ready && sleep 300",
+        "echo cleaned > cleaned.txt",
+    );
     let config = RunConfig::new(dir.path())
         .with_grace(Duration::from_secs(1))
         .with_retention(Retention::Always);
@@ -141,13 +144,18 @@ async fn cleanup_grace_expiry_feeds_kill() {
 }
 
 /// §6 driver test 2, second half: a second root cancel feeds `KillRequested`
-/// without waiting for the cleanup grace.
+/// without waiting for the cleanup grace, even after work used its full TERM
+/// grace.
 #[tokio::test]
 async fn a_second_cancel_feeds_kill() {
     let dir = RunDir::new("second-cancel-kill");
-    let graph = cleanup_graph("trap '' TERM; echo x > cleanup-started; sleep 300");
+    let graph = cleanup_graph(
+        "trap '' TERM; echo ready > ready; sleep 300",
+        "trap '' TERM; echo x > cleanup-started; sleep 300",
+    );
+    let term_grace = Duration::from_secs(10);
     let config = RunConfig::new(dir.path())
-        .with_grace(Duration::from_secs(10))
+        .with_grace(term_grace)
         .with_cleanup_grace(Duration::from_secs(300))
         .with_retention(Retention::Always);
     let workspace = dir.workspace();
@@ -158,8 +166,15 @@ async fn a_second_cancel_feeds_kill() {
 
     assert!(wait_for_file(&workspace.join("ready"), Duration::from_secs(10)).await);
     handle.cancel(CancelScopeId::ROOT).await;
+    // Work ignores TERM, so cleanup cannot start until the TERM grace expires.
+    // Leave a separate startup window after that grace; this is setup, not the
+    // second cancel's latency assertion below.
     assert!(
-        wait_for_file(&workspace.join("cleanup-started"), Duration::from_secs(10)).await,
+        wait_for_file(
+            &workspace.join("cleanup-started"),
+            term_grace + Duration::from_secs(10),
+        )
+        .await,
         "the polite cancel admitted the cleanup"
     );
     let killed_at = Instant::now();
@@ -171,6 +186,11 @@ async fn a_second_cancel_feeds_kill() {
     let elapsed = killed_at.elapsed();
 
     assert_eq!(report.status, RunStatus::Cancelled);
+    assert_eq!(status_of(&report, "work").as_deref(), Some("cancelled"));
+    assert_eq!(
+        output_of(&report, "work")["cancel_escalation"],
+        json!("sigkill")
+    );
     assert_eq!(
         output_of(&report, "cleanup")["cancel_escalation"],
         json!("sigkill")
