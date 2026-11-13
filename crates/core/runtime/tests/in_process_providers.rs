@@ -1,5 +1,5 @@
-//! The standard runtime over built-in providers linked into this process:
-//! sandbox-driver's Host provider through a factory, with no plugin.
+//! The standard runtime over an application's own sandbox catalog:
+//! sandbox-driver's built-in Host provider registered through a factory.
 
 use std::fs;
 use std::path::Path;
@@ -8,9 +8,9 @@ use std::sync::{Arc, OnceLock};
 use executor::{AcquireContext, ExecEnv, Executor as _, Retention, ScopeOutcome, ScopeSpec};
 use ir::{GraphBuilder, Outcome, RunStatus, RuntimeSpec, ScopeId, Value};
 use runtime::steps::{Step, StepCtx};
-use runtime::{InProcessProviders, RunOptions, Runtime};
+use runtime::{RunOptions, Runtime};
 use testkit::RunDir;
-use testkit::in_process::{HostFactory, host_providers};
+use testkit::in_process::{HostFactory, catalog, host_providers};
 
 struct CaptureEnvironment(Arc<OnceLock<Arc<dyn ExecEnv>>>);
 
@@ -44,7 +44,7 @@ async fn standalone_and_resumed_drivers_run_on_the_built_in_host_and_close_it() 
         let runtime = Runtime::standard()
             .step(CaptureEnvironment(environment.clone()))
             .options(retained(&directory))
-            .in_process_providers(providers);
+            .sandbox_catalog(providers);
         let mut graph = GraphBuilder::new();
         graph.add_step("capture", ScopeId::new(0), CaptureEnvironment::NAME);
         let graph = graph.build();
@@ -84,7 +84,7 @@ async fn run_finish_closes_its_environments_and_preserves_other_runs_and_retaine
     let (providers, host, docker) = host_providers();
     let runtime = Runtime::standard()
         .options(retained(&first_dir))
-        .in_process_providers(providers);
+        .sandbox_catalog(providers);
     let first = runtime.prepare_run(first_dir.path());
     let second = runtime.prepare_run(second_dir.path());
     let first_router = first.sandbox_router().expect("standard router").clone();
@@ -98,7 +98,11 @@ async fn run_finish_closes_its_environments_and_preserves_other_runs_and_retaine
         .acquire(&scope, &AcquireContext::bare())
         .await
         .expect("second host scope");
-    assert_eq!(host.connects(), 2, "each run opens its own registry");
+    assert_eq!(
+        host.connects(),
+        2,
+        "each run activates its own Host provider"
+    );
     let first_exec = first_env.exec();
     first_exec
         .write_file(Path::new("retained"), b"kept")
@@ -127,7 +131,6 @@ async fn run_finish_closes_its_environments_and_preserves_other_runs_and_retaine
         fs::read(first_dir.workspace().join("retained")).expect("retained workspace"),
         b"kept"
     );
-    assert!(first_dir.path().join("host-registry").is_dir());
     second_env
         .exec()
         .write_file(Path::new("still-live"), b"yes")
@@ -144,12 +147,12 @@ async fn run_finish_closes_its_environments_and_preserves_other_runs_and_retaine
 }
 
 #[tokio::test]
-async fn a_kind_without_a_factory_fails_at_acquire_instead_of_launching_its_plugin() {
+async fn an_entry_without_a_registered_provider_fails_at_acquire() {
     let directory = RunDir::new("in-process-missing-kind");
     let host = Arc::new(HostFactory::default());
     let runtime = Runtime::standard()
         .options(retained(&directory))
-        .in_process_providers(InProcessProviders::new().with(host.clone()));
+        .sandbox_catalog(catalog(host.clone(), None));
     let run = runtime.prepare_run(directory.path());
     let router = run.sandbox_router().expect("standard router").clone();
     let mut scope = ScopeSpec::new(ScopeId::new(0), "scope-0");
@@ -158,7 +161,7 @@ async fn a_kind_without_a_factory_fails_at_acquire_instead_of_launching_its_plug
         .acquire(&scope, &AcquireContext::bare())
         .await
         .expect_err("no Docker factory");
-    assert!(error.to_string().contains("not configured"), "{error}");
+    assert!(error.to_string().contains("not installed"), "{error}");
 
     // Host scopes still run: the missing kind is only needed by containers.
     let env = router
@@ -185,7 +188,7 @@ async fn a_dry_run_connects_no_built_in_provider() {
     let runtime = Runtime::standard()
         .options(retained(&directory))
         .simulated_sandboxes()
-        .in_process_providers(providers);
+        .sandbox_catalog(providers);
     let mut graph = GraphBuilder::new();
     graph.add_step("noop", ScopeId::new(0), "noop");
     let report = runtime.run(graph.build()).await.expect("dry run");

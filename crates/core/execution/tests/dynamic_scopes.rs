@@ -156,9 +156,11 @@ async fn a_dynamic_scope_resumes_its_durable_lease_and_rejects_corrupt_provenanc
     coordinator.finish().await;
     let after = resources(&directory).await;
     assert_eq!(after.records().count(), 2);
+    // A Host sandbox ends with its owner process: the resumed run keeps
+    // the lease and its workspace and opens a fresh sandbox over them.
     assert_eq!(
-        after.resolve(before.lease).unwrap().resource_id,
-        before.resource_id
+        after.resolve(before.lease).unwrap().workspace,
+        before.workspace
     );
     let proof = directory
         .path()

@@ -128,8 +128,8 @@ pub(crate) fn pins(fabro: Option<&FabroBinary>) -> Value {
     pins.insert(
         "sandbox".into(),
         json!({
-            "host_plugin": env::var("PETRI_SANDBOX_HOST_PLUGIN").ok(),
-            "docker_plugin": env::var("PETRI_SANDBOX_DOCKER_PLUGIN").ok(),
+            // Host and Docker are sandbox-driver built-ins, linked in.
+            "providers": "built-in",
             "plugin_revision": plugin_revision(),
             // The runner label the Docker backend maps to its default image.
             "docker_runner_label": "ubuntu-24.04",

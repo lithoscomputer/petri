@@ -4,7 +4,7 @@ version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
-description = "Petri executor over the sandbox-driver provider family"
+description = "Petri executor over sandbox-driver's shared sandbox API"
 
 publish = false
 
@@ -18,8 +18,9 @@ workspace = true
 executor.workspace = true
 ir.workspace = true
 sandbox-driver.workspace = true
-sandbox-driver-protocol.workspace = true
-sandbox-driver-docker-config.workspace = true
+sandbox-driver-host.workspace = true
+sandbox-driver-docker.workspace = true
+sandbox-driver-daytona.workspace = true
 sandbox-driver-daytona-config.workspace = true
 async-trait.workspace = true
 serde.workspace = true
@@ -28,15 +29,12 @@ sha2.workspace = true
 smol_str.workspace = true
 thiserror.workspace = true
 tokio.workspace = true
+toml.workspace = true
 tokio-util = { workspace = true, features = ["rt"] }
 tracing.workspace = true
 
 [dev-dependencies]
 testkit.workspace = true
-# The in-process source's shutdown is tested against the real Host provider.
-sandbox-driver-host.workspace = true
+sandbox-driver-testing.workspace = true
 # The Daytona battery fetches a preview URL the provider signs for a port.
 reqwest.workspace = true
-
-[build-dependencies]
-sha2.workspace = true

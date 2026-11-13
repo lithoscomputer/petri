@@ -13,6 +13,7 @@
 //! provider holds nothing more for its run.
 
 use std::collections::BTreeMap;
+use std::num::{NonZeroU32, NonZeroU64};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -23,10 +24,12 @@ use executor::{
     SandboxLeaseId, ScopeOutcome, ScopeSpec, Sig,
 };
 use executor_sandbox::{
-    DaytonaResources, MemoryLedger, PluginSettings, PluginSource, RoutingExecutor, RunIdentity,
-    SandboxBackend, SandboxExecutor, SandboxOptions,
+    DaytonaResources, RoutingExecutor, SandboxBackend, SandboxCatalog, SandboxOptions,
 };
-use sandbox_driver::{SandboxKind, SandboxState};
+use sandbox_driver::contract::{
+    Environment, EnvironmentName, Error, ProviderEntry, ProviderName, SandboxSpec, SandboxState,
+    SecretResolver, Source, StaticEnvironments,
+};
 use testkit::{DaytonaObserver, RunDir, is_daytona_ready};
 use tokio::time;
 
@@ -118,7 +121,7 @@ async fn assert_no_leftovers(observer: &DaytonaObserver, dir: &RunDir) {
             "sandboxes were left behind: {:?}",
             leftovers
                 .iter()
-                .map(|status| format!("{} ({:?})", status.id, status.state))
+                .map(|status| format!("{} ({:?})", status.reference.id, status.state))
                 .collect::<Vec<_>>()
         );
         time::sleep(Duration::from_millis(250)).await;
@@ -134,7 +137,7 @@ async fn a_process_step_runs_in_the_runner_sandbox() {
     if !is_daytona_ready().await {
         return;
     }
-    let observer = DaytonaObserver::from_env().await;
+    let observer = DaytonaObserver::from_env();
     let dir = RunDir::new("sandbox-daytona-step");
     let executor = executor(&dir, Retention::Never);
     let handle = executor
@@ -191,21 +194,25 @@ async fn a_process_step_runs_in_the_runner_sandbox() {
         .sandbox(&dir.run_id(), LEASE)
         .await
         .expect("the provider lists the run's sandbox by its labels");
-    assert_eq!(status.id.as_str(), sandbox.instance.as_str());
+    assert_eq!(status.reference.id.as_str(), sandbox.instance.as_str());
     assert_eq!(status.state, SandboxState::Running);
-    assert_eq!(status.sandbox_kind, Some(SandboxKind::Container));
     let wanted = DaytonaResources::default();
-    let resources = status.resources.expect("Daytona reports the allocation");
-    assert_eq!(resources.cpu_cores, Some(wanted.cpu_cores));
-    assert_eq!(resources.memory_mb, Some(wanted.memory_mb));
-    assert!(resources.disk_mb.is_some_and(|disk| disk > 0));
-    if let Some(region) = env::var_os("DAYTONA_TARGET").filter(|value| !value.is_empty()) {
-        assert_eq!(
-            status.region.as_deref(),
-            Some(region.to_string_lossy().as_ref()),
-            "the sandbox is placed in the configured region"
-        );
-    }
+    let resources = observer
+        .status(&dir.run_id(), LEASE)
+        .await
+        .expect("Daytona reports the sandbox")
+        .resources;
+    assert_eq!(
+        resources.cpu_cores.map(NonZeroU32::get),
+        Some(wanted.cpu_cores)
+    );
+    assert_eq!(
+        resources.memory_mb.map(NonZeroU64::get),
+        Some(wanted.memory_mb)
+    );
+    assert!(resources.disk_mb.is_some());
+    // TODO(parity): the sandbox's region. The shared API's status reports
+    // no placement, so the configured DAYTONA_TARGET is not checked here.
 
     let report = executor.release(handle, ScopeOutcome::Failed).await;
     assert!(report.is_clean(), "{report:?}");
@@ -226,7 +233,7 @@ async fn term_and_a_timeout_end_a_step_in_the_runner_sandbox() {
     if !is_daytona_ready().await {
         return;
     }
-    let observer = DaytonaObserver::from_env().await;
+    let observer = DaytonaObserver::from_env();
     let dir = RunDir::new("sandbox-daytona-term");
     let executor = executor(&dir, Retention::Never);
     let handle = executor
@@ -303,7 +310,7 @@ async fn workspace_files_go_over_the_wire() {
     if !is_daytona_ready().await {
         return;
     }
-    let observer = DaytonaObserver::from_env().await;
+    let observer = DaytonaObserver::from_env();
     let dir = RunDir::new("sandbox-daytona-fs");
     let executor = executor(&dir, Retention::Never);
     let handle = executor
@@ -405,7 +412,7 @@ async fn a_container_job_runs_nested_inside_the_runner_sandbox() {
     if !is_daytona_ready().await {
         return;
     }
-    let observer = DaytonaObserver::from_env().await;
+    let observer = DaytonaObserver::from_env();
     let dir = RunDir::new("sandbox-daytona-nested");
     let executor = executor(&dir, Retention::Never);
     let scope =
@@ -468,7 +475,7 @@ async fn a_kept_sandbox_is_stopped_and_reattached_later() {
     if !is_daytona_ready().await {
         return;
     }
-    let observer = DaytonaObserver::from_env().await;
+    let observer = DaytonaObserver::from_env();
     let dir = RunDir::new("sandbox-daytona-keep");
     let keeper = executor(&dir, Retention::Always);
     let handle = keeper
@@ -485,10 +492,20 @@ async fn a_kept_sandbox_is_stopped_and_reattached_later() {
     assert!(report.is_clean(), "{report:?}");
     assert!(report.kept_any("sandbox"), "{report:?}");
     keeper.shutdown().await;
-    let status = observer
-        .sandbox(&dir.run_id(), LEASE)
-        .await
-        .expect("the sandbox is kept");
+    // TODO(sandbox-driver): the legacy Daytona stop returned once the
+    // sandbox read `stopped`; the contract runtime returns while Daytona
+    // still lists it `stopping`. Wait for it to settle.
+    let deadline = Instant::now() + Duration::from_secs(60);
+    let status = loop {
+        let status = observer
+            .sandbox(&dir.run_id(), LEASE)
+            .await
+            .expect("the sandbox is kept");
+        if status.state != SandboxState::Stopping || Instant::now() > deadline {
+            break status;
+        }
+        time::sleep(Duration::from_secs(2)).await;
+    };
     assert_eq!(status.state, SandboxState::Stopped, "kept, stopped");
 
     let later = executor(&dir, Retention::Never);
@@ -523,7 +540,7 @@ async fn a_reacquire_attaches_and_fences_the_crashed_predecessor() {
     if !is_daytona_ready().await {
         return;
     }
-    let observer = DaytonaObserver::from_env().await;
+    let observer = DaytonaObserver::from_env();
     let dir = RunDir::new("sandbox-daytona-fence");
     let first = executor(&dir, Retention::Never);
     let handle = first
@@ -590,7 +607,7 @@ async fn output_survives_idle_and_a_burst_is_delivered_or_its_loss_is_counted() 
     if !is_daytona_ready().await {
         return;
     }
-    let observer = DaytonaObserver::from_env().await;
+    let observer = DaytonaObserver::from_env();
     let dir = RunDir::new("sandbox-daytona-output");
     let executor = executor(&dir, Retention::Never);
     let handle = executor
@@ -657,7 +674,7 @@ async fn a_preview_url_reaches_a_port_inside_the_sandbox() {
     if !is_daytona_ready().await {
         return;
     }
-    let observer = DaytonaObserver::from_env().await;
+    let observer = DaytonaObserver::from_env();
     let dir = RunDir::new("sandbox-daytona-preview");
     let executor = executor(&dir, Retention::Never);
     let handle = executor
@@ -730,7 +747,7 @@ async fn a_bad_image_fails_a_nested_job_routably() {
     if !is_daytona_ready().await {
         return;
     }
-    let observer = DaytonaObserver::from_env().await;
+    let observer = DaytonaObserver::from_env();
     let dir = RunDir::new("sandbox-daytona-bad-image");
     let executor = executor(&dir, Retention::Never);
     let error = executor
@@ -754,33 +771,49 @@ async fn a_bad_image_fails_a_nested_job_routably() {
     observer.shutdown().await;
 }
 
-/// No credentials, no daemon, no key: a Daytona scope whose plugin is not
-/// where the configuration says fails at acquire with the plugin named, as
+/// No daemon, no key: a Daytona scope whose entry names a credential the
+/// application does not have fails at acquire with the credential named, as
 /// a step's failure and not a crash. Runs everywhere.
 #[tokio::test]
-async fn a_missing_daytona_plugin_fails_the_scope_routably() {
-    let dir = RunDir::new("sandbox-daytona-no-plugin");
-    let missing = dir.path().join("sandbox-driver-daytona");
-    let settings = PluginSettings::at_path("daytona", &missing).expect("daytona is a plugin kind");
-    let executor = SandboxExecutor::new(
-        Arc::new(PluginSource::new(settings)),
-        Arc::new(MemoryLedger::default()),
-        Arc::new(RunIdentity::for_run_dir(dir.path().to_path_buf())),
-        Retention::Never,
-        None,
-        options(),
+async fn a_missing_daytona_credential_fails_the_scope_routably() {
+    struct NoSecrets;
+    #[async_trait::async_trait]
+    impl SecretResolver for NoSecrets {
+        async fn resolve(&self, _: &str) -> Result<Option<String>, Error> {
+            Ok(None)
+        }
+    }
+    const SECRET: &str = "PETRI_TEST_ABSENT_DAYTONA_KEY";
+    let dir = RunDir::new("sandbox-daytona-no-credential");
+    let name = ProviderName::try_new("daytona").expect("name");
+    let entry: ProviderEntry =
+        serde_json::from_value(serde_json::json!({ "plugin": "daytona", "secrets": [SECRET] }))
+            .expect("entry");
+    let catalog = SandboxCatalog::new(
+        [(name.clone(), entry)],
+        Arc::new(StaticEnvironments(BTreeMap::from([(
+            EnvironmentName::try_new("daytona").expect("name"),
+            Environment {
+                provider: name,
+                spec:     SandboxSpec::new(Source::Image(ALPINE.to_owned())),
+            },
+        )]))),
+        SandboxCatalog::builtin_registry(),
+        Arc::new(NoSecrets),
     );
+    let executor = RoutingExecutor::with_catalog(catalog, dir.path(), Retention::Never, options());
     let error = executor
         .acquire(&process_scope(), &AcquireContext::bare())
         .await
-        .expect_err("no plugin, no sandbox");
+        .expect_err("no credential, no sandbox");
     let message = error.to_string();
     assert!(
         matches!(error, EnvError::Backend { .. }),
         "routable, not a panic: {message}"
     );
     assert!(
-        message.contains("daytona plugin") && message.contains(&missing.display().to_string()),
-        "the failure names the plugin and where it was expected: {message}"
+        message.contains(SECRET),
+        "the failure names the credential: {message}"
     );
+    executor.shutdown().await;
 }

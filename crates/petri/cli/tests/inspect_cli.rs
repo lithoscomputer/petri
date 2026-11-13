@@ -33,7 +33,7 @@ fn run_workflow(run_dir: &Path, workflow: &Path, extra: &[&str]) -> Output {
 }
 
 /// `petri inspect --json` under an environment with no provider reachable
-/// and no sandbox plugin named: the command needs neither.
+/// and no Docker daemon reachable: the command needs neither.
 fn inspect(run_dir: &Path) -> (Output, Value) {
     let output = petri()
         .args(["inspect", "--json", "--run-dir"])
@@ -42,8 +42,7 @@ fn inspect(run_dir: &Path) -> (Output, Value) {
         .env("ANTHROPIC_BASE_URL", "http://127.0.0.1:9")
         .env("OPENAI_API_KEY", "bogus")
         .env("OPENAI_BASE_URL", "http://127.0.0.1:9")
-        .env_remove("PETRI_SANDBOX_HOST_PLUGIN")
-        .env_remove("PETRI_SANDBOX_DOCKER_PLUGIN")
+        .env("DOCKER_HOST", "tcp://127.0.0.1:1")
         .output()
         .expect("petri inspects");
     let document = if output.stdout.is_empty() {

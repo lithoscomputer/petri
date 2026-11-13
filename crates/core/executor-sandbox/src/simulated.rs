@@ -2,161 +2,213 @@
 //!
 //! A dry run touches no provider. Its step kinds are stubs that run no
 //! process and read no file, so a scope needs nothing behind it. This
-//! in-process provider hands out sandboxes that are a name, a working
-//! directory string and labels, and nothing else: no plugin is launched,
-//! no process runs, no directory is created. The lease manager, the ledger
-//! and the run's scope records work unchanged over it, so `scope.acquired`
-//! names the provider `simulated`, `scope.released` records the lease's
-//! end, and a resume or a prune finds records it knows to leave alone.
+//! built-in provider hands out sandboxes that are a name, a working
+//! directory string and labels, and nothing else: no process runs and no
+//! directory is created. The lease manager, the ledger and the run's scope
+//! records work unchanged over it, so `scope.acquired` names the entry
+//! `simulated`, `scope.released` records the lease's end, and a resume or a
+//! prune finds records it knows to leave alone.
 //!
 //! A simulated sandbox lives as long as the process that created it. A
 //! resumed dry run finds none on the provider and creates fresh ones
 //! ([`crate::LostSandbox::Replace`]), which is what a sandbox with no state
 //! amounts to.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
+use std::num::NonZeroU16;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 
 use async_trait::async_trait;
-use sandbox_driver::{
-    Capabilities, DirEntry, Error, EventContext, Exec, ExecControls, ExecResult, ExecSpec,
-    ExecStreamingResult, FileMetadata, Filesystem, Isolation, PlatformInfo, ProviderError,
-    ProviderKind, ResourceKind, Sandbox, SandboxFilter, SandboxId, SandboxProvider, SandboxSpec,
-    SandboxState, SandboxStatus,
+use sandbox_driver::contract::{
+    AccessScope, Activation, ByteStream, CapabilitySet, Descriptor, Durability, Error,
+    ExecControls, ExecOutcome, ExecSpec, Expose, Exposure, FileEntry, FileRange, Files, Health,
+    JsonSchema, LabelFilter, Locality, Namespace, NamespaceId, NamespaceScope, NetworkMode,
+    PluginLocation, PortSupport, Ports, ProviderFactory, ProviderName, ProviderRuntime,
+    ProviderSchemas, Resources, Sandbox, SandboxRef, SandboxState, SandboxSummary, SourceKind,
+    Status, WorkloadAdmission,
 };
+use sandbox_driver::{Isolation, ProviderKind, SandboxId};
 
-/// The provider kind a dry run's leases and scope records name.
+/// The provider kind, entry and environment a dry run's leases and scope
+/// records name.
 pub const SIMULATED_KIND: &str = "simulated";
 
-/// The in-process provider of sandboxes that hold nothing and run nothing.
-pub struct SimulatedProvider {
-    kind:         ProviderKind,
-    capabilities: Capabilities,
-    sandboxes:    Mutex<BTreeMap<String, Arc<SimulatedSandbox>>>,
-    unnamed:      AtomicU64,
-}
+/// The built-in factory of the simulated provider.
+pub struct SimulatedFactory;
 
-impl Default for SimulatedProvider {
-    fn default() -> Self {
-        Self::new()
+#[async_trait]
+impl ProviderFactory for SimulatedFactory {
+    async fn discover(&self, _location: &PluginLocation) -> Result<ProviderSchemas, Error> {
+        Ok(schemas())
+    }
+
+    async fn activate(&self, activation: Activation) -> Result<Arc<dyn ProviderRuntime>, Error> {
+        Ok(Arc::new(SimulatedRuntime {
+            entry:     activation.name,
+            sandboxes: Mutex::new(BTreeMap::new()),
+            unnamed:   AtomicU64::new(0),
+        }))
     }
 }
 
-impl SimulatedProvider {
-    pub fn new() -> Self {
-        Self {
-            kind:         ProviderKind::try_new(SIMULATED_KIND)
-                .expect("the simulated provider kind is a valid kind name"),
-            // No isolation is claimed: there is nothing to isolate. Nothing
-            // optional is declared, so every gated facet fails preflight.
-            capabilities: Capabilities::minimal(Isolation::None),
-            sandboxes:    Mutex::new(BTreeMap::new()),
-            unnamed:      AtomicU64::new(0),
-        }
+fn schemas() -> ProviderSchemas {
+    let closed: JsonSchema = serde_json::from_value(serde_json::json!({
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "type": "object",
+        "additionalProperties": false,
+    }))
+    .expect("a constant schema");
+    ProviderSchemas {
+        kind:          ProviderKind::try_new(SIMULATED_KIND).expect("a constant kind name"),
+        version:       env!("CARGO_PKG_VERSION").to_owned(),
+        config_schema: closed.clone(),
+        spec_schema:   Some(closed),
+        secrets:       Vec::new(),
+    }
+}
+
+fn namespace() -> NamespaceId {
+    NamespaceId::try_new(SIMULATED_KIND).expect("a constant namespace")
+}
+
+/// One activation's sandboxes, keyed by id.
+struct SimulatedRuntime {
+    entry:     ProviderName,
+    sandboxes: Mutex<BTreeMap<SandboxId, Arc<SimulatedSandbox>>>,
+    unnamed:   AtomicU64,
+}
+
+impl SimulatedRuntime {
+    fn get(&self, id: &SandboxId) -> Result<Arc<SimulatedSandbox>, Error> {
+        self.sandboxes
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .get(id)
+            .cloned()
+            .ok_or_else(|| Error::NotFound {
+                resource: "sandbox".to_owned(),
+                id:       id.to_string(),
+            })
     }
 }
 
 #[async_trait]
-impl SandboxProvider for SimulatedProvider {
-    fn kind(&self) -> &ProviderKind {
-        &self.kind
+impl ProviderRuntime for SimulatedRuntime {
+    async fn describe(&self) -> Result<Descriptor, Error> {
+        Ok(Descriptor {
+            schemas:      schemas(),
+            namespace:    Namespace {
+                id:    namespace(),
+                scope: NamespaceScope::Process,
+            },
+            // No isolation is claimed: there is nothing to isolate.
+            isolation:    Isolation::None,
+            durability:   Durability::Process,
+            access:       AccessScope::OwnerProcess,
+            sources:      BTreeSet::from([SourceKind::HostDirectory]),
+            locality:     Locality::default(),
+            resources:    BTreeSet::new(),
+            network:      BTreeSet::from([NetworkMode::ProviderDefault]),
+            ports:        PortSupport::None,
+            capabilities: CapabilitySet::default(),
+        })
     }
 
-    fn capabilities(&self) -> &Capabilities {
-        &self.capabilities
+    async fn health(&self) -> Result<Health, Error> {
+        Ok(Health {
+            healthy: true,
+            message: None,
+        })
     }
 
     /// A sandbox named as the spec asks, at the working directory it asks
-    /// for, carrying its labels. A name already in use is taken over: a
-    /// simulated sandbox has no state to lose.
-    async fn create(
-        &self,
-        spec: &SandboxSpec,
-        _events: Option<EventContext>,
-    ) -> sandbox_driver::Result<Arc<dyn Sandbox>> {
+    /// for, carrying its labels. A name already in use is the sandbox that
+    /// holds it, as on a real provider.
+    async fn create(&self, admission: WorkloadAdmission) -> Result<Box<dyn Sandbox>, Error> {
+        let spec = admission.spec;
         let name = spec.name.clone().unwrap_or_else(|| {
             format!(
                 "{SIMULATED_KIND}-{}",
                 self.unnamed.fetch_add(1, Ordering::Relaxed)
             )
         });
-        let id = SandboxId::try_new(name.as_str())
-            .map_err(|error| Error::invalid_spec("name", error.to_string()))?;
-        let sandbox = Arc::new(SimulatedSandbox {
-            id,
-            name: name.clone(),
-            labels: spec.labels.clone(),
-            working_directory: spec
-                .working_directory
-                .clone()
-                .unwrap_or_else(|| format!("/{SIMULATED_KIND}")),
-            capabilities: self.capabilities.clone(),
-            state: Mutex::new(SandboxState::Running),
-            exec: SimulatedExec {
-                kind: self.kind.clone(),
-            },
-            fs: SimulatedFilesystem {
-                kind: self.kind.clone(),
-            },
-        });
-        self.sandboxes
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .insert(name, sandbox.clone());
-        Ok(sandbox)
-    }
-
-    async fn attach(
-        &self,
-        id: &SandboxId,
-        _events: Option<EventContext>,
-    ) -> sandbox_driver::Result<Arc<dyn Sandbox>> {
-        let sandbox = self
+        let id = SandboxId::try_new(name.as_str()).map_err(|error| Error::InvalidSpec {
+            path:    "name".to_owned(),
+            message: error.to_string(),
+        })?;
+        let mut sandboxes = self
             .sandboxes
             .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .get(id.as_str())
-            .filter(|sandbox| sandbox.state() != SandboxState::Deleted)
-            .cloned();
-        sandbox
-            .map(|sandbox| sandbox as Arc<dyn Sandbox>)
-            .ok_or_else(|| Error::NotFound {
-                resource: ResourceKind::Sandbox,
-                id:       id.as_str().to_owned(),
-            })
+            .unwrap_or_else(PoisonError::into_inner);
+        if sandboxes.contains_key(&id) {
+            return Err(Error::AlreadyExists {
+                name,
+                id: id.to_string(),
+            });
+        }
+        let sandbox = Arc::new(SimulatedSandbox {
+            reference: SandboxRef {
+                provider:  self.entry.clone(),
+                namespace: namespace(),
+                id:        id.clone(),
+            },
+            name,
+            labels: spec.labels,
+            working_directory: PathBuf::from(
+                spec.working_directory
+                    .unwrap_or_else(|| format!("/{SIMULATED_KIND}")),
+            ),
+            env: BTreeMap::new(),
+            state: Mutex::new(SandboxState::Running),
+        });
+        sandboxes.insert(id, sandbox.clone());
+        Ok(Box::new(Handle(sandbox)))
     }
 
-    async fn list(&self, filter: &SandboxFilter) -> sandbox_driver::Result<Vec<SandboxStatus>> {
-        let sandboxes: Vec<Arc<SimulatedSandbox>> = self
+    async fn attach(&self, id: &SandboxId) -> Result<Box<dyn Sandbox>, Error> {
+        Ok(Box::new(Handle(self.get(id)?)))
+    }
+
+    async fn list(&self, filter: &LabelFilter) -> Result<Vec<SandboxSummary>, Error> {
+        Ok(self
             .sandboxes
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .values()
-            .filter(|sandbox| sandbox.state() != SandboxState::Deleted)
-            .filter(|sandbox| {
-                filter
-                    .labels
-                    .iter()
-                    .all(|(key, value)| sandbox.labels.get(key) == Some(value))
+            .filter(|sandbox| filter.matches(&sandbox.labels))
+            .map(|sandbox| SandboxSummary {
+                reference: sandbox.reference.clone(),
+                name:      Some(sandbox.name.clone()),
+                state:     sandbox.state(),
+                labels:    sandbox.labels.clone(),
             })
-            .cloned()
-            .collect();
-        Ok(sandboxes.iter().map(|sandbox| sandbox.status()).collect())
+            .collect())
+    }
+
+    async fn destroy(&self, id: &SandboxId) -> Result<(), Error> {
+        self.sandboxes
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .remove(id);
+        Ok(())
+    }
+
+    async fn shutdown(&self) -> Result<(), Error> {
+        Ok(())
     }
 }
 
-/// A sandbox that is a name and a state. Its facets refuse every process
-/// and hold no file.
+/// A sandbox that is a name and a state.
 struct SimulatedSandbox {
-    id:                SandboxId,
+    reference:         SandboxRef,
     name:              String,
     labels:            BTreeMap<String, String>,
-    working_directory: String,
-    capabilities:      Capabilities,
+    working_directory: PathBuf,
+    /// Empty: no process starts here, so no variable is in force.
+    env:               BTreeMap<String, String>,
     state:             Mutex<SandboxState>,
-    exec:              SimulatedExec,
-    fs:                SimulatedFilesystem,
 }
 
 impl SimulatedSandbox {
@@ -167,215 +219,147 @@ impl SimulatedSandbox {
     fn set_state(&self, state: SandboxState) {
         *self.state.lock().unwrap_or_else(PoisonError::into_inner) = state;
     }
+}
 
-    fn status(&self) -> SandboxStatus {
-        let mut status = SandboxStatus::new(self.id.clone(), self.state());
-        status.name = Some(self.name.clone());
-        status.labels = self.labels.clone();
-        status
+/// A handle on a simulated sandbox. It refuses every process and holds no
+/// file.
+struct Handle(Arc<SimulatedSandbox>);
+
+fn refusal(what: &str) -> Error {
+    Error::Unsupported {
+        capability: format!("{what}: a simulated sandbox runs no process and holds no files"),
     }
 }
 
 #[async_trait]
-impl Sandbox for SimulatedSandbox {
-    fn id(&self) -> &SandboxId {
-        &self.id
+impl Sandbox for Handle {
+    fn reference(&self) -> SandboxRef {
+        self.0.reference.clone()
     }
 
-    fn capabilities(&self) -> &Capabilities {
-        &self.capabilities
+    fn working_directory(&self) -> &Path {
+        &self.0.working_directory
     }
 
-    async fn describe(&self) -> sandbox_driver::Result<SandboxStatus> {
-        Ok(self.status())
+    fn env(&self) -> &BTreeMap<String, String> {
+        &self.0.env
     }
 
-    fn working_directory(&self) -> &str {
-        &self.working_directory
+    async fn status(&self) -> Result<Status, Error> {
+        Ok(Status {
+            reference: self.reference(),
+            state:     self.0.state(),
+            name:      Some(self.0.name.clone()),
+            labels:    self.0.labels.clone(),
+            image:     None,
+            snapshot:  None,
+            resources: Resources::default(),
+            network:   None,
+            services:  BTreeMap::new(),
+            web_url:   None,
+        })
     }
 
-    /// Empty: no process starts here, so no variable is in force.
-    async fn environment(&self) -> sandbox_driver::Result<BTreeMap<String, String>> {
-        Ok(BTreeMap::new())
-    }
-
-    async fn platform_info(&self) -> sandbox_driver::Result<PlatformInfo> {
-        Err(self.exec.refusal("a simulated sandbox has no platform"))
-    }
-
-    async fn start(&self) -> sandbox_driver::Result<()> {
-        self.set_state(SandboxState::Running);
+    async fn start(&self) -> Result<(), Error> {
+        self.0.set_state(SandboxState::Running);
         Ok(())
     }
 
-    async fn stop(&self) -> sandbox_driver::Result<()> {
-        self.set_state(SandboxState::Stopped);
+    async fn stop(&self) -> Result<(), Error> {
+        self.0.set_state(SandboxState::Stopped);
         Ok(())
     }
 
-    async fn delete(&self) -> sandbox_driver::Result<()> {
-        self.set_state(SandboxState::Deleted);
-        Ok(())
+    async fn exec(&self, _spec: ExecSpec, _controls: ExecControls) -> Result<ExecOutcome, Error> {
+        Err(refusal("exec"))
     }
 
-    fn exec(&self) -> &dyn Exec {
-        &self.exec
+    fn files(&self) -> &dyn Files {
+        self
     }
 
-    fn fs(&self) -> &dyn Filesystem {
-        &self.fs
-    }
-}
-
-/// The exec facet: every command is refused.
-struct SimulatedExec {
-    kind: ProviderKind,
-}
-
-impl SimulatedExec {
-    fn refusal(&self, message: &str) -> Error {
-        Error::Provider(ProviderError::new(self.kind.clone(), message))
+    fn ports(&self) -> &dyn Ports {
+        self
     }
 }
 
+/// Nothing exists, and nothing can be written.
 #[async_trait]
-impl Exec for SimulatedExec {
-    async fn run(&self, _spec: &ExecSpec) -> sandbox_driver::Result<ExecResult> {
-        Err(self.refusal("a simulated sandbox runs no process"))
-    }
-
-    async fn run_streaming(
-        &self,
-        _spec: &ExecSpec,
-        _controls: ExecControls,
-    ) -> sandbox_driver::Result<ExecStreamingResult> {
-        Err(self.refusal("a simulated sandbox runs no process"))
-    }
-}
-
-/// The filesystem facet: nothing exists, and nothing can be written.
-struct SimulatedFilesystem {
-    kind: ProviderKind,
-}
-
-impl SimulatedFilesystem {
-    fn refusal(&self) -> Error {
-        Error::Provider(ProviderError::new(
-            self.kind.clone(),
-            "a simulated sandbox holds no files",
-        ))
-    }
-
-    fn not_found(path: &str) -> Error {
-        Error::NotFound {
-            resource: ResourceKind::File,
+impl Files for Handle {
+    async fn get(&self, path: &str, _range: Option<FileRange>) -> Result<ByteStream, Error> {
+        Err(Error::NotFound {
+            resource: "file".to_owned(),
             id:       path.to_owned(),
-        }
-    }
-}
-
-#[async_trait]
-impl Filesystem for SimulatedFilesystem {
-    async fn read(&self, path: &str) -> sandbox_driver::Result<Vec<u8>> {
-        Err(Self::not_found(path))
+        })
     }
 
-    async fn write(&self, _path: &str, _content: &[u8]) -> sandbox_driver::Result<()> {
-        Err(self.refusal())
+    async fn put(&self, _path: &str, _bytes: ByteStream) -> Result<(), Error> {
+        Err(refusal("files"))
     }
 
-    /// Idempotent by contract: a path that does not exist is deleted.
-    async fn delete(&self, _path: &str, _recursive: bool) -> sandbox_driver::Result<()> {
-        Ok(())
-    }
-
-    async fn exists(&self, _path: &str) -> sandbox_driver::Result<bool> {
-        Ok(false)
-    }
-
-    async fn metadata(&self, path: &str) -> sandbox_driver::Result<FileMetadata> {
-        Err(Self::not_found(path))
-    }
-
-    async fn list_dir(&self, _path: &str, _depth: usize) -> sandbox_driver::Result<Vec<DirEntry>> {
+    async fn list(&self, _path: &str, _depth: u32) -> Result<Vec<FileEntry>, Error> {
         Ok(Vec::new())
     }
+}
 
-    async fn create_dir(&self, _path: &str) -> sandbox_driver::Result<()> {
-        Err(self.refusal())
+#[async_trait]
+impl Ports for Handle {
+    async fn expose(&self, _port: NonZeroU16, _options: Expose) -> Result<Exposure, Error> {
+        Err(refusal("ports"))
     }
 
-    async fn rename(&self, from: &str, _to: &str) -> sandbox_driver::Result<()> {
-        Err(Self::not_found(from))
+    async fn release(&self, _port: NonZeroU16) -> Result<(), Error> {
+        Ok(())
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use std::path::Path;
 
-    fn spec(name: &str, workspace: &str) -> SandboxSpec {
-        SandboxSpec::new(sandbox_driver::SandboxSource::HostDirectory)
-            .name(name)
-            .working_directory(format!("/{SIMULATED_KIND}/{workspace}"))
-            .label(crate::WORKSPACE_LABEL, workspace)
-    }
+    use sandbox_driver::contract::{ExecControls, ExecSpec, LabelFilter, SandboxSpec, Source};
+
+    use crate::SandboxCatalog;
 
     #[tokio::test]
-    async fn a_created_sandbox_is_listed_by_label_and_attached_by_id_until_deleted() {
-        let provider = SimulatedProvider::new();
-        let sandbox = provider
-            .create(&spec("petri-run-l1", "run/ws"), None)
+    async fn a_created_sandbox_is_found_by_label_and_attached_until_destroyed() {
+        let sandboxes = SandboxCatalog::simulated()
+            .open()
+            .expect("the simulated catalog opens");
+        let mut spec = SandboxSpec::new(Source::HostDirectory);
+        spec.name = Some("petri-run-l1".to_owned());
+        spec.working_directory = Some("/simulated/main".to_owned());
+        spec.labels.insert("petri.run".to_owned(), "run".to_owned());
+        let sandbox = sandboxes
+            .builder(super::SIMULATED_KIND)
             .await
-            .expect("create");
-        assert_eq!(sandbox.id().as_str(), "petri-run-l1");
-        assert_eq!(sandbox.working_directory(), "/simulated/run/ws");
-        let mut filter = SandboxFilter::default();
-        filter
-            .labels
-            .insert(crate::WORKSPACE_LABEL.to_owned(), "run/ws".to_owned());
-        let listed = provider.list(&filter).await.expect("list");
-        assert_eq!(listed.len(), 1);
-        assert_eq!(listed[0].state, SandboxState::Running);
-        let attached = provider.attach(sandbox.id(), None).await.expect("attach");
-        attached.stop().await.expect("stop");
+            .expect("the environment exists")
+            .spec(spec)
+            .create()
+            .await
+            .expect("a simulated sandbox is created");
+        assert_eq!(sandbox.working_directory(), Path::new("/simulated/main"));
+        let reference = sandbox.reference();
+        let found = sandboxes
+            .find(LabelFilter::eq("petri.run", "run"))
+            .await
+            .expect("find");
         assert_eq!(
-            sandbox.describe().await.expect("describe").state,
-            SandboxState::Stopped
+            found
+                .sandboxes
+                .iter()
+                .map(|summary| summary.reference.clone())
+                .collect::<Vec<_>>(),
+            vec![reference.clone()]
         );
-        sandbox.delete().await.expect("delete");
-        assert!(provider.list(&filter).await.expect("list").is_empty());
-        assert!(matches!(
-            provider.attach(sandbox.id(), None).await,
-            Err(Error::NotFound { .. })
-        ));
-    }
-
-    #[tokio::test]
-    async fn the_facets_run_nothing_and_hold_nothing() {
-        let provider = SimulatedProvider::new();
-        let sandbox = provider
-            .create(&spec("petri-run-l2", "run/other"), None)
-            .await
-            .expect("create");
-        let run = sandbox.exec().run(&ExecSpec::new("true")).await;
         assert!(
-            run.as_ref()
-                .is_err_and(|error| error.to_string().contains("runs no process")),
-            "{run:?}"
+            sandbox
+                .exec(ExecSpec::argv(["true"]), ExecControls::default())
+                .await
+                .is_err_and(|error| error.to_string().contains("runs no process"))
         );
-        assert!(matches!(
-            sandbox.fs().read("a.txt").await,
-            Err(Error::NotFound { .. })
-        ));
-        assert!(!sandbox.fs().exists("a.txt").await.expect("exists"));
-        let write = sandbox.fs().write("a.txt", b"x").await;
-        assert!(
-            write
-                .as_ref()
-                .is_err_and(|error| error.to_string().contains("holds no files")),
-            "{write:?}"
-        );
-        assert!(sandbox.environment().await.expect("environment").is_empty());
+        sandboxes.attach(&reference).await.expect("attached");
+        sandboxes.destroy(&reference).await.expect("destroyed");
+        assert!(sandboxes.attach(&reference).await.is_err());
     }
 }

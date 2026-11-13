@@ -37,6 +37,18 @@ fn pids_matching(pattern: &str) -> Vec<i32> {
         .collect()
 }
 
+/// The pattern a sentinel's command line carries: its record paths, under
+/// the built-in Host instance that owns `sandbox` (a `host-<instance>-s<n>`
+/// id), which no other test's provider shares.
+fn sentinel_pattern(sandbox: &str) -> String {
+    let instance = sandbox
+        .strip_prefix("host-")
+        .and_then(|rest| rest.rsplit_once("-s"))
+        .map(|(instance, _)| instance)
+        .expect("a built-in Host sandbox id");
+    format!("sandbox-driver-host/{instance}/")
+}
+
 /// The `ps` state of one pid, empty when the process is fully gone.
 fn ps_state(pid: i32) -> String {
     let output = Command::new("ps")
@@ -186,8 +198,8 @@ async fn the_sentinel_pins_the_group_until_release() {
     assert!(status.is_success());
 
     // The workload is gone; the sentinel is not. Its command line names the
-    // status file under this run's unique directory.
-    let pattern = dir.path().display().to_string();
+    // status file under its provider instance's own directory.
+    let pattern = sentinel_pattern(&env.sandbox().instance);
     time::sleep(Duration::from_millis(100)).await;
     let sentinels = pids_matching(&pattern);
     assert_eq!(
@@ -243,7 +255,7 @@ async fn a_workload_that_kills_its_sentinel_cannot_free_the_group_id() {
         .expect("spawn");
 
     // Catch the sentinel's pid while it is alive, then let the murder happen.
-    let pattern = dir.path().display().to_string();
+    let pattern = sentinel_pattern(&env.sandbox().instance);
     let deadline = Instant::now() + Duration::from_secs(10);
     let sentinel = loop {
         if let Some(pid) = pids_matching(&pattern).first().copied() {

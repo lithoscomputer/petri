@@ -610,7 +610,8 @@ async fn prune_deletes_a_kept_sandbox_and_records_the_tombstone() {
         .expect("lease 0");
     assert_eq!(record.state, execution::LeaseState::Stopped);
     assert_eq!(record.provider, "docker");
-    assert!(record.resource_id.is_some() && record.fingerprint.is_some());
+    assert!(record.resource_id.is_some() && record.admission.is_some());
+    assert!(record.reference.is_some());
     drop(records);
 
     // Prune only deletes sandboxes, even when runtime retention would

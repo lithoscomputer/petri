@@ -397,23 +397,28 @@ impl LeaseLedger for ResourceLedger {
     async fn allocating(
         &self,
         lease: SandboxLeaseId,
-        provider: &str,
-        fingerprint: &str,
+        admission: &SandboxAdmission,
     ) -> Result<(), LedgerError> {
         self.update(lease, |record| {
             record.state = LeaseState::Allocating;
             record.pending = None;
-            record.provider = SmolStr::new(provider);
-            record.fingerprint = Some(SmolStr::new(fingerprint));
+            record.provider = admission.provider.clone();
+            record.admission = Some(admission.clone());
         })
         .await
     }
 
-    async fn live(&self, lease: SandboxLeaseId, resource_id: &str) -> Result<(), LedgerError> {
+    async fn live(
+        &self,
+        lease: SandboxLeaseId,
+        reference: &ir::SandboxReference,
+    ) -> Result<(), LedgerError> {
         self.update(lease, |record| {
             record.state = LeaseState::Live;
             record.pending = None;
-            record.resource_id = Some(SmolStr::new(resource_id));
+            record.provider = reference.provider.clone();
+            record.resource_id = Some(reference.id.clone());
+            record.reference = Some(reference.clone());
         })
         .await
     }

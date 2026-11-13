@@ -1,40 +1,34 @@
-//! An [`Executor`] that routes each scope to the provider its placement
-//! needs: one [`SandboxExecutor`] per provider kind, over the kind's plugin
-//! or a built-in linked into this process through [`InProcessProviders`],
-//! or over the in-process [`SimulatedProvider`] for a dry run. It is the
-//! composition the runtime registers for a run.
+//! An [`Executor`] over one run's sandbox catalog: each scope goes to the
+//! catalog environment its runtime names, through one [`SandboxExecutor`],
+//! and a process scope on a host directory gets an action host on the
+//! container environment for its Docker actions. It is the composition the
+//! runtime registers for a run.
 
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex, OnceLock, PoisonError};
-use std::time::Duration;
 
 use async_trait::async_trait;
 use executor::{
     AcquireContext, EnvError, EnvHandle, Executor, ReleaseReport, Retention, SandboxLeaseId,
     ScopeOutcome, ScopeSpec, WorkspaceId,
 };
-use ir::RuntimeTarget;
 use sandbox_driver::SandboxId;
-use tokio::fs;
-use tokio::sync::OnceCell;
+use sandbox_driver::contract::{Sandboxes, Source};
 
 use crate::actions::{ActionHost, ActionHostRunner, remove_recorded};
+use crate::catalog::Credentials;
 use crate::gate::{DRAIN_BUDGET, RunGate};
-use crate::in_process::{
-    InProcessProviders, InProcessSource, ProviderContext, ProviderFactory, ProviderNetwork,
-};
 use crate::lease::{LeaseLedger, MemoryLedger, ReconcileReport, RecordedLease};
-use crate::plugin::{FixedProvider, PluginSettings, PluginSource, ProviderSource};
 use crate::run::{RunIdentity, workspace_dir};
-use crate::simulated::{SIMULATED_KIND, SimulatedProvider};
-use crate::{SandboxBackend, SandboxExecutor, SandboxOptions, SandboxTeardown};
+use crate::simulated::SIMULATED_KIND;
+use crate::{
+    BACKEND, DOCKER_HOST_ALIAS, SandboxCatalog, SandboxExecutor, SandboxOptions, SandboxTeardown,
+    acquire_failed,
+};
 
-/// The provider kind container scopes go to.
+/// The environment container scopes go to when the options name no other.
 pub const CONTAINER_KIND: &str = "docker";
-
-/// The provider kind host-process scopes go to.
-const HOST_KIND: &str = "host";
 
 /// What ends a host scope's action host.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
@@ -43,94 +37,26 @@ enum ActionOwner {
     Scope(ir::ScopeId),
 }
 
-/// How one provider kind is reached.
-#[derive(Clone)]
-pub(crate) enum ProviderTransport {
-    /// A built-in provider linked into this process.
-    Linked(Arc<dyn ProviderFactory>),
-    /// The kind's plugin, configured from this process's environment on
-    /// first use.
-    EnvPlugin,
-}
-
-/// The provider kinds a router can reach, and how. A kind with no entry
-/// fails routably at acquire; nothing is launched in its place.
-#[derive(Clone, Default)]
-pub(crate) struct ProviderRegistrations {
-    entries: BTreeMap<String, ProviderTransport>,
-}
-
-impl ProviderRegistrations {
-    /// Standalone Petri's: the Host, Docker, and Daytona plugins, each
-    /// configured from the environment when first used.
-    fn standalone() -> Self {
-        Self {
-            entries: [HOST_KIND, CONTAINER_KIND, "daytona"]
-                .into_iter()
-                .map(|kind| (kind.to_owned(), ProviderTransport::EnvPlugin))
-                .collect(),
-        }
-    }
-
-    /// Only the built-in providers linked in `providers`: a kind with no
-    /// factory has no entry, so no plugin is launched in its place.
-    pub(crate) fn linked(providers: InProcessProviders) -> Self {
-        Self {
-            entries: providers
-                .into_factories()
-                .into_iter()
-                .map(|(kind, factory)| (kind, ProviderTransport::Linked(factory)))
-                .collect(),
-        }
-    }
-
-    pub(crate) fn get(&self, kind: &str) -> Result<&ProviderTransport, String> {
-        self.entries.get(kind).ok_or_else(|| {
-            format!(
-                "the {kind} provider is not configured for this run, and no provider plugin is \
-                 launched in its place"
-            )
-        })
-    }
-}
-
-/// One provider kind as this run reaches it: its executor, and how its
-/// sandboxes reach this machine.
-struct Bound {
-    executor: Arc<SandboxExecutor>,
-    network:  ProviderNetwork,
-}
-
-type Slot = Arc<OnceCell<Result<Arc<Bound>, String>>>;
-
-/// Routes scopes to one [`SandboxExecutor`] per provider kind.
+/// Routes scopes to the environments of one sandbox catalog.
 ///
-/// A host-process scope runs as real processes on this machine, with the
-/// sentinel and crash fence a bare process needs; a container scope runs on
-/// the Docker provider, reached through its plugin. Each provider is
-/// reached on the first scope that needs it, so a host-only run never
-/// touches a daemon, and a scope whose provider cannot be reached fails
-/// routably at acquire. A lease recorded earlier goes back to the provider
-/// its record names, whatever backend the run is configured for now.
-///
-/// With [`RoutingExecutor::with_in_process`], the same routes go to the
-/// built-in providers linked into this process instead of their plugins,
-/// and no plugin is launched.
+/// Every scope goes through one [`SandboxExecutor`] over the run's catalog;
+/// which provider an environment reaches is the catalog's. The catalog is
+/// opened on the first scope that needs it, after the coordinator sets the
+/// ledger, and a provider is activated on the first sandbox it serves, so a
+/// host-only run never touches a daemon. A lease recorded earlier goes back
+/// to the entry its reference names, whatever environment the run is
+/// configured with now.
 ///
 /// A [`RoutingExecutor::simulated`] router is a dry run's: every scope,
 /// whatever its target and whatever backend the options name, is acquired
-/// on the [`SimulatedProvider`], and no plugin is ever launched. A lease
-/// another provider holds (a real run resumed as a dry run) is left where
-/// it is and reported, never touched.
+/// on the simulated provider. A lease another provider holds (a real run
+/// resumed as a dry run) is left where it is and reported, never touched.
 pub struct RoutingExecutor {
-    providers:    ProviderRegistrations,
-    /// A source a caller handed in, serving every kind but Host: tests
-    /// over a fake or fixed provider, and a dry run's simulated provider.
-    fixed:        Option<Arc<dyn ProviderSource>>,
-    /// One executor per provider kind, built on first use. A configuration
-    /// error is remembered: every scope on that kind then fails routably
+    catalog:      Result<SandboxCatalog, String>,
+    /// The run's open catalog and executor, built on first use. A
+    /// configuration error is remembered: every scope then fails routably
     /// with it.
-    bound:        Mutex<BTreeMap<String, Slot>>,
+    open:         OnceLock<Result<Arc<SandboxExecutor>, String>>,
     /// The action hosts of host scopes, each keyed by what ends it: the
     /// lease that owns it, or the scope itself when no coordinator named one.
     action_hosts: Mutex<BTreeMap<(ActionOwner, WorkspaceId), Arc<ActionHost>>>,
@@ -146,93 +72,70 @@ pub struct RoutingExecutor {
 }
 
 impl RoutingExecutor {
-    /// Host and Docker plugins, launched on first use. The standard runtime's
-    /// default.
+    /// The catalog the default options describe: Host for process scopes,
+    /// Docker for container scopes. The standard runtime's default.
     pub fn local(run_dir: impl Into<PathBuf>, retention: Retention) -> Self {
         Self::with_options(run_dir, retention, SandboxOptions::default())
     }
 
-    /// [`RoutingExecutor::local`] with the plugin dev-mode decision made by
-    /// the caller (the CLI's `--sandbox-plugin-dev`).
-    pub fn local_with_dev(run_dir: impl Into<PathBuf>, retention: Retention, dev: bool) -> Self {
-        Self::with_options(run_dir, retention, SandboxOptions {
-            plugin_dev: Some(dev),
-            ..Default::default()
-        })
-    }
-
+    /// The catalog `options` name: its catalog file, or the built-in
+    /// environments its backend describes.
     pub fn with_options(
         run_dir: impl Into<PathBuf>,
         retention: Retention,
         options: SandboxOptions,
     ) -> Self {
-        let mut router = Self::over(run_dir, retention, None);
-        router.options = options;
-        router
+        let catalog = match &options.catalog {
+            Some(path) => SandboxCatalog::from_file(path),
+            None => SandboxCatalog::from_options(&options),
+        };
+        Self::over(catalog, run_dir, retention, options)
     }
 
-    /// A router whose container scopes go to `source`: tests over a fake
-    /// or fixed provider.
-    pub fn with_provider_source(
-        source: Arc<dyn ProviderSource>,
+    /// A router over an application's own catalog: its entries,
+    /// environments, providers, and credential store.
+    pub fn with_catalog(
+        catalog: SandboxCatalog,
         run_dir: impl Into<PathBuf>,
         retention: Retention,
+        options: SandboxOptions,
     ) -> Self {
-        Self::over(run_dir, retention, Some(source))
+        Self::over(Ok(catalog), run_dir, retention, options)
     }
 
-    /// A router over a fixed in-process provider, for tests.
-    pub fn with_provider(
-        provider: Arc<dyn sandbox_driver::SandboxProvider>,
-        run_dir: impl Into<PathBuf>,
-        retention: Retention,
-    ) -> Self {
-        Self::with_provider_source(Arc::new(FixedProvider::new(provider)), run_dir, retention)
-    }
-
-    /// A dry run's router: every scope is acquired on the
-    /// [`SimulatedProvider`], and no plugin is launched. The sandbox options
-    /// a run would place scopes with do not apply, and neither does its
-    /// retention: there is nothing to place and nothing to keep, so every
-    /// lease is recorded deleted when it is released.
+    /// A dry run's router: every scope is acquired on the simulated
+    /// provider. The sandbox options a run would place scopes with do not
+    /// apply, and neither does its retention: there is nothing to place and
+    /// nothing to keep, so every lease is recorded deleted when it is
+    /// released.
     pub fn simulated(run_dir: impl Into<PathBuf>) -> Self {
-        let provider: Arc<dyn sandbox_driver::SandboxProvider> = Arc::new(SimulatedProvider::new());
-        let source: Arc<dyn ProviderSource> = Arc::new(FixedProvider::new(provider));
-        let mut router = Self::over(run_dir, Retention::Never, Some(source));
+        let mut router = Self::over(
+            Ok(SandboxCatalog::simulated()),
+            run_dir,
+            Retention::Never,
+            SandboxOptions::default(),
+        );
         router.simulated = true;
         router
     }
 
     fn over(
+        catalog: Result<SandboxCatalog, String>,
         run_dir: impl Into<PathBuf>,
         retention: Retention,
-        fixed: Option<Arc<dyn ProviderSource>>,
+        options: SandboxOptions,
     ) -> Self {
-        let run_dir = run_dir.into();
         Self {
-            providers: ProviderRegistrations::standalone(),
-            fixed,
-            bound: Mutex::new(BTreeMap::new()),
+            catalog,
+            open: OnceLock::new(),
             action_hosts: Mutex::new(BTreeMap::new()),
             ledger: OnceLock::new(),
-            identity: Arc::new(RunIdentity::for_run_dir(run_dir)),
+            identity: Arc::new(RunIdentity::for_run_dir(run_dir.into())),
             retention,
-            options: SandboxOptions::default(),
+            options,
             simulated: false,
             gate: RunGate::default(),
         }
-    }
-
-    /// Reach Host, Docker, and Daytona through the built-in providers in
-    /// `providers` instead of their plugins. A kind with no factory fails
-    /// routably at acquire; no plugin is launched in its place. A router
-    /// over a supplied source keeps that source for its container scopes
-    /// and still takes its Host scopes here; a simulated router reaches no
-    /// provider at all.
-    #[must_use]
-    pub fn with_in_process(mut self, providers: InProcessProviders) -> Self {
-        self.providers = ProviderRegistrations::linked(providers);
-        self
     }
 
     /// Name the run on its providers: the run's store key, so a resume
@@ -247,9 +150,9 @@ impl RoutingExecutor {
         self
     }
 
-    /// The durable ledger container leases are recorded in. A coordinator
-    /// sets it before the first container scope; without one, leases live
-    /// in memory and sandboxes end with their scopes.
+    /// The durable ledger leases are recorded in. A coordinator sets it
+    /// before the first scope; without one, leases live in memory and
+    /// sandboxes end with their scopes.
     pub fn set_ledger(&self, ledger: Arc<dyn LeaseLedger>) {
         let _ = self.ledger.set(ledger);
     }
@@ -258,245 +161,82 @@ impl RoutingExecutor {
         &self.identity
     }
 
-    /// Close the run's access to its sandboxes, then stop the providers
-    /// this router created, after its run's leases settle. Environments
-    /// handed out earlier refuse new work from here on. A supplied container
-    /// source belongs to its caller and can be shared. Durable sandbox
-    /// records and retained workspaces remain available.
+    /// Close the run's access to its sandboxes, then shut down the
+    /// providers this router activated, after its run's admitted operations
+    /// settle. Environments handed out earlier refuse new work from here
+    /// on. Durable sandboxes and retained workspaces remain.
     pub async fn shutdown(&self) {
-        let fixed_kind = self.fixed.as_ref().map(|source| source.kind().to_owned());
-        let bound: Vec<(String, Arc<Bound>)> = self
-            .bound
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .iter()
-            .filter_map(|(kind, slot)| {
-                let bound = slot.get()?.as_ref().ok()?;
-                Some((kind.clone(), bound.clone()))
-            })
-            .collect();
-        // A plugin's closing transport ends its in-flight work; any other
-        // source needs admitted work to settle first.
-        let settles = bound
-            .iter()
-            .any(|(_, bound)| !bound.executor.manager().source().ends_work_on_shutdown());
-        let budget = if settles {
-            DRAIN_BUDGET
-        } else {
-            Duration::ZERO
-        };
-        if !self.gate.close(budget).await && !budget.is_zero() {
+        if !self.gate.close(DRAIN_BUDGET).await {
             tracing::warn!(
                 budget_secs = DRAIN_BUDGET.as_secs(),
                 "sandbox operations were still running when the run closed its sandboxes"
             );
         }
-        for (kind, bound) in bound {
-            if fixed_kind.as_deref() == Some(kind.as_str()) {
-                continue;
-            }
-            bound.executor.manager().source().shutdown().await;
+        let Some(Ok(executor)) = self.open.get() else {
+            return;
+        };
+        if let Err(error) = executor.manager().sandboxes().clone().shutdown().await {
+            tracing::warn!(error = %error, "shutting down the run's sandbox providers failed");
         }
     }
 
-    /// Provider identity for the lease reservation, before resource creation.
+    /// The environment a scope's lease is reserved on, before resource
+    /// creation. The lease's record names the entry once it is admitted.
     pub fn provider_kind_for(&self, runtime: &ir::RuntimeSpec) -> &str {
-        if !self.simulated
-            && self.options.backend == SandboxBackend::Host
-            && matches!(runtime.target, RuntimeTarget::HostProcess)
-        {
-            return HOST_KIND;
-        }
-        self.default_kind()
-    }
-
-    /// The kind a scope goes to when it is not a host-process scope on the
-    /// Host backend, and the kind a lease with no recorded provider is
-    /// looked for on.
-    fn default_kind(&self) -> &str {
         if self.simulated {
-            return SIMULATED_KIND;
-        }
-        match &self.fixed {
-            Some(source) => source.kind(),
-            None => match self.options.backend {
-                SandboxBackend::Host | SandboxBackend::Docker => CONTAINER_KIND,
-                SandboxBackend::Daytona => "daytona",
-            },
-        }
-    }
-
-    /// The kind `kind` is served under: a supplied source serves every
-    /// kind but Host, under its own name.
-    fn route<'a>(&'a self, kind: &'a str) -> &'a str {
-        match &self.fixed {
-            Some(source) if kind != HOST_KIND => source.kind(),
-            _ => kind,
-        }
-    }
-
-    /// `kind`'s executor for this run, built on first use.
-    async fn bound(&self, kind: &str) -> Result<Arc<Bound>, String> {
-        let kind = self.route(kind);
-        let slot = self
-            .bound
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .entry(kind.to_owned())
-            .or_default()
-            .clone();
-        slot.get_or_init(|| self.bind(kind)).await.clone()
-    }
-
-    async fn executor(&self, kind: &str) -> Result<Arc<Bound>, EnvError> {
-        self.bound(kind)
-            .await
-            .map_err(|message| EnvError::backend(self.route(kind), "configure", message))
-    }
-
-    /// The executor for `kind` if this run has built it; nothing is built
-    /// to answer.
-    fn built(&self, kind: &str) -> Option<Arc<Bound>> {
-        self.bound
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .get(self.route(kind))?
-            .get()?
-            .as_ref()
-            .ok()
-            .cloned()
-    }
-
-    /// Builds `kind`'s source and executor. Nothing here contacts a
-    /// provider: the source connects on its first call.
-    async fn bind(&self, kind: &str) -> Result<Arc<Bound>, String> {
-        let ledger = self
-            .ledger
-            .get()
-            .cloned()
-            .unwrap_or_else(|| Arc::new(MemoryLedger::default()) as Arc<dyn LeaseLedger>);
-        if let Some(source) = &self.fixed
-            && kind != HOST_KIND
-            && kind == source.kind()
-        {
-            if self.simulated {
-                // A simulated sandbox offers no route to this machine and
-                // mounts no workspace: nothing runs in it.
-                let executor =
-                    SandboxExecutor::simulated(source.clone(), ledger, Arc::clone(&self.identity))
-                        .with_gate(self.gate.clone());
-                return Ok(Arc::new(Bound {
-                    executor: Arc::new(executor),
-                    network:  ProviderNetwork::from_parts(Ok(None), false),
-                }));
-            }
-            let network =
-                ProviderNetwork::from_parts(Ok(Some(crate::DOCKER_HOST_ALIAS.to_owned())), true);
-            return Ok(Arc::new(Bound {
-                executor: Arc::new(self.executor_over(source.clone(), ledger, &network)?),
-                network,
-            }));
-        }
-        if self.simulated {
-            return Err(format!(
-                "a dry run launches no provider plugin; a lease the {kind} provider holds is left \
-                 as recorded"
-            ));
-        }
-        let transport = self.providers.get(kind)?;
-        let host_registry = if kind == HOST_KIND {
-            let directory = self.identity.run_dir().join("host-registry");
-            fs::create_dir_all(&directory)
-                .await
-                .map_err(|error| error.to_string())?;
-            Some(
-                fs::canonicalize(directory)
-                    .await
-                    .map_err(|error| error.to_string())?,
-            )
+            SIMULATED_KIND
         } else {
-            None
-        };
-        let (source, network): (Arc<dyn ProviderSource>, ProviderNetwork) = match transport {
-            ProviderTransport::Linked(factory) => {
-                let network = factory.network();
-                let context = ProviderContext::new(
-                    self.identity.run_id(),
-                    self.identity.run_dir(),
-                    host_registry,
-                );
-                (
-                    Arc::new(InProcessSource::new(factory.clone(), context)),
-                    network,
-                )
-            }
-            ProviderTransport::EnvPlugin => {
-                let settings = PluginSettings::from_env(kind, self.options.plugin_dev)
+            self.options.environment_for(runtime)
+        }
+    }
+
+    /// The run's executor over its open catalog, built on first use.
+    fn executor(&self) -> Result<&Arc<SandboxExecutor>, EnvError> {
+        self.open
+            .get_or_init(|| {
+                let catalog = self.catalog.clone()?;
+                let credentials = Arc::new(Credentials::default());
+                let sandboxes = catalog
+                    .open_with(credentials.clone())
                     .map_err(|error| error.to_string())?;
-                if let Some(directory) = host_registry {
-                    (
-                        Arc::new(PluginSource::new(settings.with_host_registry(&directory))),
-                        ProviderNetwork::from_parts(Ok(Some("127.0.0.1".to_owned())), false),
-                    )
+                let ledger =
+                    self.ledger.get().cloned().unwrap_or_else(|| {
+                        Arc::new(MemoryLedger::default()) as Arc<dyn LeaseLedger>
+                    });
+                let executor = SandboxExecutor::new(
+                    sandboxes,
+                    credentials,
+                    ledger,
+                    Arc::clone(&self.identity),
+                    self.retention,
+                    self.options.clone(),
+                )
+                .with_host_addresses(catalog.host_addresses().clone())
+                .with_gate(self.gate.clone());
+                Ok(Arc::new(if self.simulated {
+                    executor.simulated()
                 } else {
-                    let network = ProviderNetwork::from_parts(
-                        settings.host_address().map_err(|error| error.to_string()),
-                        settings.supports_host_workspace(),
-                    );
-                    (Arc::new(PluginSource::new(settings)), network)
-                }
-            }
-        };
-        Ok(Arc::new(Bound {
-            executor: Arc::new(self.executor_over(source, ledger, &network)?),
-            network,
-        }))
+                    executor
+                }))
+            })
+            .as_ref()
+            .map_err(|message| EnvError::backend(BACKEND, "configure", message.clone()))
     }
 
-    fn executor_over(
-        &self,
-        source: Arc<dyn ProviderSource>,
-        ledger: Arc<dyn LeaseLedger>,
-        network: &ProviderNetwork,
-    ) -> Result<SandboxExecutor, String> {
-        Ok(SandboxExecutor::new(
-            source,
-            ledger,
-            Arc::clone(&self.identity),
-            self.retention,
-            network.host_address()?,
-            self.options.clone(),
-        )
-        .with_gate(self.gate.clone()))
+    fn sandboxes(&self) -> Result<&Sandboxes, EnvError> {
+        Ok(self.executor()?.manager().sandboxes())
     }
 
-    /// The provider kind a lease is recorded on, when the ledger knows it.
-    async fn recorded_provider(&self, lease: SandboxLeaseId) -> Result<Option<String>, EnvError> {
+    /// Whether `lease` was simulated by a dry run, by its record.
+    async fn simulated_lease(&self, lease: SandboxLeaseId) -> Result<bool, EnvError> {
         let Some(ledger) = self.ledger.get() else {
-            return Ok(None);
+            return Ok(false);
         };
         let record = ledger
             .lookup(lease)
             .await
-            .map_err(|e| EnvError::backend("sandbox", "lookup", e.to_string()))?;
-        Ok(record.and_then(|record| record.provider.map(|provider| provider.to_string())))
-    }
-
-    /// The executor of the provider `lease` is recorded on; the run's
-    /// default kind when no record names one.
-    async fn executor_for_record(&self, lease: SandboxLeaseId) -> Result<Arc<Bound>, EnvError> {
-        let kind = self.recorded_provider(lease).await?;
-        let kind = kind.as_deref().unwrap_or_else(|| self.default_kind());
-        // A dry run's lease under a real router: no provider holds it, so
-        // no plugin is launched to look for it.
-        if kind == SIMULATED_KIND && !self.simulated {
-            return Err(EnvError::backend(
-                SIMULATED_KIND,
-                "lookup",
-                format!("lease {lease} was simulated by a dry run; no provider holds it"),
-            ));
-        }
-        self.executor(kind).await
+            .map_err(|e| EnvError::backend(BACKEND, "lookup", e.to_string()))?;
+        Ok(record.is_some_and(|record| record.provider.as_deref() == Some(SIMULATED_KIND)))
     }
 
     /// The name prefix every sandbox this run owns starts with,
@@ -505,25 +245,25 @@ impl RoutingExecutor {
         self.identity.container_prefix()
     }
 
-    async fn action_host(
+    /// The action host of a host scope's workspace. Nothing here contacts
+    /// a provider: the container environment is checked, and its entry
+    /// activated, when the first action runs.
+    fn action_host(
         &self,
         owner: ActionOwner,
         scope: &ScopeSpec,
     ) -> Result<Arc<ActionHost>, EnvError> {
-        let container = self.executor(CONTAINER_KIND).await?;
-        if !container.network.supports_host_workspace() {
-            return Err(EnvError::backend(
-                CONTAINER_KIND,
-                "one-shot",
-                "Docker actions in Host jobs require a local Docker daemon to mount their workspace; \
-                 use --backend docker for a remote daemon",
-            ));
-        }
-        let host_address = container
-            .network
-            .host_address()
-            .map_err(|message| EnvError::backend(CONTAINER_KIND, "configure", message))?
-            .ok_or(EnvError::HostUnreachable)?;
+        let sandboxes = self.sandboxes()?;
+        let environment = self.options.container_environment();
+        // The action host binds this machine's workspace, so it is on a
+        // local daemon and reaches this machine through the host alias,
+        // unless the operator named another route.
+        let host_address = self
+            .catalog
+            .as_ref()
+            .ok()
+            .and_then(|catalog| catalog.host_addresses().get(environment).cloned().flatten())
+            .unwrap_or_else(|| DOCKER_HOST_ALIAS.to_owned());
         let key = (owner, scope.workspace_id.clone());
         let mut hosts = self
             .action_hosts
@@ -533,11 +273,12 @@ impl RoutingExecutor {
             .entry(key)
             .or_insert_with(|| {
                 Arc::new(ActionHost::new(
-                    container.executor.manager().source().clone(),
+                    sandboxes.clone(),
+                    self.options.container_environment().to_owned(),
                     self.identity.clone(),
                     workspace_dir(self.identity.run_dir(), scope.workspace_id.as_str()),
                     scope.workspace_id.as_str().to_owned(),
-                    host_address,
+                    host_address.clone(),
                 ))
             })
             .clone())
@@ -587,88 +328,72 @@ impl RoutingExecutor {
             // owning lease intact so release or prune can retry safely.
             return report;
         }
-        match self.executor_for_record(lease).await {
-            Ok(bound) => {
-                let ended = bound
-                    .executor
+        match self.leased(lease).await {
+            Ok(executor) => {
+                let ended = executor
                     .manager()
                     .release_lease(lease, self.retention, outcome)
                     .await;
                 report.merge(ended);
             }
             Err(error) => {
-                report = report.problem(format!(
-                    "no container executor to release lease {lease}: {error}"
-                ));
+                report = report.problem(format!("no executor to release lease {lease}: {error}"));
             }
         }
         report
+    }
+
+    /// The executor for a recorded lease; refused for a dry run's lease
+    /// under a real router, since no provider holds it.
+    async fn leased(&self, lease: SandboxLeaseId) -> Result<&Arc<SandboxExecutor>, EnvError> {
+        if !self.simulated && self.simulated_lease(lease).await? {
+            return Err(EnvError::backend(
+                SIMULATED_KIND,
+                "lookup",
+                format!("lease {lease} was simulated by a dry run; no provider holds it"),
+            ));
+        }
+        self.executor()
     }
 
     /// Reconcile the run's recorded leases with their providers before any
     /// create: the takeover step a coordinator runs when it opens a stored
-    /// run for writing. Each lease goes to the provider its record names; a
-    /// provider with no lease recorded on it is not launched.
+    /// run for writing. Each lease goes to the entry its record names.
     pub async fn reconcile(&self, leases: &[RecordedLease]) -> ReconcileReport {
-        let mut report = ReconcileReport::default();
-        let mut groups: BTreeMap<String, Vec<RecordedLease>> = BTreeMap::new();
-        for recorded in leases {
-            match self.recorded_provider(recorded.lease).await {
-                Ok(kind) => groups
-                    .entry(kind.unwrap_or_else(|| self.default_kind().to_owned()))
-                    .or_default()
-                    .push(recorded.clone()),
-                Err(error) => report.problems.push(error.to_string()),
-            }
+        match self.executor() {
+            Ok(executor) => executor.manager().reconcile(leases).await,
+            Err(error) => ReconcileReport {
+                problems: vec![format!("no executor to reconcile with: {error}")],
+                ..ReconcileReport::default()
+            },
         }
-        for (kind, group) in groups {
-            match self.executor(&kind).await {
-                Ok(bound) => report.merge(bound.executor.manager().reconcile(&group).await),
-                Err(error) => report
-                    .problems
-                    .push(format!("no {kind} executor to reconcile with: {error}")),
-            }
-        }
-        report
     }
 
     /// Deletes a recorded lease's sandbox with no live handle: prune.
-    /// `workspace_id` is the lease's workspace, the reconcile key for a
-    /// record that never learned its resource id.
+    /// `workspace_id` is the lease's workspace, whose action host, if a
+    /// marker records one, goes first.
     pub async fn delete_recorded(
         &self,
         lease: SandboxLeaseId,
         workspace_id: &str,
     ) -> Result<Vec<SandboxId>, EnvError> {
-        if !self.simulated
-            && self.recorded_provider(lease).await?.as_deref() == Some(SIMULATED_KIND)
-        {
+        if !self.simulated && self.simulated_lease(lease).await? {
             // A dry run's lease: nothing was ever on a provider.
             return Ok(Vec::new());
         }
-        let bound = self.executor_for_record(lease).await?;
-        // An action host has its own marker and Docker resource. Remove it
-        // before the Host provider deletes the workspace, even if an earlier
-        // cleanup left a tombstone for the Host lease itself.
-        // The container provider is only needed when a marker says one
-        // created an action host.
-        let mut deleted = if bound.executor.manager().source().kind() == HOST_KIND {
-            let container = self.bound(CONTAINER_KIND).await;
-            let source = container
-                .as_ref()
-                .map(|container| &**container.executor.manager().source())
-                .map_err(|message| EnvError::backend(CONTAINER_KIND, "configure", message.clone()));
-            remove_recorded(source, &self.identity, workspace_id, None).await?
-        } else {
-            Vec::new()
-        };
-        deleted.extend(
-            bound
-                .executor
-                .manager()
-                .delete_recorded(lease, workspace_id)
-                .await?,
-        );
+        let executor = self.executor()?;
+        // An action host has its own marker and sandbox. Remove it before
+        // the lease's own sandbox and workspace go, even if an earlier
+        // cleanup left a tombstone for the lease itself. A workspace that
+        // never ran an action has no marker, and nothing is contacted.
+        let mut deleted = remove_recorded(
+            executor.manager().sandboxes(),
+            &self.identity,
+            workspace_id,
+            None,
+        )
+        .await?;
+        deleted.extend(executor.manager().delete_recorded(lease).await?);
         Ok(deleted)
     }
 }
@@ -680,28 +405,30 @@ impl Executor for RoutingExecutor {
         scope: &ScopeSpec,
         ctx: &AcquireContext,
     ) -> Result<EnvHandle, EnvError> {
-        let kind = self.provider_kind_for(&scope.runtime);
-        if kind != HOST_KIND {
-            return self
-                .executor(kind)
-                .await?
-                .executor
-                .acquire(scope, ctx)
-                .await;
+        let executor = self.executor()?;
+        if self.simulated {
+            return executor.acquire(scope, ctx).await;
+        }
+        // A process scope on a host directory runs its Docker actions on an
+        // action host; every other scope runs them on its own sandbox.
+        let environment = executor.environment_for(&scope.runtime);
+        let template = executor
+            .manager()
+            .sandboxes()
+            .environment(environment)
+            .await
+            .map_err(|error| acquire_failed(&error))?;
+        if template.spec.source != Source::HostDirectory {
+            return executor.acquire(scope, ctx).await;
         }
         let owner = ctx
             .lease()
             .map_or(ActionOwner::Scope(scope.id), ActionOwner::Lease);
-        let action_host = self.action_host(owner, scope).await;
+        let action_host = self.action_host(owner, scope);
         if let Ok(host) = &action_host {
             host.prepare().await;
         }
-        let handle = self
-            .executor(HOST_KIND)
-            .await?
-            .executor
-            .acquire(scope, ctx)
-            .await?;
+        let handle = executor.acquire(scope, ctx).await?;
         Ok(handle.with_runner(Arc::new(ActionHostRunner::new(
             action_host,
             scope,
@@ -709,14 +436,13 @@ impl Executor for RoutingExecutor {
         ))))
     }
 
-    /// Release goes back to the provider whose teardown record the handle
-    /// carries: the handle itself says which acquired it.
     async fn release(&self, env: EnvHandle, outcome: ScopeOutcome) -> ReleaseReport {
         let Some(teardown) = env.teardown::<SandboxTeardown>() else {
             return ReleaseReport::default()
                 .problem("no backend of this router acquired this environment");
         };
-        let Some(bound) = self.built(&teardown.provider) else {
+        let lease = teardown.lease;
+        let Some(Ok(executor)) = self.open.get() else {
             return ReleaseReport::default()
                 .problem("the environment has no executor to release it");
         };
@@ -726,14 +452,10 @@ impl Executor for RoutingExecutor {
         if !ended.is_clean() {
             // End the holder but retain its workspace while an action host
             // can still mount it. A later acquire/release can retry cleanup.
-            bound
-                .executor
-                .manager()
-                .release_holder(teardown.lease)
-                .await;
+            executor.manager().release_holder(lease).await;
             return ended;
         }
-        let mut report = bound.executor.release(env, outcome).await;
+        let mut report = executor.release(env, outcome).await;
         report.merge(ended);
         report
     }

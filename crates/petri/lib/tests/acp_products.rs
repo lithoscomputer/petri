@@ -9,7 +9,7 @@
 //! `PATH` and its credential is set, or fails instead when
 //! `PETRI_REQUIRE_ACP_PRODUCTS` is set. The container cells build the
 //! `petri-acp-products` image once (both products over `node:22`) and skip
-//! without the Docker plugin or a daemon.
+//! without a Docker daemon.
 //!
 //! Each cell runs a one-stage workflow that asks the agent to create a
 //! file, checks the file from a command node in the same scope (so the host
@@ -22,7 +22,6 @@
 //! written and that the block is on the stream.
 
 use std::collections::BTreeMap;
-use std::path::PathBuf;
 use std::process::Stdio;
 use std::time::Duration;
 use std::{env, fs};
@@ -442,10 +441,6 @@ fn host_dir(label: &str) -> RunDir {
     RunDir::new(&format!("acp-products-{label}"))
 }
 
-fn plugin_path() -> Option<PathBuf> {
-    env::var_os("PETRI_SANDBOX_DOCKER_PLUGIN").map(PathBuf::from)
-}
-
 #[tokio::test]
 #[ignore = "live: needs `claude-code-acp` on PATH and ANTHROPIC_API_KEY"]
 async fn claude_code_writes_a_file_on_the_host_and_a_hook_blocks_it() {
@@ -475,12 +470,12 @@ async fn gemini_cli_writes_a_file_on_the_host_and_a_hook_blocks_it() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-#[ignore = "live: needs ANTHROPIC_API_KEY, the Docker plugin and a daemon"]
+#[ignore = "live: needs ANTHROPIC_API_KEY and a Docker daemon"]
 async fn claude_code_writes_a_file_in_a_container() {
     let Some(credential) = CLAUDE.require(true) else {
         return;
     };
-    if plugin_path().is_none() || product_image().await.is_none() {
+    if product_image().await.is_none() {
         return;
     }
     let dir = host_dir("claude-docker");
@@ -489,12 +484,12 @@ async fn claude_code_writes_a_file_in_a_container() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-#[ignore = "live: needs GEMINI_API_KEY, the Docker plugin and a daemon"]
+#[ignore = "live: needs GEMINI_API_KEY and a Docker daemon"]
 async fn gemini_cli_writes_a_file_in_a_container() {
     let Some(credential) = GEMINI.require(true) else {
         return;
     };
-    if plugin_path().is_none() || product_image().await.is_none() {
+    if product_image().await.is_none() {
         return;
     }
     let dir = host_dir("gemini-docker");

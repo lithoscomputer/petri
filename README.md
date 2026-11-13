@@ -7,7 +7,6 @@ A Rust workflow engine for running CI and AI agent workflows, embedded in your a
 
 ```sh
 cargo install --locked --git https://github.com/lithoscomputer/petri --branch main petri-cli
-cargo install --locked --git https://github.com/lithoscomputer/sandbox-driver --rev 691cb4e5b8425434c1fe24becc47962a4fae9ce4 sandbox-driver-host
 ```
 
 Save this as `hello.yml`:
@@ -23,7 +22,7 @@ nodes:
 ```
 
 ```sh
-petri run hello.yml --run-dir petri-run --sandbox-plugin-dev
+petri run hello.yml --run-dir petri-run
 petri inspect --run-dir petri-run
 ```
 
@@ -38,9 +37,8 @@ execution 0 (invocation 0, index 0): finished log 16 records replay verified
 
 Part of [Lithos](#part-of-lithos), a family of Rust building blocks for AI tools.
 
-Petri runs every command through a sandbox plugin, a separate executable.
-The host plugin runs commands on your machine.
-`--sandbox-plugin-dev` lets a source-built binary launch the plugin you installed; see [Install](#install).
+Petri runs every command through [sandbox-driver](https://github.com/lithoscomputer/sandbox-driver)'s providers, built into the binary.
+The Host provider runs commands on your machine.
 `petri inspect` replays the run's event log and checks that replay produces the same records.
 
 ## Why does this exist?
@@ -65,7 +63,7 @@ If you only need to run GitHub Actions locally, act may fit better.
 - Runs supported GitHub Actions jobs, actions, matrices, and reusable workflows.
 - Runs [Attractor](https://github.com/lithoscomputer/petri/blob/main/crates/attractor/FORMAT.md) agent workflows written as Graphviz DOT graphs.
 - Reads the settings of [Fabro](https://fabro.sh), a tool that runs AI coding agents through workflow graphs, including models, environments, and hooks.
-- Executes commands on the host, in Docker, or in [Daytona](https://www.daytona.io/) cloud sandboxes through provider plugins.
+- Executes commands on the host, in Docker, or in [Daytona](https://www.daytona.io/) cloud sandboxes through sandbox-driver's built-in providers.
 - Records runs for inspection, replay, and recovery after a process exits unexpectedly.
 - Exposes events, human questions, secrets, and lifecycle hooks to an embedding application.
 
@@ -93,12 +91,10 @@ The [architecture guide](https://github.com/lithoscomputer/petri/blob/main/docs/
 
 ### Install
 
-The commands at the top install the CLI and the host plugin.
-They build from Petri's lockfile, and the plugin revision matches it.
+The command at the top installs the CLI from Petri's lockfile.
+The Host, Docker, and Daytona providers are built in; there is nothing else to install.
 Keep Cargo's binary directory on `PATH`.
 
-Source-built binaries have no bundled plugin digests, so they need `--sandbox-plugin-dev` to launch plugins.
-See the [CLI guide](https://github.com/lithoscomputer/petri/blob/main/docs/cli.md#source-installation) for the Docker and Daytona plugins.
 Docker workflows also need a running Docker daemon.
 Agent workflows read model credentials such as `ANTHROPIC_API_KEY` and `OPENAI_API_KEY`.
 
@@ -108,7 +104,7 @@ From the root of a Git repository:
 
 ```sh
 petri check .github/workflows/ci.yml
-petri run .github/workflows/ci.yml --run-dir ../petri-ci-run --sandbox-plugin-dev
+petri run .github/workflows/ci.yml --run-dir ../petri-ci-run
 ```
 
 `actions/checkout` copies your working tree, including uncommitted changes, into the run's workspace.
@@ -131,7 +127,7 @@ digraph haiku {
 
 ```sh
 export ANTHROPIC_API_KEY=...
-petri run haiku.dot --run-dir haiku-run --sandbox-plugin-dev
+petri run haiku.dot --run-dir haiku-run
 ```
 
 The `write` node runs an agent, and the CLI prints its reply.
@@ -147,8 +143,7 @@ cargo add tokio --features macros,rt-multi-thread
 ```
 
 Your project's `Cargo.lock` picks its own sandbox-driver commit, which can differ from Petri's.
-Install the host plugin at the commit after `#` on the `sandbox-driver` source line in your `Cargo.lock`.
-Reinstall it when `cargo update` moves that commit.
+The built-in providers come from that commit.
 
 Run a workflow:
 
@@ -201,7 +196,7 @@ Build the API documentation in your project with `cargo doc --open -p petri`.
 
 ## Running workflows you did not write
 
-- The host plugin does not isolate commands. They run as your user, with your files and network.
+- The Host provider does not isolate commands. They run as your user, with your files and network.
 - Use `--backend docker` or `--backend daytona` for workflows you have not read.
 - GitHub Actions steps such as `actions/github-script` and `gh` use `GITHUB_TOKEN` or your `gh` login when present. A local run can comment, tag, or release, as the workflow says.
 - Unset `GITHUB_TOKEN`, or use a fine-grained read-only token.

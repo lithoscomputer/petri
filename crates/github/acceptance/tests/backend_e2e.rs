@@ -6,10 +6,9 @@
 mod support;
 
 use std::env;
-use std::sync::Arc;
 
 use acceptance::runs::RUNNER_IMAGE_2404;
-use executor_sandbox::{MemoryLedger, PluginSettings, PluginSource, RunIdentity, SandboxExecutor};
+use executor_sandbox::{RoutingExecutor, SandboxCatalog};
 use runtime::executor::Retention;
 use runtime::ir::RunStatus;
 use runtime::{DaytonaResources, DaytonaSandboxKind, SandboxBackend, SandboxOptions};
@@ -105,19 +104,16 @@ async fn ordinary_actions_run_without_advertising_an_unreachable_results_service
         return;
     }
     let dir = RunDir::new("actions-without-callback");
-    let executor = SandboxExecutor::new(
-        Arc::new(PluginSource::new(
-            PluginSettings::from_env("docker", Some(true)).unwrap(),
-        )),
-        Arc::new(MemoryLedger::default()),
-        Arc::new(RunIdentity::for_run_dir(dir.path().to_path_buf())),
-        Retention::Never,
-        None,
-        SandboxOptions {
-            backend: SandboxBackend::Docker,
-            ..Default::default()
-        },
-    );
+    let options = SandboxOptions {
+        backend: SandboxBackend::Docker,
+        ..Default::default()
+    };
+    // No route back to this machine: the sandbox cannot reach a results
+    // service, so none may be advertised.
+    let catalog = SandboxCatalog::from_options(&options)
+        .expect("catalog")
+        .with_host_address("docker", None);
+    let executor = RoutingExecutor::with_catalog(catalog, dir.path(), Retention::Never, options);
     let rt = with_object_service(runtime(dir.path()).executor(executor), None);
     let report = rt
         .run(with_params(lower_ok(&workflow(true))))

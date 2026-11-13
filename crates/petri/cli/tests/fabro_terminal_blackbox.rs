@@ -661,7 +661,7 @@ async fn a_daytona_run_keeps_its_sandbox_after_success_and_prune_removes_it() {
     if !support::fabro::require::daytona().await {
         return;
     }
-    let observer = testkit::DaytonaObserver::from_env().await;
+    let observer = testkit::DaytonaObserver::from_env();
     let case = Case::new("daytona-success").daytona();
     let workflow = case.workflow(DOCKER_WORKFLOW, None);
     let finished = case.run(&workflow, &[]).await;
@@ -701,9 +701,13 @@ async fn a_daytona_run_keeps_its_sandbox_after_success_and_prune_removes_it() {
         .sandbox(&run_id, 0)
         .await
         .expect("the VM is retained on the account");
-    assert_eq!(status.id.as_str(), id, "the reported id is the provider's");
+    assert_eq!(
+        status.reference.id.as_str(),
+        id,
+        "the reported id is the provider's"
+    );
     assert!(
-        observer.is_stopped(&run_id, 0).await,
+        observer.eventually_stopped(&run_id, 0).await,
         "the retained VM is stopped: {status:?}"
     );
     finished.assert_no_leaked_processes().await;
@@ -715,7 +719,7 @@ async fn a_daytona_run_keeps_its_sandbox_after_success_and_prune_removes_it() {
         "{stderr}"
     );
     assert!(
-        observer.sandboxes(&run_id).await.is_empty(),
+        observer.eventually_gone(&run_id).await.is_empty(),
         "prune removed the VM: {stderr}"
     );
     observer.shutdown().await;
