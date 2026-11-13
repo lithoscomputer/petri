@@ -84,6 +84,11 @@ executor-sandbox = { package = "petri-executor-sandbox", path = "crates/core/exe
 # the two together, point these at the sibling checkout with a `[patch]`
 # section in a local, untracked Cargo config, and move `Cargo.lock` forward
 # once the matching sandbox-driver commit is on `main`.
+# Cargo.lock holds these at tag v2 (0a07380), the last sandbox-driver with the
+# old API, while its main becomes new-API-only. Do not `cargo update` them, and
+# keep `branch = "main"` so Fabro's and Pebble's declarations stay the same
+# source. Lift the pin when Petri, Fabro, and Pebble move to the new API
+# together; see .github/workflows/internal-deps.yml.
 sandbox-driver = { git = "https://github.com/lithoscomputer/sandbox-driver.git", branch = "main" }
 sandbox-driver-protocol = { git = "https://github.com/lithoscomputer/sandbox-driver.git", branch = "main" }
 sandbox-driver-docker-config = { git = "https://github.com/lithoscomputer/sandbox-driver.git", branch = "main" }
