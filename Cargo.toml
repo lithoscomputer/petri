@@ -26,6 +26,12 @@ members = [
     "crates/petri/cli",
 ]
 
+# sandbox-driver hashes plugin binaries during metadata discovery; unoptimized
+# sha2 can outlast the discovery timeout in debug builds. Profiles apply only
+# from the root manifest, so the driver's own override does not reach here.
+[profile.dev.package.sha2]
+opt-level = 3
+
 [workspace.package]
 version = "0.1.0"
 edition = "2024"
