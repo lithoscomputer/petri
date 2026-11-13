@@ -36,6 +36,7 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex, PoisonError};
 
 use executor::{EnvError, ReleaseReport, Retention, SandboxLeaseId, ScopeOutcome};
+use ir::SandboxReference;
 use sandbox_driver::{
     Error as DriverError, Sandbox, SandboxFilter, SandboxId, SandboxProvider, SandboxSpec,
 };
@@ -72,7 +73,7 @@ pub enum PendingIntent {
 }
 
 /// The durable facts about one lease the manager reads and writes.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct LeaseRecord {
     pub state:       LeaseState,
     pub pending:     Option<PendingIntent>,
@@ -80,8 +81,27 @@ pub struct LeaseRecord {
     pub provider:    Option<SmolStr>,
     /// The provider's resource id, once known.
     pub resource_id: Option<SmolStr>,
-    /// The non-secret provider fingerprint recorded at allocation.
+    /// The non-secret provider fingerprint a lease allocated before the
+    /// shared sandbox API recorded. Read, never written.
     pub fingerprint: Option<SmolStr>,
+    /// Where the lease's sandbox is admitted, written before the create.
+    pub admission:   Option<SandboxAdmission>,
+    /// The sandbox's durable reference, once it exists.
+    pub reference:   Option<SandboxReference>,
+}
+
+/// What a lease's sandbox was admitted as, recorded before the provider is
+/// asked to create it: the provider entry and the namespace it reported, the
+/// catalog environment the template came from, and the resolved spec. A
+/// recovery uses these, never the catalog's current state, so an edited
+/// environment cannot redirect a lease.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct SandboxAdmission {
+    pub provider:    SmolStr,
+    pub namespace:   SmolStr,
+    pub environment: SmolStr,
+    /// The resolved `SandboxSpec`, as its JSON encoding.
+    pub spec:        serde_json::Value,
 }
 
 /// Why a ledger operation failed.
@@ -139,6 +159,8 @@ impl MemoryLedger {
             provider:    None,
             resource_id: None,
             fingerprint: None,
+            admission:   None,
+            reference:   None,
         });
         update(record);
     }

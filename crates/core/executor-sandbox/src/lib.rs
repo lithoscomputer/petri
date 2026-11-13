@@ -72,7 +72,7 @@ pub use crate::in_process::{
 };
 pub use crate::lease::{
     LeaseLedger, LeaseRecord, LeaseState, LedgerError, MemoryLedger, PendingIntent,
-    ReconcileReport, RecordedLease, SandboxLeaseManager,
+    ReconcileReport, RecordedLease, SandboxAdmission, SandboxLeaseManager,
 };
 pub use crate::plugin::{FixedProvider, PluginError, PluginSettings, PluginSource, ProviderSource};
 pub use crate::routing::{CONTAINER_KIND, RoutingExecutor};
@@ -318,6 +318,7 @@ impl SandboxExecutor {
             image:             image.map(SmolStr::new),
             snapshot:          snapshot.map(SmolStr::new),
             working_directory: SmolStr::new(workspace),
+            reference:         None,
         }
     }
 

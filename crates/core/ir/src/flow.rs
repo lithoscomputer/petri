@@ -353,7 +353,9 @@ impl FailureInfo {
 /// host needs to reach the same sandbox again after the run.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SandboxInstance {
-    /// The provider kind: `host`, `docker`, `daytona`, or a plugin's kind.
+    /// The provider entry the sandbox was created through, as the run's
+    /// sandbox catalog names it. Records written before the shared sandbox
+    /// API name a provider kind here instead: `host`, `docker`, `daytona`.
     pub provider:          SmolStr,
     /// The provider's id for the sandbox: a container id, a remote sandbox
     /// id, the host provider's registry id.
@@ -368,6 +370,22 @@ pub struct SandboxInstance {
     /// The directory commands run in by default: the scope's workspace as
     /// the sandbox sees it.
     pub working_directory: SmolStr,
+    /// The sandbox's durable reference: how a host reaches it again. Absent
+    /// on records written before the shared sandbox API; those sandboxes
+    /// are found by their run label and `instance`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reference:         Option<SandboxReference>,
+}
+
+/// A sandbox's durable identity under the shared sandbox API: the provider
+/// entry it was created through, the namespace that entry reported, and the
+/// provider's id for it. Hosts store it and derive nothing from it; a
+/// changed namespace means the entry now reaches a different backend.
+#[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct SandboxReference {
+    pub provider:  SmolStr,
+    pub namespace: SmolStr,
+    pub id:        SmolStr,
 }
 
 /// Counters reported by a step. Free-form so step kinds can add their own.
