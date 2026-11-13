@@ -229,25 +229,16 @@ crate dependencies consistent with the layering rules described there.
 The routine suite runs without Docker or the corpus. It reports skips when those
 resources are absent.
 
-Container scopes run through the `sandbox-driver-docker` plugin. `mise run
-plugins:build` installs it from the sandbox-driver commit `Cargo.lock` locks, under
-`target/plugins/bin`; the test tasks depend on it and set
-`PETRI_SANDBOX_DOCKER_PLUGIN` to that path. `mise run plugins:build:daytona`
-adds the `sandbox-driver-daytona` plugin for the live Daytona tier
-(`SANDBOX_DRIVER_PLUGINS` names the kinds the script installs). To test against
-another build of a plugin, set the variable yourself. A plugin this build does
-not embed runs only in dev mode, which debug builds turn on; a release build needs
-`PETRI_SANDBOX_PLUGIN_DEV=1` or `--sandbox-plugin-dev`.
+Sandboxes come from sandbox-driver's shared API (`contract::Sandboxes`). Host,
+Docker and Daytona are built-in providers linked into Petri
+(`SandboxCatalog::builtin_registry`), so no plugin is built or launched.
+Without a catalog file (`--sandbox-catalog`), the `--backend` options become one
+provider entry and one environment per backend, configured from `DOCKER_HOST`
+and the `DAYTONA_*` variables. Docker tests skip when no daemon is reachable.
 
-To build plugins from the sibling sandbox-driver checkout during coordinated
-development, use:
-
-```sh
-SANDBOX_DRIVER_SOURCE=../sandbox-driver mise run plugins:build
-```
-
-Both local and locked Git builds install the provider packages directly.
-Each package builds its same-named plugin executable.
+During coordinated development, test against a sibling sandbox-driver checkout
+with a Cargo `[patch]` for its crates in a local `.cargo/config.toml`; restore
+`Cargo.lock` to the locked git revision before committing.
 
 Nextest is the normal test runner. `mise run test` also uses Cargo to run
 doctests, which Nextest does not run.
@@ -273,11 +264,9 @@ path or to the locked sandbox-driver commit lands:
 DAYTONA_API_KEY=... mise run test:daytona
 ```
 
-The task installs the Daytona plugin beside the others (`mise run
-plugins:build:daytona`, which sets `PETRI_SANDBOX_DAYTONA_PLUGIN`), sets
-`PETRI_REQUIRE_DAYTONA=1`, and runs every test whose binary or name says
-`daytona`. `DAYTONA_TARGET`, `DAYTONA_ORGANIZATION_ID` and `DAYTONA_API_URL`
-are forwarded to the plugin when set. The tier creates billable sandboxes,
+The task sets `PETRI_REQUIRE_DAYTONA=1` and runs every test whose binary or
+name says `daytona`. `DAYTONA_TARGET`, `DAYTONA_ORGANIZATION_ID` and
+`DAYTONA_API_URL` configure the built-in Daytona provider's entry when set. The tier creates billable sandboxes,
 about fourteen VMs, and the first run on an account builds the shared runner
 snapshot, which can take fifteen minutes. Without the variable the same tests
 skip with a notice, which is what `mise run test` does.

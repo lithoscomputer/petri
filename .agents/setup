@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Prepare an Amp orb: the locked mise tools, the Rust style guide, a warm
-# Cargo build of the routine test suite, the sandbox plugins, Docker, and
+# Cargo build of the routine test suite, Docker, and
 # the review bundle's Python requirements. Amp runs this on fresh orbs and
 # again on stale snapshots, so every step skips work that is already done.
 set -euo pipefail
@@ -104,7 +104,6 @@ setup_python() {
 }
 step "python requirements" setup_python
 
-step "sandbox plugins" mise run plugins:build
 
 # Compile what `mise run test` runs, with its profile, so the first test run
 # in an orb only builds what changed.

@@ -89,12 +89,6 @@ jobs:
         if: matrix.docker == 'required'
         run: docker pull alpine:3.20
 
-      # Container scopes reach Docker through the sandbox-driver plugin, built
-      # from the commit Cargo.lock locks. A separate step, so a plugin
-      # build failure reads as one.
-      - name: Build the sandbox plugins
-        run: mise run plugins:build
-
       - name: Verify routine changes
         id: verify
         run: mise run check
@@ -228,9 +222,6 @@ jobs:
           echo "fabro binary ready in $((SECONDS - started)) s"
         env:
           PETRI_REQUIRE_FABRO_BINARY: '1'
-
-      - name: Build the sandbox plugins
-        run: mise run plugins:build
 
       - name: Run the comparison matrix
         id: matrix

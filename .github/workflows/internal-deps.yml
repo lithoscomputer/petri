@@ -166,11 +166,6 @@ jobs:
         if: steps.update.outputs.changed == 'true'
         run: docker pull alpine:3.20
 
-      # Built from the sandbox-driver commit the updated Cargo.lock locks.
-      - name: Build the sandbox plugins
-        if: steps.update.outputs.changed == 'true'
-        run: mise run plugins:build
-
       - name: Lint
         if: steps.update.outputs.changed == 'true'
         run: mise run lint
