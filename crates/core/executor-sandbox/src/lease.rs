@@ -22,7 +22,8 @@
 //! error, never a silent replacement, because its workspace was lost. A
 //! provider whose sandboxes last only as long as their owner process
 //! (`Durability::Process`, built-in Host) is the exception: its sandbox is
-//! created again from the admitted spec, over the same workspace.
+//! created again from the admitted spec, provided its designated workspace
+//! still exists or the run permits replacing lost workspaces.
 //!
 //! A lease recorded before the shared sandbox API names a provider kind and
 //! the provider's id, with no reference. Its sandbox is found by the run's
@@ -440,8 +441,25 @@ impl SandboxLeaseManager {
                     return Err(deleted_lease(lease));
                 }
                 let process = self.process_durable(&record).await?;
+                // The admitted spec, never the catalog's current template:
+                // a process-durable sandbox comes back over the same
+                // workspace, and a lost create is retried as admitted.
+                let prepared = match &record.admission {
+                    Some(admission) => self.readmit(admission).await?,
+                    None => prepare(labels).await?,
+                };
+                let workspace_lost = if process {
+                    match self.designated(prepared.builder.resolved_spec()) {
+                        Some(directory) => !fs::try_exists(&directory).await.map_err(|error| {
+                            EnvError::workspace("inspect", directory.display(), error)
+                        })?,
+                        None => false,
+                    }
+                } else {
+                    true
+                };
                 if record.state != LeaseState::Allocating
-                    && !process
+                    && workspace_lost
                     && self.lost_sandbox == LostSandbox::Refuse
                 {
                     return Err(EnvError::backend(
@@ -455,7 +473,7 @@ impl SandboxLeaseManager {
                         ),
                     ));
                 }
-                if record.state != LeaseState::Allocating && !process {
+                if record.state != LeaseState::Allocating && workspace_lost {
                     tracing::warn!(
                         lease = lease.raw(),
                         state = ?record.state,
@@ -463,13 +481,6 @@ impl SandboxLeaseManager {
                          fresh one with an empty workspace"
                     );
                 }
-                // The admitted spec, never the catalog's current template:
-                // a process-durable sandbox comes back over the same
-                // workspace, and a lost create is retried as admitted.
-                let prepared = match &record.admission {
-                    Some(admission) => self.readmit(admission).await?,
-                    None => prepare(labels).await?,
-                };
                 return self.create(&request, prepared, slot).await;
             }
         };

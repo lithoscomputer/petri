@@ -1,12 +1,19 @@
 //! The Host plugin: spawn, output, exit status, environment, and the
 //! cancellation ladder, with no daemon.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::Duration;
 
-use executor::{AcquireContext, Executor, ProcessSpec, ScopeOutcome, ScopeSpec, Sig};
-use executor_sandbox::HostExecutor;
+use executor::{
+    AcquireContext, Executor, ProcessSpec, Retention, SandboxLeaseId, ScopeOutcome, ScopeSpec, Sig,
+};
+use executor_sandbox::{
+    HostExecutor, LeaseLedger, LeaseState, LostSandbox, MemoryLedger, RoutingExecutor,
+    SandboxOptions,
+};
 use testkit::RunDir;
+use tokio::fs;
 use tokio::time::timeout;
 
 fn scope() -> ScopeSpec {
@@ -157,4 +164,81 @@ async fn the_workspace_is_written_and_read() {
         .expect("read missing");
     assert_eq!(missing, None);
     executor.release(handle, ScopeOutcome::Succeeded).await;
+}
+
+#[tokio::test]
+async fn a_resumed_host_lease_applies_the_lost_workspace_policy() {
+    for (state, missing, policy) in [
+        (LeaseState::Live, true, LostSandbox::Refuse),
+        (LeaseState::Stopped, true, LostSandbox::Refuse),
+        (LeaseState::Live, true, LostSandbox::Replace),
+        (LeaseState::Live, false, LostSandbox::Refuse),
+        (LeaseState::Allocating, true, LostSandbox::Refuse),
+    ] {
+        let dir = RunDir::new("host-lost-workspace");
+        let ledger = Arc::new(MemoryLedger::default());
+        let lease = SandboxLeaseId::new(0);
+        let ctx = AcquireContext::bare().with_lease(lease);
+        let first = RoutingExecutor::local(dir.path(), Retention::Always);
+        first.set_ledger(ledger.clone());
+        let handle = first.acquire(&scope(), &ctx).await.unwrap();
+        let workspace = PathBuf::from(handle.exec().workspace_path());
+        fs::write(workspace.join("kept"), b"original")
+            .await
+            .unwrap();
+        assert!(
+            first
+                .release(handle, ScopeOutcome::Succeeded)
+                .await
+                .is_clean()
+        );
+        first.shutdown().await;
+        match state {
+            LeaseState::Allocating => {
+                let admission = ledger
+                    .lookup(lease)
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .admission
+                    .unwrap();
+                ledger.allocating(lease, &admission).await.unwrap();
+            }
+            LeaseState::Stopped => ledger.stopped(lease).await.unwrap(),
+            _ => {}
+        }
+        if missing {
+            fs::remove_dir_all(&workspace).await.unwrap();
+        }
+
+        let resumed =
+            RoutingExecutor::with_options(dir.path(), Retention::Always, SandboxOptions {
+                lost_sandbox: policy,
+                ..SandboxOptions::default()
+            });
+        resumed.set_ledger(ledger.clone());
+        let result = resumed.acquire(&scope(), &ctx).await;
+        if missing && state != LeaseState::Allocating && policy == LostSandbox::Refuse {
+            assert!(
+                !workspace.exists(),
+                "a refused resume must not recreate the workspace"
+            );
+            let error = result.expect_err("the lost workspace is refused");
+            assert!(error.to_string().contains("workspace was lost"), "{error}");
+            assert_eq!(ledger.lookup(lease).await.unwrap().unwrap().state, state);
+        } else {
+            let handle = result.expect("an intact workspace or permitted create resumes");
+            assert!(workspace.is_dir());
+            if !missing {
+                assert_eq!(fs::read(workspace.join("kept")).await.unwrap(), b"original");
+            }
+            assert!(
+                resumed
+                    .release(handle, ScopeOutcome::Succeeded)
+                    .await
+                    .is_clean()
+            );
+        }
+        resumed.shutdown().await;
+    }
 }
