@@ -83,6 +83,24 @@ impl SandboxCatalog {
         self
     }
 
+    /// Replace or add provider entry `name`, preserving its environments.
+    /// Use this to override built-in entry configuration that
+    /// [`Self::from_options`] read from the process environment.
+    #[must_use]
+    pub fn with_provider(mut self, name: ProviderName, entry: ProviderEntry) -> Self {
+        Arc::make_mut(&mut self.0).providers.insert(name, entry);
+        self
+    }
+
+    /// Replace the catalog's secret resolver, for example with an
+    /// application's vault instead of the process environment used by
+    /// [`Self::from_options`]. There is no fallback to the previous resolver.
+    #[must_use]
+    pub fn with_secrets(mut self, secrets: Arc<dyn SecretResolver>) -> Self {
+        Arc::make_mut(&mut self.0).secrets = secrets;
+        self
+    }
+
     /// The host addresses configured per environment.
     pub(crate) fn host_addresses(&self) -> &BTreeMap<String, Option<String>> {
         &self.0.host_addresses
@@ -391,4 +409,75 @@ pub(crate) async fn find(sandboxes: &Sandboxes, filter: LabelFilter) -> Result<F
                 outcome: MutationOutcome::NotStarted,
             })
         })
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use async_trait::async_trait;
+    use sandbox_driver::{Error, NetworkPolicy, ProviderEntry, ProviderName, SecretResolver};
+
+    use super::SandboxCatalog;
+    use crate::{DaytonaResources, SandboxOptions};
+
+    struct Secrets(Option<&'static str>);
+
+    #[async_trait]
+    impl SecretResolver for Secrets {
+        async fn resolve(&self, _: &str) -> Result<Option<String>, Error> {
+            Ok(self.0.map(str::to_owned))
+        }
+    }
+
+    #[tokio::test]
+    async fn application_overrides_preserve_environments_and_do_not_change_clones() {
+        let options = SandboxOptions {
+            network: NetworkPolicy::Block,
+            daytona_resources: DaytonaResources {
+                cpu_cores: 4,
+                memory_mb: 8192,
+                disk_mb:   Some(16384),
+            },
+            ..SandboxOptions::default()
+        };
+        let original = SandboxCatalog::from_options(&options).unwrap();
+        let host: ProviderEntry = serde_json::from_value(serde_json::json!({
+            "plugin": "host", "secrets": ["CATALOG_TEST_KEY"]
+        }))
+        .unwrap();
+        let overridden = original
+            .clone()
+            .with_provider(ProviderName::try_new("docker").unwrap(), host.clone())
+            .with_provider(ProviderName::try_new("extra").unwrap(), host)
+            .with_secrets(Arc::new(Secrets(Some("application-value"))));
+        let missing = overridden
+            .clone()
+            .with_secrets(Arc::new(Secrets(None)))
+            .open()
+            .unwrap();
+        let original = original.open().unwrap();
+        let overridden = overridden.open().unwrap();
+
+        assert!(original.provider("extra").is_err());
+        for name in ["host", "docker", "daytona"] {
+            assert_eq!(
+                serde_json::to_value(original.environment(name).await.unwrap()).unwrap(),
+                serde_json::to_value(overridden.environment(name).await.unwrap()).unwrap(),
+                "provider overrides must retain {name}'s image and run options"
+            );
+        }
+        for name in ["docker", "extra"] {
+            let descriptor = overridden.provider(name).unwrap().describe().await.unwrap();
+            assert_eq!(descriptor.schemas.kind.as_str(), "host");
+        }
+        assert!(matches!(
+            missing.provider("docker").unwrap().describe().await,
+            Err(Error::MissingSecret { name, .. }) if name == "CATALOG_TEST_KEY"
+        ));
+
+        missing.shutdown().await.unwrap();
+        overridden.shutdown().await.unwrap();
+        original.shutdown().await.unwrap();
+    }
 }
