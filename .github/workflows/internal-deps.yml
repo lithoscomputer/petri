@@ -165,8 +165,8 @@ jobs:
           fi
 
       # The rest mirrors the Linux half of the routine CI job, so the new lock
-      # meets the same test suite: the corpus, the vendored bundles, Docker,
-      # and the sandbox plugins, all required. It runs the lint, the tests, and
+      # meets the same test suite: the corpus, the vendored bundles and Docker,
+      # all required. It runs the lint, the tests, and
       # the compiler floor, not the whole `mise run check`: the release build
       # and the repository checks do not depend on the lock.
       - name: Fetch the corpus
