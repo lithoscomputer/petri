@@ -47,10 +47,9 @@ use std::sync::{Arc, Mutex, PoisonError};
 
 use executor::{EnvError, ReleaseReport, Retention, SandboxLeaseId, ScopeOutcome};
 use ir::SandboxReference;
-use sandbox_driver::SandboxId;
-use sandbox_driver::contract::{
+use sandbox_driver::{
     Descriptor, Durability, Error as DriverError, LabelFilter, NamespaceId, ProviderName, Sandbox,
-    SandboxBuilder, SandboxRef, SandboxSpec, Sandboxes, Source,
+    SandboxBuilder, SandboxId, SandboxRef, SandboxSpec, Sandboxes, Source,
 };
 use serde::{Deserialize, Serialize};
 use smol_str::SmolStr;

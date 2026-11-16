@@ -9,7 +9,7 @@ use std::str::FromStr;
 
 use executor::EnvError;
 use ir::RuntimeSpec;
-use sandbox_driver::contract::{NetworkPolicy, Resources};
+use sandbox_driver::{NetworkPolicy, Resources};
 
 const RUNNER_PIN: &str = "f8bbbfd81934";
 const DEFAULT_LABEL: &str = "ubuntu-24.04";

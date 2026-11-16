@@ -26,7 +26,7 @@ use executor::{
 use executor_sandbox::{
     DaytonaResources, RoutingExecutor, SandboxBackend, SandboxCatalog, SandboxOptions,
 };
-use sandbox_driver::contract::{
+use sandbox_driver::{
     Environment, EnvironmentName, Error, ProviderEntry, ProviderName, SandboxSpec, SandboxState,
     SecretResolver, Source, StaticEnvironments,
 };

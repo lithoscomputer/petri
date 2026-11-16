@@ -17,7 +17,7 @@ use driver::ExecutionReport;
 use executor::Retention;
 use executor_sandbox::{LEASE_LABEL, RUN_LABEL, SandboxBackend, SandboxCatalog, SandboxOptions};
 use ir::{Graph, GraphBuilder, NodeId, ScopeId, StepRef, Value};
-use sandbox_driver::contract::{LabelFilter, SandboxState, SandboxSummary, Sandboxes, Status};
+use sandbox_driver::{LabelFilter, SandboxState, SandboxSummary, Sandboxes, Status};
 use serde::Deserialize;
 use serde_json::json;
 use steps::PROCESS_KIND;

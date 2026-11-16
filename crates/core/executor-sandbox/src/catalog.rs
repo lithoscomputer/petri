@@ -20,11 +20,10 @@ use std::sync::{Arc, Mutex, PoisonError};
 use std::{env, fs};
 
 use async_trait::async_trait;
-use sandbox_driver::ProviderKind;
-use sandbox_driver::contract::{
+use sandbox_driver::{
     CatalogOptions, Environment, EnvironmentName, EnvironmentSource, Error, Found, LabelFilter,
-    MutationOutcome, ProviderEntry, ProviderFactory, ProviderName, Registry, SandboxSpec,
-    Sandboxes, SecretResolver, Source, StaticEnvironments, Timers,
+    MutationOutcome, ProviderEntry, ProviderFactory, ProviderKind, ProviderName, Registry,
+    SandboxSpec, Sandboxes, SecretResolver, Source, StaticEnvironments, Timers,
 };
 use serde::Deserialize;
 use tokio::runtime::Handle;

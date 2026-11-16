@@ -27,16 +27,15 @@ use std::time::Duration;
 use async_trait::async_trait;
 use executor::ExitStatus;
 use executor_sandbox::{LEASE_LABEL, LeaseState, PendingIntent, SandboxCatalog};
-use sandbox_driver::contract::{
+use sandbox_driver::{
     AccessScope, Activation, ByteStream, CapabilitySet, ContainerField, Descriptor, Durability,
     Environment, EnvironmentName, Error, ExecControls, ExecOutcome, ExecSpec, Expose, Exposure,
-    FileEntry, FileRange, Files, Health, LabelFilter, Locality, MutationOutcome, Namespace,
-    NamespaceId, NamespaceScope, NetworkMode, OutputStream, PluginLocation, PortSupport, Ports,
-    ProviderEntry, ProviderFactory, ProviderName, ProviderRuntime, ProviderSchemas, Registry,
-    Resources, Sandbox, SandboxRef, SandboxSpec, SandboxState, SandboxSummary, SecretResolver,
-    Source, SourceKind, StaticEnvironments, Status, Termination, WorkloadAdmission,
+    FileEntry, FileRange, Files, Health, Isolation, LabelFilter, Locality, MutationOutcome,
+    Namespace, NamespaceId, NamespaceScope, NetworkMode, OutputStream, PluginLocation, PortSupport,
+    Ports, Provider, ProviderEntry, ProviderFactory, ProviderKind, ProviderName, ProviderSchemas,
+    Registry, Resources, Sandbox, SandboxId, SandboxRef, SandboxSpec, SandboxState, SandboxSummary,
+    SecretResolver, Source, SourceKind, StaticEnvironments, Status, Termination, WorkloadAdmission,
 };
-use sandbox_driver::{Isolation, ProviderKind, SandboxId};
 use smol_str::SmolStr;
 use tokio::sync::Notify;
 use tokio::time;
@@ -255,7 +254,7 @@ impl ProviderFactory for WorldFactory {
         Ok(schemas())
     }
 
-    async fn activate(&self, activation: Activation) -> Result<Arc<dyn ProviderRuntime>, Error> {
+    async fn activate(&self, activation: Activation) -> Result<Arc<dyn Provider>, Error> {
         Ok(Arc::new(WorldProvider {
             world:    Arc::clone(&self.world),
             lifetime: self.lifetime,
@@ -499,7 +498,7 @@ impl WorldProvider {
 }
 
 #[async_trait]
-impl ProviderRuntime for WorldProvider {
+impl Provider for WorldProvider {
     async fn describe(&self) -> Result<Descriptor, Error> {
         Ok(Descriptor {
             schemas:      schemas(),

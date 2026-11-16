@@ -10,7 +10,7 @@
 //! Host execution.
 //!
 //! Host, Docker and Daytona are built-in providers linked into this crate and
-//! registered with [`sandbox_driver::contract::Registry::builtin`]
+//! registered with [`sandbox_driver::Registry::builtin`]
 //! ([`SandboxCatalog::builtin_registry`]); none is launched as a plugin. A
 //! dry run acquires every scope on the simulated provider, which creates
 //! nothing and runs nothing.
@@ -37,11 +37,10 @@ use executor::{
     ScopeOutcome, ScopeSpec,
 };
 use ir::{RuntimeTarget, SandboxInstance};
-use sandbox_driver::contract::{
-    ContainerSpec, Descriptor, Error as DriverError, NetworkPolicy, ProviderName, ReadinessCheck,
-    Sandbox, SandboxSpec, Sandboxes, ServiceSpec, Source,
+use sandbox_driver::{
+    ContainerSpec, Descriptor, Error as DriverError, Isolation, NetworkPolicy, ProviderName,
+    ReadinessCheck, Sandbox, SandboxSpec, Sandboxes, ServiceSpec, Source, WorkspaceOwnership,
 };
-use sandbox_driver::{Isolation, WorkspaceOwnership};
 use smol_str::SmolStr;
 
 pub use crate::backend::{

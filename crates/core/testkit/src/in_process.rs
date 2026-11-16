@@ -7,10 +7,9 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 
 use async_trait::async_trait;
 use executor_sandbox::SandboxCatalog;
-use sandbox_driver::ProviderKind;
-use sandbox_driver::contract::{
-    Activation, Environment, EnvironmentName, Error, MutationOutcome, PluginLocation,
-    ProviderEntry, ProviderFactory, ProviderName, ProviderRuntime, ProviderSchemas, Registry,
+use sandbox_driver::{
+    Activation, Environment, EnvironmentName, Error, MutationOutcome, PluginLocation, Provider,
+    ProviderEntry, ProviderFactory, ProviderKind, ProviderName, ProviderSchemas, Registry,
     SandboxSpec, SecretResolver, Source, StaticEnvironments,
 };
 
@@ -33,7 +32,7 @@ impl ProviderFactory for HostFactory {
         sandbox_driver_host::HostFactory.discover(location).await
     }
 
-    async fn activate(&self, activation: Activation) -> Result<Arc<dyn ProviderRuntime>, Error> {
+    async fn activate(&self, activation: Activation) -> Result<Arc<dyn Provider>, Error> {
         self.connects.fetch_add(1, Ordering::SeqCst);
         sandbox_driver_host::HostFactory.activate(activation).await
     }
@@ -72,7 +71,7 @@ impl ProviderFactory for UnusedFactory {
         })
     }
 
-    async fn activate(&self, _: Activation) -> Result<Arc<dyn ProviderRuntime>, Error> {
+    async fn activate(&self, _: Activation) -> Result<Arc<dyn Provider>, Error> {
         unreachable!("discovery refuses first")
     }
 }

@@ -15,10 +15,9 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use executor::{ContainerRunner, EnvError, OneShotContainer, ProcessHandle, ScopeSpec};
-use sandbox_driver::SandboxId;
-use sandbox_driver::contract::{
+use sandbox_driver::{
     ContainerSpec, Error as DriverError, LabelFilter, NamespaceId, ProviderName, Sandbox,
-    SandboxRef, Sandboxes, Source,
+    SandboxId, SandboxRef, Sandboxes, Source,
 };
 use serde::{Deserialize, Serialize};
 use smol_str::SmolStr;

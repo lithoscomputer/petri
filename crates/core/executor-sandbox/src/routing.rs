@@ -13,8 +13,7 @@ use executor::{
     AcquireContext, EnvError, EnvHandle, Executor, ReleaseReport, Retention, SandboxLeaseId,
     ScopeOutcome, ScopeSpec, WorkspaceId,
 };
-use sandbox_driver::SandboxId;
-use sandbox_driver::contract::{Sandboxes, Source};
+use sandbox_driver::{SandboxId, Sandboxes, Source};
 
 use crate::actions::{ActionHost, ActionHostRunner, remove_recorded};
 use crate::catalog::Credentials;

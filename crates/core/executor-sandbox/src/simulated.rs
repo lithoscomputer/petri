@@ -21,15 +21,14 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 
 use async_trait::async_trait;
-use sandbox_driver::contract::{
+use sandbox_driver::{
     AccessScope, Activation, ByteStream, CapabilitySet, Descriptor, Durability, Error,
     ExecControls, ExecOutcome, ExecSpec, Expose, Exposure, FileEntry, FileRange, Files, Health,
-    JsonSchema, LabelFilter, Locality, Namespace, NamespaceId, NamespaceScope, NetworkMode,
-    PluginLocation, PortSupport, Ports, ProviderFactory, ProviderName, ProviderRuntime,
-    ProviderSchemas, Resources, Sandbox, SandboxRef, SandboxState, SandboxSummary, SourceKind,
-    Status, WorkloadAdmission,
+    Isolation, JsonSchema, LabelFilter, Locality, Namespace, NamespaceId, NamespaceScope,
+    NetworkMode, PluginLocation, PortSupport, Ports, Provider, ProviderFactory, ProviderKind,
+    ProviderName, ProviderSchemas, Resources, Sandbox, SandboxId, SandboxRef, SandboxState,
+    SandboxSummary, SourceKind, Status, WorkloadAdmission,
 };
-use sandbox_driver::{Isolation, ProviderKind, SandboxId};
 
 /// The provider kind, entry and environment a dry run's leases and scope
 /// records name.
@@ -44,7 +43,7 @@ impl ProviderFactory for SimulatedFactory {
         Ok(schemas())
     }
 
-    async fn activate(&self, activation: Activation) -> Result<Arc<dyn ProviderRuntime>, Error> {
+    async fn activate(&self, activation: Activation) -> Result<Arc<dyn Provider>, Error> {
         Ok(Arc::new(SimulatedRuntime {
             entry:     activation.name,
             sandboxes: Mutex::new(BTreeMap::new()),
@@ -95,7 +94,7 @@ impl SimulatedRuntime {
 }
 
 #[async_trait]
-impl ProviderRuntime for SimulatedRuntime {
+impl Provider for SimulatedRuntime {
     async fn describe(&self) -> Result<Descriptor, Error> {
         Ok(Descriptor {
             schemas:      schemas(),
@@ -317,7 +316,7 @@ impl Ports for Handle {
 mod tests {
     use std::path::Path;
 
-    use sandbox_driver::contract::{ExecControls, ExecSpec, LabelFilter, SandboxSpec, Source};
+    use sandbox_driver::{ExecControls, ExecSpec, LabelFilter, SandboxSpec, Source};
 
     use crate::SandboxCatalog;
 

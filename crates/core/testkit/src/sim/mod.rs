@@ -48,7 +48,7 @@ pub use provider::{
     Call, CallCrash, CallRecord, LeaseRecords, LeaseView, Moment, WORLD_KIND, WorldFactory,
     WorldSandbox,
 };
-pub use sandbox_driver::contract::SandboxState;
+pub use sandbox_driver::SandboxState;
 
 /// `SplitMix64`.
 #[derive(Clone, Copy, Debug)]

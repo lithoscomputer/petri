@@ -28,10 +28,9 @@ use executor::{
     LineStream, OneShotContainer, OutputChunk, OutputMode, PreviewUrl, ProcessHandle, ProcessSpec,
     Sig, StdinMode, StdinWriter,
 };
-use sandbox_driver::OutputLoss;
-use sandbox_driver::contract::{
+use sandbox_driver::{
     ByteStream as ContractByteStream, Error as DriverError, ExecControls, ExecOutcome, ExecSpec,
-    Expose, FileRange, OneShotImage, OneShotSpec, OutputStream, Sandbox, Termination,
+    Expose, FileRange, OneShotImage, OneShotSpec, OutputLoss, OutputStream, Sandbox, Termination,
 };
 use smol_str::SmolStr;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt, DuplexStream, duplex};
@@ -679,9 +678,7 @@ mod tests {
     use std::num::NonZeroU16;
     use std::path::PathBuf;
 
-    use sandbox_driver::contract::{
-        ByteStream, Exposure, FileEntry, Files, Ports, SandboxRef, Status,
-    };
+    use sandbox_driver::{ByteStream, Exposure, FileEntry, Files, Ports, SandboxRef, Status};
 
     use super::*;
 

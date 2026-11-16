@@ -71,16 +71,10 @@ jobs:
       # repository moves every package from that repository. The summary names
       # each repository whose locked commit moved, for the job summary and the
       # tracking issue.
-      #
-      # sandbox-driver is deliberately left out: its main is becoming
-      # new-API-only, so Cargo.lock holds it at tag v2 (SANDBOX_DRIVER_PIN),
-      # the last commit with the old API that Petri, Fabro, and Pebble use.
-      # Lift the pin once all three are ported to the new API and switch
-      # together: add sandbox-driver back here and delete the pin check.
       - name: Update internal dependencies
         id: update
         env:
-          INTERNAL_CRATES: pebble-agent lithos-llm twin-openai
+          INTERNAL_CRATES: pebble-agent lithos-llm sandbox-driver twin-openai
         run: |
           set -euo pipefail
           cp Cargo.lock "$RUNNER_TEMP/Cargo.lock.before"
@@ -152,15 +146,13 @@ jobs:
           } >> "$GITHUB_OUTPUT"
 
       # A Pebble main that names sandbox-driver differently would add a second
-      # copy to the lock instead of moving the pinned one.
-      - name: Check that sandbox-driver is still pinned
-        env:
-          SANDBOX_DRIVER_PIN: 0a073809773b0ae007b316973d8c0993ca6a5d21 # tag v2
+      # copy to the lock instead of updating the shared source.
+      - name: Check that sandbox-driver has one main source
         run: |
           set -euo pipefail
           sources="$(grep -o 'git+https://github.com/lithoscomputer/sandbox-driver[^"]*' Cargo.lock | sort -u)"
-          if [ "$(wc -l <<< "$sources")" -ne 1 ] || [ "${sources##*#}" != "$SANDBOX_DRIVER_PIN" ]; then
-            echo "::error::Cargo.lock must lock sandbox-driver only at tag v2 ($SANDBOX_DRIVER_PIN), but locks: $sources"
+          if [ "$(wc -l <<< "$sources")" -ne 1 ] || [[ "$sources" != git+https://github.com/lithoscomputer/sandbox-driver.git\?branch=main#* ]]; then
+            echo "::error::Cargo.lock must lock sandbox-driver from one main source, but locks: $sources"
             exit 1
           fi
 
