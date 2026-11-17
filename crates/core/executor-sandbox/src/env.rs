@@ -505,12 +505,14 @@ impl ExecEnv for SandboxEnv {
             return Ok(Vec::new());
         };
         let depth = u32::try_from(depth).unwrap_or(u32::MAX);
-        // The contract names entries by their workload path; Petri names
-        // them relative to the directory listed.
+        // Older providers return the requested or absolute path prefixed
+        // to each entry; sandbox-driver#108 makes entries directory-relative.
+        // Request an absolute directory so the old prefix is unambiguous,
+        // and leave already-relative paths unchanged below.
         let root = Path::new(&self.workspace).join(path);
         self.sandbox
             .files()
-            .list(&path.to_string_lossy(), depth)
+            .list(&root.to_string_lossy(), depth)
             .await
             .map(|entries| {
                 entries
@@ -726,6 +728,7 @@ mod tests {
         loss:      OutputLoss,
         directory: PathBuf,
         env:       BTreeMap<String, String>,
+        listing:   Option<Vec<FileEntry>>,
     }
 
     #[async_trait]
@@ -788,7 +791,7 @@ mod tests {
         }
 
         async fn list(&self, _: &str, _: u32) -> Result<Vec<FileEntry>, DriverError> {
-            panic!("a step's spawn does not touch the filesystem")
+            Ok(self.listing.clone().expect("a scripted directory listing"))
         }
     }
 
@@ -810,6 +813,7 @@ mod tests {
             loss,
             directory: PathBuf::from(crate::CONTAINER_WORKSPACE),
             env: BTreeMap::new(),
+            listing: None,
         });
         let admission = RunGate::default()
             .admit("exec")
@@ -850,5 +854,42 @@ mod tests {
         assert_eq!(status.code, Some(2));
         assert_eq!(stdout, vec!["first".to_owned()]);
         assert_eq!(stderr, vec!["warned".to_owned()]);
+    }
+
+    #[tokio::test]
+    async fn directory_lists_accept_absolute_and_already_relative_entries() {
+        for entry_path in ["/workspace/src/src/nested.rs", "src/nested.rs"] {
+            let sandbox = Arc::new(ScriptedSandbox {
+                loss:      OutputLoss::default(),
+                directory: PathBuf::from("/workspace"),
+                env:       BTreeMap::new(),
+                listing:   Some(vec![FileEntry {
+                    path: entry_path.to_owned(),
+                    kind: sandbox_driver::FileKind::File,
+                    size: 7,
+                }]),
+            });
+            let env = SandboxEnv {
+                host: false,
+                sandbox,
+                workspace: "/workspace".to_owned(),
+                ambient: BTreeMap::new(),
+                env: BTreeMap::new(),
+                grace: Duration::from_secs(1),
+                host_address: None,
+                gate: RunGate::default(),
+            };
+            for path in ["src", "src/", "/workspace/src"] {
+                assert_eq!(
+                    env.list_directory(Path::new(path), 2).await.unwrap(),
+                    vec![DirectoryEntry {
+                        path:   "src/nested.rs".to_owned(),
+                        is_dir: false,
+                        size:   Some(7),
+                    }],
+                    "a relative entry that starts with the listed directory's name must stay intact"
+                );
+            }
+        }
     }
 }

@@ -242,3 +242,51 @@ async fn a_resumed_host_lease_applies_the_lost_workspace_policy() {
         resumed.shutdown().await;
     }
 }
+
+#[tokio::test]
+async fn directory_lists_are_relative_and_depth_one_means_children() {
+    let dir = RunDir::new("host-directory-list");
+    let executor = HostExecutor::new(dir.path());
+    let handle = executor
+        .acquire(&scope(), &AcquireContext::bare())
+        .await
+        .unwrap();
+    let env = handle.exec();
+    env.write_file(Path::new("src/main.rs"), b"main")
+        .await
+        .unwrap();
+    env.write_file(Path::new("src/src/nested.rs"), b"nested")
+        .await
+        .unwrap();
+    let absolute = Path::new(env.workspace_path()).join("src");
+    for path in [Path::new("src"), Path::new("src/"), absolute.as_path()] {
+        for (depth, expected) in [
+            (0, vec![]),
+            (1, vec![("main.rs", false, Some(4)), ("src", true, None)]),
+            (2, vec![
+                ("main.rs", false, Some(4)),
+                ("src", true, None),
+                ("src/nested.rs", false, Some(6)),
+            ]),
+        ] {
+            let mut entries = env.list_directory(path, depth).await.unwrap();
+            entries.sort_by(|left, right| left.path.cmp(&right.path));
+            let actual: Vec<_> = entries
+                .iter()
+                .map(|entry| (entry.path.as_str(), entry.is_dir, entry.size))
+                .collect();
+            assert_eq!(
+                actual,
+                expected,
+                "listing {} at depth {depth}",
+                path.display()
+            );
+        }
+    }
+    assert!(
+        executor
+            .release(handle, ScopeOutcome::Succeeded)
+            .await
+            .is_clean()
+    );
+}
