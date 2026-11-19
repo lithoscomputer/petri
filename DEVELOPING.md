@@ -27,9 +27,13 @@ The corpus uses the commits in `crates/github/corpus-pins.txt`. Do not use
 
 ## Git dependencies
 
-Internal Git dependencies (`lithoscomputer/*`, the twins included) name
-exactly `branch = "main"`: not `rev`, and not an omitted ref, which Cargo
-treats as a different source. Pick up a newer commit with
+Unfrozen internal Git dependencies (`lithoscomputer/*`, the twins included)
+name exactly `branch = "main"`; a different ref is a different Cargo source.
+During the sandbox API migration, every `sandbox-driver` dependency instead
+uses the exact v2 revision `0a073809773b0ae007b316973d8c0993ca6a5d21` in
+`Cargo.toml`, shared with Pebble and Fabro. A library's lockfile does not constrain
+downstream consumers. Keep this manifest pin and the nightly guard until all
+three migrate together. Pick up a newer commit of an unfrozen dependency with
 `cargo update -p <crate>` and let CI decide; whoever breaks an API another
 Lithos repository uses fixes that repository promptly. Fabro's `Cargo.lock`
 decides what ships.

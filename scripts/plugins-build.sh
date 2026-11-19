@@ -41,7 +41,7 @@ packages=()
 for kind in "${kinds[@]}"; do
   packages+=("sandbox-driver-$kind")
 done
-# The manifest tracks `branch = "main"`; the lockfile chooses the commit.
+# Read the resolved commit, including the manifest pin during the API freeze.
 locked_source="$(awk '
   $0 == "[[package]]" { name = "" }
   $0 == "name = \"sandbox-driver\"" { name = "sandbox-driver" }
