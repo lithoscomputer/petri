@@ -691,10 +691,12 @@ impl Finished {
             .collect()
     }
 
-    /// Fail the test when a process launched for this case is still alive:
-    /// anything naming the run dir.
+    /// Fail when a process naming the run dir outlives the settling window.
+    /// After a crash, idle Host sentinels poll owner death once per second.
     pub(crate) async fn assert_no_leaked_processes(&self) {
-        for needle in [self.run_dir.to_string_lossy().into_owned()] {
+        let needle = self.run_dir.to_string_lossy().into_owned();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
             let output = Command::new("pgrep")
                 .args(["-f", &needle])
                 .stdin(Stdio::null())
@@ -707,10 +709,29 @@ impl Finished {
                 .map(str::trim)
                 .filter(|pid| !pid.is_empty())
                 .collect();
-            assert!(
-                pids.is_empty(),
-                "processes still running for `{needle}`: {pids:?}"
-            );
+            if pids.is_empty() {
+                return;
+            }
+            if Instant::now() >= deadline {
+                let details = Command::new("ps")
+                    .args([
+                        "-ww",
+                        "-o",
+                        "pid,ppid,pgid,stat,etime,args",
+                        "-p",
+                        &pids.join(","),
+                    ])
+                    .stdin(Stdio::null())
+                    .output()
+                    .await
+                    .expect("ps runs");
+                panic!(
+                    "processes still running for `{needle}`: {pids:?}\n{}\n{}",
+                    String::from_utf8_lossy(&details.stdout),
+                    String::from_utf8_lossy(&details.stderr),
+                );
+            }
+            sleep(Duration::from_millis(50)).await;
         }
     }
 }
