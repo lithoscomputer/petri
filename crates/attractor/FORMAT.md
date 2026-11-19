@@ -865,6 +865,30 @@ adapters. Applications that use `attractor_steps::register` directly must provid
 `attractor_steps::pebble::PebbleClient(client)` through `Runtime::capability`.
 The application owns the client's catalog, credentials, and retry middleware.
 
+Every model call a native agent or prompt node makes, its sub-agents' calls
+included, and every request its agent sends an `http` MCP server carry the
+stage's identity as HTTP headers, so a proxy between Petri and a provider or
+a server can attribute the exchange and join it to the run's public events
+(`attractor_steps::pebble::identity`):
+
+| Header | Value | Public event field |
+| --- | --- | --- |
+| `x-petri-run-id` | the run key: the host's run id (Fabro's run ULID), or the one Petri minted | the run's store key |
+| `x-petri-invocation` | the invocation the stage runs in, `0` for the root | `context.invocation` |
+| `x-petri-execution` | the execution the stage runs in | `context.execution` |
+| `x-petri-node` | the node's instance name (`build`, or `build#2` for an expansion clone) | `subject.node.name` |
+| `x-petri-firing` | the firing | `subject.firing` |
+| `x-petri-attempt` | the attempt, from `1` | `subject.attempt` |
+
+The run, invocation and execution come from the coordinator; a driver built
+outside it sends the three step headers alone. A node name outside visible
+ASCII is percent-encoded, as is `%`. A header the configuration names wins:
+a provider's catalog `default_headers` take precedence over the client's
+defaults in lithos-llm, and an MCP server's own `headers` entry of the same
+name (in any case) is sent instead of the stage's. Petri sends no
+`x-session-id`; a host that wants one sets it on the client it passes in,
+as Fabro does with its run id.
+
 An application may also give every native session tools of its own: register
 an `attractor_steps::host_tools::HostTools` capability holding builders of
 Pebble `RegisteredTool`s. Each session calls the builders once with a
@@ -1262,9 +1286,10 @@ Placement follows Fabro. A `stdio` server is a child process of Petri's host
 scope's workspace when the scope shares the host filesystem (the host
 backend), else Petri's own, and it gets the entry's `env` on top of Petri's
 environment. An `http` server is reached from the host with the entry's
-`headers`, over streamable HTTP or, with `protocol = "sse"`, the older SSE
-transport (Pebble's own client; the stream at `url`, posts to the endpoint
-it names, refused off the stream's origin). A `sandbox` server is launched in
+`headers` and the stage's identity headers ("Native Pebble" above), over
+streamable HTTP or, with `protocol = "sse"`, the older SSE transport
+(Pebble's own client; the stream at `url`, posts to the endpoint it names,
+refused off the stream's origin). A `sandbox` server is launched in
 the scope's execution environment through Pebble's `Environment::exec`
 (`bash -c` for a `script`) and reached over the same two protocols through
 the environment's route to its port: a streamable HTTP server at the route

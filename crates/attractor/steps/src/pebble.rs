@@ -44,6 +44,7 @@
 //! reports the stop as [`INTERRUPTED_EVENT`] beside Pebble's own event.
 
 pub mod environment;
+pub mod identity;
 pub mod mcp;
 pub mod questions;
 pub mod tools;
@@ -191,6 +192,11 @@ impl NativeSession {
                 "Native Pebble requires a PebbleClient capability",
             )
         })?;
+        // The stage's own client: the application's, with the stage's
+        // identity on every model call it and its sub-agents make.
+        let client = identity::client(&client.0, ctx)
+            .map_err(|e| AgentError::failed("pebble_config", chain(&e)))?;
+        let identity_headers = identity::headers(ctx);
         if config.acp.is_some() {
             return Err(AgentError::failed(
                 "bad_config",
@@ -338,7 +344,8 @@ impl NativeSession {
             // Pebble, so it is reported here. A send that fails here means
             // the driver stopped taking this attempt's progress; the build's
             // own outcome reports that.
-            let servers = mcp::pebble_servers(&mcps, env.as_ref(), secrets.as_ref());
+            let servers =
+                mcp::pebble_servers(&mcps, env.as_ref(), secrets.as_ref(), &identity_headers);
             for (server, error) in &servers.unavailable {
                 let _ = session_events.unavailable(server, error).await;
             }
@@ -356,11 +363,9 @@ impl NativeSession {
             // builder binds this node's services either way.
             let mut builder: CodingAgentBuilder = match resume {
                 Resume::Export { export, .. } => {
-                    CodingAgent::resume_from_export(client.0.clone(), environment, *export)
+                    CodingAgent::resume_from_export(client, environment, *export)
                 }
-                Resume::Fresh(_) => {
-                    CodingAgent::builder(client.0.clone(), environment).model(&selector)
-                }
+                Resume::Fresh(_) => CodingAgent::builder(client, environment).model(&selector),
             };
             builder = builder
                 .options(options)

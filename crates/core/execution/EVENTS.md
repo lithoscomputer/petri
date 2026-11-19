@@ -597,6 +597,11 @@ backend payloads survive the round trip exactly because the workspace's
   the agent does not report are not observable.
 - Agent facts are Pebble's; Petri adds run, invocation, node and attempt
   attribution and does not restate them.
+- A native stage's model and `http` MCP requests carry the same attribution
+  as `x-petri-*` headers (run key, `context.invocation`,
+  `context.execution`, `subject.node.name`, `subject.firing`,
+  `subject.attempt`), so a proxy's record of the exchange joins to these
+  events; see `crates/attractor/FORMAT.md`, "Native Pebble".
 - A backend envelope is a custom payload with a string `kind` and an
   `event` **object**. A step's own payload may carry a string `event` (a
   hook report names its hook event); it is not a backend envelope.
