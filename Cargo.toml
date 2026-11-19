@@ -93,20 +93,18 @@ executor-sandbox = { package = "petri-executor-sandbox", path = "crates/core/exe
 # section in a local, untracked Cargo config, and move `Cargo.lock` forward
 # once the matching sandbox-driver commit is on `main`.
 # These use the crate-root sandbox API. Match Fabro's and Pebble's source.
-# TODO: return these and the internal-deps source check to `main` together
-# once https://github.com/lithoscomputer/sandbox-driver/pull/96 merges.
 # Merge this cutover only alongside their ports; Petri main stays on v2
 # until that joint switch.
-sandbox-driver = { git = "https://github.com/lithoscomputer/sandbox-driver.git", branch = "parity-captured-exec" }
-sandbox-driver-protocol = { git = "https://github.com/lithoscomputer/sandbox-driver.git", branch = "parity-captured-exec" }
-sandbox-driver-docker-config = { git = "https://github.com/lithoscomputer/sandbox-driver.git", branch = "parity-captured-exec" }
-sandbox-driver-daytona-config = { git = "https://github.com/lithoscomputer/sandbox-driver.git", branch = "parity-captured-exec" }
+sandbox-driver = { git = "https://github.com/lithoscomputer/sandbox-driver.git", branch = "main" }
+sandbox-driver-protocol = { git = "https://github.com/lithoscomputer/sandbox-driver.git", branch = "main" }
+sandbox-driver-docker-config = { git = "https://github.com/lithoscomputer/sandbox-driver.git", branch = "main" }
+sandbox-driver-daytona-config = { git = "https://github.com/lithoscomputer/sandbox-driver.git", branch = "main" }
 # The built-in providers, linked into the executor in-process.
-sandbox-driver-host = { git = "https://github.com/lithoscomputer/sandbox-driver.git", branch = "parity-captured-exec" }
-sandbox-driver-docker = { git = "https://github.com/lithoscomputer/sandbox-driver.git", branch = "parity-captured-exec" }
-sandbox-driver-daytona = { git = "https://github.com/lithoscomputer/sandbox-driver.git", branch = "parity-captured-exec" }
+sandbox-driver-host = { git = "https://github.com/lithoscomputer/sandbox-driver.git", branch = "main" }
+sandbox-driver-docker = { git = "https://github.com/lithoscomputer/sandbox-driver.git", branch = "main" }
+sandbox-driver-daytona = { git = "https://github.com/lithoscomputer/sandbox-driver.git", branch = "main" }
 # Tests only: sandbox-driver's in-memory contract fake.
-sandbox-driver-testing = { git = "https://github.com/lithoscomputer/sandbox-driver.git", branch = "parity-captured-exec" }
+sandbox-driver-testing = { git = "https://github.com/lithoscomputer/sandbox-driver.git", branch = "main" }
 steps = { package = "petri-steps", path = "crates/core/steps" }
 driver = { package = "petri-driver", path = "crates/core/driver" }
 execution = { package = "petri-execution", path = "crates/core/execution" }

@@ -1888,7 +1888,7 @@ dependencies = [
 [[package]]
 name = "pebble-agent"
 version = "0.1.0"
-source = "git+https://github.com/lithoscomputer/pebble.git?branch=sandbox-driver-new-api#a366a6f3fa16e245b9e03963cd68f66a827a2f40"
+source = "git+https://github.com/lithoscomputer/pebble.git?branch=sandbox-driver-new-api#fecbdbf0a2f112e6a902b6885d16ba3b4e29e5b0"
 dependencies = [
  "async-trait",
  "futures-util",
@@ -1905,7 +1905,7 @@ dependencies = [
 [[package]]
 name = "pebble-coding-agent"
 version = "0.1.0"
-source = "git+https://github.com/lithoscomputer/pebble.git?branch=sandbox-driver-new-api#a366a6f3fa16e245b9e03963cd68f66a827a2f40"
+source = "git+https://github.com/lithoscomputer/pebble.git?branch=sandbox-driver-new-api#fecbdbf0a2f112e6a902b6885d16ba3b4e29e5b0"
 dependencies = [
  "async-trait",
  "futures-util",
@@ -2925,7 +2925,7 @@ dependencies = [
 [[package]]
 name = "sandbox-driver"
 version = "0.1.0"
-source = "git+https://github.com/lithoscomputer/sandbox-driver.git?branch=parity-captured-exec#e5d416eb479f4d19554e69589a461074c77fb530"
+source = "git+https://github.com/lithoscomputer/sandbox-driver.git?branch=main#3369f3791aae5ad359dfbb8cbd1e9ef727ee9a65"
 dependencies = [
  "async-trait",
  "futures-util",
@@ -2945,7 +2945,7 @@ dependencies = [
 [[package]]
 name = "sandbox-driver-daytona"
 version = "0.1.0"
-source = "git+https://github.com/lithoscomputer/sandbox-driver.git?branch=parity-captured-exec#e5d416eb479f4d19554e69589a461074c77fb530"
+source = "git+https://github.com/lithoscomputer/sandbox-driver.git?branch=main#3369f3791aae5ad359dfbb8cbd1e9ef727ee9a65"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -2973,7 +2973,7 @@ dependencies = [
 [[package]]
 name = "sandbox-driver-daytona-config"
 version = "0.1.0"
-source = "git+https://github.com/lithoscomputer/sandbox-driver.git?branch=parity-captured-exec#e5d416eb479f4d19554e69589a461074c77fb530"
+source = "git+https://github.com/lithoscomputer/sandbox-driver.git?branch=main#3369f3791aae5ad359dfbb8cbd1e9ef727ee9a65"
 dependencies = [
  "sandbox-driver-docker-config",
  "serde",
@@ -2983,7 +2983,7 @@ dependencies = [
 [[package]]
 name = "sandbox-driver-docker"
 version = "0.1.0"
-source = "git+https://github.com/lithoscomputer/sandbox-driver.git?branch=parity-captured-exec#e5d416eb479f4d19554e69589a461074c77fb530"
+source = "git+https://github.com/lithoscomputer/sandbox-driver.git?branch=main#3369f3791aae5ad359dfbb8cbd1e9ef727ee9a65"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -3004,7 +3004,7 @@ dependencies = [
 [[package]]
 name = "sandbox-driver-docker-config"
 version = "0.1.0"
-source = "git+https://github.com/lithoscomputer/sandbox-driver.git?branch=parity-captured-exec#e5d416eb479f4d19554e69589a461074c77fb530"
+source = "git+https://github.com/lithoscomputer/sandbox-driver.git?branch=main#3369f3791aae5ad359dfbb8cbd1e9ef727ee9a65"
 dependencies = [
  "serde",
  "serde_json",
@@ -3013,7 +3013,7 @@ dependencies = [
 [[package]]
 name = "sandbox-driver-host"
 version = "0.1.0"
-source = "git+https://github.com/lithoscomputer/sandbox-driver.git?branch=parity-captured-exec#e5d416eb479f4d19554e69589a461074c77fb530"
+source = "git+https://github.com/lithoscomputer/sandbox-driver.git?branch=main#3369f3791aae5ad359dfbb8cbd1e9ef727ee9a65"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -3031,7 +3031,7 @@ dependencies = [
 [[package]]
 name = "sandbox-driver-protocol"
 version = "0.1.0"
-source = "git+https://github.com/lithoscomputer/sandbox-driver.git?branch=parity-captured-exec#e5d416eb479f4d19554e69589a461074c77fb530"
+source = "git+https://github.com/lithoscomputer/sandbox-driver.git?branch=main#3369f3791aae5ad359dfbb8cbd1e9ef727ee9a65"
 dependencies = [
  "async-trait",
  "base64 0.22.1",
@@ -3049,7 +3049,7 @@ dependencies = [
 [[package]]
 name = "sandbox-driver-testing"
 version = "0.1.0"
-source = "git+https://github.com/lithoscomputer/sandbox-driver.git?branch=parity-captured-exec#e5d416eb479f4d19554e69589a461074c77fb530"
+source = "git+https://github.com/lithoscomputer/sandbox-driver.git?branch=main#3369f3791aae5ad359dfbb8cbd1e9ef727ee9a65"
 dependencies = [
  "async-trait",
  "sandbox-driver",

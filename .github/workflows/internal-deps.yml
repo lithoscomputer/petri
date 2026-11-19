@@ -145,15 +145,14 @@ jobs:
             echo "$delimiter"
           } >> "$GITHUB_OUTPUT"
 
-      # A Pebble main that names sandbox-driver differently would add a second
+      # A Pebble update that names sandbox-driver differently would add a second
       # copy to the lock instead of updating the shared source.
-      # TODO: return to main with Fabro and Pebble once sandbox-driver#96 merges.
-      - name: Check that sandbox-driver has one parity source
+      - name: Check that sandbox-driver has one main source
         run: |
           set -euo pipefail
           sources="$(grep -o 'git+https://github.com/lithoscomputer/sandbox-driver[^"]*' Cargo.lock | sort -u)"
-          if [ "$(wc -l <<< "$sources")" -ne 1 ] || [[ "$sources" != git+https://github.com/lithoscomputer/sandbox-driver.git\?branch=parity-captured-exec#* ]]; then
-            echo "::error::Cargo.lock must lock sandbox-driver from one parity-captured-exec source, but locks: $sources"
+          if [ "$(wc -l <<< "$sources")" -ne 1 ] || [[ "$sources" != git+https://github.com/lithoscomputer/sandbox-driver.git\?branch=main#* ]]; then
+            echo "::error::Cargo.lock must lock sandbox-driver from one main source, but locks: $sources"
             exit 1
           fi
 
