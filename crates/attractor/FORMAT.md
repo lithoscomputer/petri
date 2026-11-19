@@ -889,6 +889,33 @@ name (in any case) is sent instead of the stage's. Petri sends no
 `x-session-id`; a host that wants one sets it on the client it passes in,
 as Fabro does with its run id.
 
+The stage also sends W3C trace context under its step attempt's span, the
+span `step.started` derives in the run's trace
+(`crates/core/execution/EVENTS.md`, "Trace context"), with two baggage
+entries: `run_id`, the run key, and `run_step`, the node's instance name
+(the `x-petri-run-id` and `x-petri-node` values, unencoded, then
+percent-encoded as W3C baggage requires).
+
+- **Agent node.** The node gives its Pebble session the step's span and
+  the two entries (`CodingAgentBuilder::trace_context`). The session, and
+  each sub-agent, which inherits it, opens a span per model request and per
+  tool call beneath the step's. It sends `traceparent` naming that span and
+  `baggage` with its `session_id` added on every model request. On every MCP
+  `tools/call` it puts the same in `params._meta`, adding `tool_call_id`.
+  Its events record each span (`trace_id`, `span_id`, and
+  `parent_span_id`, the step's span).
+- **Prompt node.** Its one call goes through no session, so it sends
+  `traceparent: 00-<trace_id>-<step span_id>-01` and
+  `baggage: run_id=<run key>,run_step=<node>` itself.
+
+The coordinator names the run, so a driver built outside it sends no trace
+context. Petri owns these two headers on the calls it makes: a
+`traceparent` or `baggage` the host set as a client default is replaced
+(Pebble does the same on its requests), and a provider's catalog
+`default_headers` entry of either name still wins in lithos-llm. `http` MCP
+requests carry no trace headers; the context travels in each `tools/call`
+instead. Hooks and ACP agents send no trace context.
+
 An application may also give every native session tools of its own: register
 an `attractor_steps::host_tools::HostTools` capability holding builders of
 Pebble `RegisteredTool`s. Each session calls the builders once with a

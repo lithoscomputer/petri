@@ -294,8 +294,9 @@ impl Step for PromptStep {
                 "pebble_unconfigured",
             );
         };
-        // The stage's identity on its model calls, as on an agent node's.
-        let client = match identity::client(&client.0, &ctx) {
+        // The stage's identity on its model call, as on an agent node's,
+        // and the step's trace context, which no session sends for it.
+        let client = match identity::prompt_client(&client.0, &ctx) {
             Ok(client) => PebbleClient(client),
             Err(error) => return fail(error.to_string(), "pebble_config"),
         };

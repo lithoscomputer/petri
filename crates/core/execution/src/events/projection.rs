@@ -24,8 +24,8 @@ use super::{
 };
 use crate::hooks::{HOOK_ACTIVITY_NOTE_KIND, HookActivity};
 use crate::{
-    CancelReason, CoordinatorEvent, CoordinatorRecord, ExecutionId, InvocationId,
-    StoredEngineRecord,
+    CancelReason, CoordinatorEvent, CoordinatorRecord, ExecutionId, InvocationId, RunKey,
+    StepTrace, StoredEngineRecord,
 };
 
 /// Per-execution bookkeeping the derivation needs beyond the engine state.
@@ -162,6 +162,9 @@ impl Envelope {
 pub struct Projection {
     executions:  BTreeMap<ExecutionId, ExecutionTrack>,
     invocations: BTreeMap<InvocationId, Option<ParentLink>>,
+    /// The run key from `run.started`, which every step's trace derives
+    /// from.
+    run:         Option<RunKey>,
 }
 
 impl Projection {
@@ -174,7 +177,10 @@ impl Projection {
     pub fn lifecycle(&mut self, record: &CoordinatorRecord) -> Vec<RunEvent> {
         let mut views = Views::default();
         let (invocation, execution, derived) = match &record.body {
-            CoordinatorEvent::RunStarted { root, .. } => (Some(*root), None, None),
+            CoordinatorEvent::RunStarted { root, key, .. } => {
+                self.run = Some(key.clone());
+                (Some(*root), None, None)
+            }
             CoordinatorEvent::GraphRegistered { .. }
             | CoordinatorEvent::RunPaused
             | CoordinatorEvent::RunUnpaused
@@ -266,7 +272,14 @@ impl Projection {
         let track = self.executions.entry(execution).or_default();
         track.refresh_branches(state);
         let mut views = Views::default();
-        let (subject, derived) = track.derive(execution, record, state, &mut views);
+        let (subject, mut derived) = track.derive(execution, record, state, &mut views);
+        if let (Event::StepStarted { firing, attempt }, Some(run), Some(invocation)) =
+            (&record.event, &self.run, track.invocation)
+        {
+            derived = Some(Derived::StepStarted {
+                trace: StepTrace::derive(run, invocation, execution, *firing, *attempt),
+            });
+        }
         // State-derived facts every record may carry: new firings (visits
         // starting), firings told to stop, new final records (visits
         // completing), and killed forks with no branch left running. The

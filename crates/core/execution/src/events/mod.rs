@@ -110,7 +110,7 @@ use steps::{Answer, Question, QuestionExpired};
 
 use crate::hooks::HookActivity;
 use crate::{
-    CoordinatorEvent, CoordinatorRecord, ExecutionId, InvocationId, ParentCallKey,
+    CoordinatorEvent, CoordinatorRecord, ExecutionId, InvocationId, ParentCallKey, StepTrace,
     StoredEngineRecord,
 };
 
@@ -392,6 +392,11 @@ impl RunEvent {
 pub enum Derived {
     /// A view event, on an event with no record.
     View(ViewEvent),
+    /// `step.started`: the attempt's span in its run's W3C trace, the
+    /// parent of every model and MCP request the step makes
+    /// ([`StepTrace`]). Absent when the stream has no `run.started` to
+    /// name the run.
+    StepStarted { trace: StepTrace },
     /// `step.finished`: `final` is whether the engine recorded the attempt
     /// as the firing's outcome (a non-final attempt is followed by a
     /// retry); `exhausted` is whether the retry policy allowed no further

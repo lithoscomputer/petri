@@ -197,6 +197,10 @@ impl NativeSession {
         let client = identity::client(&client.0, ctx)
             .map_err(|e| AgentError::failed("pebble_config", chain(&e)))?;
         let identity_headers = identity::headers(ctx);
+        // The step's span, the parent of every span the session opens.
+        let trace_context = identity::trace_context(ctx)
+            .transpose()
+            .map_err(|e| AgentError::failed("pebble_config", chain(&e)))?;
         if config.acp.is_some() {
             return Err(AgentError::failed(
                 "bad_config",
@@ -378,6 +382,9 @@ impl NativeSession {
                 .port_routes(Arc::new(ScopePortRoutes::new(env)))
                 .tools(host_tools);
             builder = compaction::install(builder, compaction_policy);
+            if let Some(trace_context) = trace_context {
+                builder = builder.trace_context(trace_context);
+            }
             if let Some(middleware) = tool_hooks {
                 builder = builder.tool_middleware(middleware);
             }

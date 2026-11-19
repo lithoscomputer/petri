@@ -1,7 +1,9 @@
 //! The stage's identity on its outbound requests: a native agent node's
 //! model calls, a prompt node's model call, and an agent node's requests to
 //! an `http` MCP server carry the run and the step as `x-petri-*` headers,
-//! with the values the public events name the stage by.
+//! with the values the public events name the stage by. The model calls
+//! also carry W3C `traceparent` and `baggage` under the step's span, which
+//! the step's `step.started` event names.
 //!
 //! The run goes through the coordinator (`execution::host`), which registers
 //! the `ExecutionIdentity` the run, invocation and execution come from. The
@@ -42,21 +44,42 @@ use tokio::time::{sleep, timeout};
 
 const RUN_KEY: &str = "identity-run";
 
-/// The `x-petri-*` headers of every model call, with its operation.
+/// One model call's operation, its `x-petri-*` headers, and its
+/// `traceparent` and `baggage`.
+type Recorded = (Operation, BTreeMap<String, String>, Trace);
+
+/// A call's `traceparent` and `baggage`, when it sent them.
+#[derive(Clone, Debug, Default, PartialEq)]
+struct Trace {
+    traceparent: Option<String>,
+    baggage:     Option<String>,
+}
+
+/// What every model call sent.
 #[derive(Default)]
-struct Headers(Mutex<Vec<(Operation, BTreeMap<String, String>)>>);
+struct Headers(Mutex<Vec<Recorded>>);
 
 #[async_trait]
 impl Middleware for Headers {
     async fn handle(&self, call: Call, next: Next) -> Result<Output, Error> {
+        let headers = call.context().default_headers();
+        let header = |name: &str| {
+            headers
+                .get(name)
+                .map(|value| value.to_str().unwrap_or_default().to_owned())
+        };
+        let trace = Trace {
+            traceparent: header("traceparent"),
+            baggage:     header("baggage"),
+        };
         self.0.lock().unwrap_or_else(PoisonError::into_inner).push((
             call.operation(),
             petri_headers(
-                call.context()
-                    .default_headers()
+                headers
                     .iter()
                     .map(|(name, value)| (name.as_str(), value.to_str().unwrap_or_default())),
             ),
+            trace,
         ));
         next.run(call).await
     }
@@ -171,6 +194,72 @@ fn expected(events: &[RunEvent], node: &str) -> BTreeMap<String, String> {
     ])
 }
 
+/// The `(trace_id, span_id)` the `step.started` event of `node` derives.
+fn step_span(events: &[RunEvent], node: &str) -> (String, String) {
+    events
+        .iter()
+        .find_map(|event| {
+            let value = serde_json::to_value(event).ok()?;
+            (value["record"]["body"]["event"] == "step.started"
+                && value["subject"]["node"]["name"] == node)
+                .then(|| {
+                    let trace = &value["derived"]["trace"];
+                    (
+                        trace["trace_id"].as_str().expect("trace_id").to_owned(),
+                        trace["span_id"].as_str().expect("span_id").to_owned(),
+                    )
+                })
+        })
+        .unwrap_or_else(|| panic!("`{node}`'s step.started"))
+}
+
+/// A `traceparent` as W3C version 00 spells it: the trace ID and the
+/// parent span ID, each lowercase hex and not all zero, and the sampled
+/// flag.
+fn parse_traceparent(value: &str) -> (String, String) {
+    let parts: Vec<&str> = value.split('-').collect();
+    let valid = |id: &str, len: usize| {
+        id.len() == len
+            && id
+                .bytes()
+                .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+            && id.bytes().any(|b| b != b'0')
+    };
+    assert!(
+        parts.len() == 4
+            && parts[0] == "00"
+            && valid(parts[1], 32)
+            && valid(parts[2], 16)
+            && parts[3] == "01",
+        "a valid traceparent: {value}"
+    );
+    (parts[1].to_owned(), parts[2].to_owned())
+}
+
+/// Every span Pebble recorded on the agent node's events in `trace_id`:
+/// the event's kind, its `span_id` and its `parent_span_id`.
+fn pebble_spans(events: &[RunEvent], trace_id: &str) -> Vec<(String, String, String)> {
+    events
+        .iter()
+        .filter_map(|event| {
+            let value = serde_json::to_value(event).ok()?;
+            let custom = &value["record"]["body"]["ev"]["custom"];
+            let envelope = &custom["event"];
+            if custom["kind"] != "pebble" || envelope["trace_id"] != trace_id {
+                return None;
+            }
+            // `event` is externally tagged: a bare name or `{name: {..}}`.
+            let kind = match &envelope["event"] {
+                Value::String(name) => name.clone(),
+                Value::Object(tagged) => tagged.keys().next().cloned().unwrap_or_default(),
+                _ => String::new(),
+            };
+            let text = |key: &str| envelope[key].as_str().unwrap_or_default().to_owned();
+            Some((kind, text("span_id"), text("parent_span_id")))
+        })
+        .collect()
+}
+
 #[tokio::test]
 async fn model_and_http_mcp_requests_carry_the_stages_identity() {
     let dir = RunDir::new("request-identity");
@@ -246,11 +335,54 @@ async fn model_and_http_mcp_requests_carry_the_stages_identity() {
         .lock()
         .unwrap_or_else(PoisonError::into_inner)
         .clone();
-    assert_eq!(calls, [
+    let identity: Vec<_> = calls
+        .iter()
+        .map(|(operation, petri, _)| (*operation, petri.clone()))
+        .collect();
+    assert_eq!(identity, [
         (Operation::Stream, agent.clone()),
         (Operation::Stream, agent.clone()),
         (Operation::Complete, prompt),
     ]);
+
+    // One trace for the run, a span per step.
+    let (trace_id, agent_span) = step_span(&events, "a");
+    let (prompt_trace, prompt_span) = step_span(&events, "p");
+    assert_eq!(prompt_trace, trace_id);
+    assert_ne!(prompt_span, agent_span);
+
+    // The prompt node's call names the step's span itself.
+    assert_eq!(calls[2].2, Trace {
+        traceparent: Some(format!("00-{trace_id}-{prompt_span}-01")),
+        baggage:     Some(format!("run_id={RUN_KEY},run_step=p")),
+    });
+
+    // Each of the agent's rounds names its own Pebble request span in the
+    // run's trace, the span Pebble records on that request's events, with
+    // the run and the step in baggage ahead of Pebble's session.
+    let recorded_spans = pebble_spans(&events, &trace_id);
+    let mut request_spans = Vec::new();
+    for (_, _, trace) in &calls[..2] {
+        let (trace_of_call, span) =
+            parse_traceparent(trace.traceparent.as_deref().expect("a traceparent"));
+        assert_eq!(trace_of_call, trace_id);
+        assert_ne!(span, agent_span, "a request span beneath the step's");
+        assert!(
+            recorded_spans.contains(&(
+                "LlmRequestStarted".to_owned(),
+                span.clone(),
+                agent_span.clone()
+            )),
+            "{span}, under the step's {agent_span}, on an LlmRequestStarted: {recorded_spans:?}"
+        );
+        request_spans.push(span);
+        let baggage = trace.baggage.as_deref().expect("baggage");
+        assert!(
+            baggage.starts_with(&format!("run_id={RUN_KEY},run_step=a,session_id=")),
+            "{baggage}"
+        );
+    }
+    assert_ne!(request_spans[0], request_spans[1]);
 
     // Every request the agent's session sent the MCP server, on the wire:
     // the configured header beside the stage's.
