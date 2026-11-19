@@ -24,6 +24,8 @@ is attributable by its command line. ``--fail-init`` exits with status 3
 before reading a request. ``--slow-init MS`` delays the ``initialize``
 answer. ``MCP_TEST_LOG`` names a file every lifecycle step is appended to:
 ``started``, ``initialize``, ``call NAME``, ``shutdown`` (on EOF).
+``MCP_TEST_HEADERS`` names a file the streamable HTTP server appends each
+request's headers to, as one JSON object per line with lower-cased names.
 """
 
 import argparse
@@ -104,6 +106,14 @@ def log(line):
         return
     with open(path, "a", encoding="utf-8") as handle:
         handle.write(line + "\n")
+
+
+def record_headers(headers):
+    path = os.environ.get("MCP_TEST_HEADERS")
+    if not path:
+        return
+    with open(path, "a", encoding="utf-8") as handle:
+        handle.write(json.dumps({k.lower(): v for k, v in headers.items()}) + "\n")
 
 
 def trace(line):
@@ -233,6 +243,7 @@ def serve_http(server, port):
             pass
 
         def do_POST(self):  # noqa: N802 - http.server's naming
+            record_headers(self.headers)
             length = int(self.headers.get("Content-Length") or 0)
             body = self.rfile.read(length)
             try:
