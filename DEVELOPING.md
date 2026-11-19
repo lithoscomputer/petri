@@ -27,9 +27,14 @@ The corpus uses the commits in `crates/github/corpus-pins.txt`. Do not use
 
 ## Git dependencies
 
-Internal Git dependencies (`lithoscomputer/*`, the twins included) name
-exactly `branch = "main"`: not `rev`, and not an omitted ref, which Cargo
-treats as a different source. Pick up a newer commit with
+Unfrozen internal Git dependencies (`lithoscomputer/*`, the twins included)
+name exactly `branch = "main"`; a different ref is a different Cargo source.
+This cutover uses sandbox-driver's new API on `main` and temporarily follows
+Pebble's `sandbox-driver-new-api` branch. Keep these manifest sources aligned
+with Fabro and Pebble: a library's lockfile does not constrain downstream
+consumers. The nightly guard requires one sandbox-driver `main` source.
+Petri's main branch stays frozen at v2 until all three migrate together.
+Pick up a newer commit of an unfrozen dependency with
 `cargo update -p <crate>` and let CI decide; whoever breaks an API another
 Lithos repository uses fixes that repository promptly. Fabro's `Cargo.lock`
 decides what ships.
