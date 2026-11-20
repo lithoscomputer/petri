@@ -46,25 +46,21 @@ pub(crate) struct Case {
     pub(crate) credential: String,
     layers:                Vec<String>,
     providers:             Vec<&'static str>,
-    plugin_link:           PathBuf,
     /// The container backend the case runs on, when it does not run on the
-    /// host: its `--backend` name and its plugin, linked per case.
+    /// host: its `--backend` name.
     container:             Option<ContainerBackend>,
 }
 
-/// A container backend a case runs its workflows on: `docker` through the
-/// Docker plugin, `daytona` through the Daytona plugin.
+/// A container backend a case runs its workflows on: `docker` or `daytona`,
+/// both built into the binary.
 struct ContainerBackend {
     kind: &'static str,
-    /// The plugin, linked per case, so a leaked plugin process is
-    /// attributable to the case by its command line.
-    link: PathBuf,
 }
 
 impl ContainerBackend {
-    /// The variables Petri forwards to this kind's plugin: the daemon or
-    /// account this test process was pointed at, so the binary's plugin
-    /// reaches the same one. Unset, the plugin uses its defaults.
+    /// The variables the binary's built-in provider reads: the daemon or
+    /// account this test process was pointed at, so the binary reaches the
+    /// same one. Unset, the provider uses its defaults.
     fn forwarded_env(&self) -> &'static [&'static str] {
         match self.kind {
             "docker" => &[
@@ -83,11 +79,6 @@ impl ContainerBackend {
             other => panic!("no container backend `{other}`"),
         }
     }
-
-    /// `PETRI_SANDBOX_<KIND>_PLUGIN`.
-    fn plugin_variable(&self) -> String {
-        format!("PETRI_SANDBOX_{}_PLUGIN", self.kind.to_ascii_uppercase())
-    }
 }
 
 impl Case {
@@ -102,61 +93,38 @@ impl Case {
         ));
         let _ = fs::remove_dir_all(&root);
         fs::create_dir_all(&root).expect("case root");
-        for sub in ["home", "store", "cache", "plugins", "workflow"] {
+        for sub in ["home", "store", "cache", "workflow"] {
             fs::create_dir_all(root.join(sub)).expect("case subdirectory");
         }
         let fabro_home = root.join("home").join(".fabro");
         fs::create_dir_all(&fabro_home).expect("fabro home");
         fs::write(fabro_home.join("settings.toml"), LOCAL_ENVIRONMENT_SETTINGS)
             .expect("settings.toml");
-        let plugin = env::var_os("PETRI_SANDBOX_HOST_PLUGIN")
-            .map(PathBuf::from)
-            .expect("PETRI_SANDBOX_HOST_PLUGIN names the host sandbox plugin");
-        // A per-case path for the plugin executable, so a leaked plugin
-        // process is attributable to this case by its command line.
-        let plugin_link = root.join("plugins").join("sandbox-driver-host");
-        link_plugin(&plugin, &plugin_link);
         Self {
             credential: format!("fake-{label}-{}", testkit::unique_id()),
             run_dir: root.join("run"),
             root,
             layers: Vec::new(),
             providers: Vec::new(),
-            plugin_link,
             container: None,
         }
     }
 
-    /// Run this case's workflows on `--backend docker` through the Docker
-    /// plugin `PETRI_SANDBOX_DOCKER_PLUGIN` names. The caller checks that a
-    /// daemon is reachable first (`testkit::is_docker_ready`).
+    /// Run this case's workflows on `--backend docker`. The caller checks
+    /// that a daemon is reachable first (`testkit::is_docker_ready`).
     pub(crate) fn docker(self) -> Self {
         self.on_container_backend("docker")
     }
 
-    /// Run this case's workflows on `--backend daytona` through the Daytona
-    /// plugin `PETRI_SANDBOX_DAYTONA_PLUGIN` names, with the credentials in
-    /// this process's environment. The caller checks the tier is available
-    /// first (`testkit::is_daytona_ready`).
+    /// Run this case's workflows on `--backend daytona`, with the
+    /// credentials in this process's environment. The caller checks the tier is
+    /// available first (`testkit::is_daytona_ready`).
     pub(crate) fn daytona(self) -> Self {
         self.on_container_backend("daytona")
     }
 
     fn on_container_backend(mut self, kind: &'static str) -> Self {
-        let backend = ContainerBackend {
-            kind,
-            link: self
-                .root
-                .join("plugins")
-                .join(format!("sandbox-driver-{kind}")),
-        };
-        let variable = backend.plugin_variable();
-        let plugin = env::var_os(&variable).map_or_else(
-            || panic!("{variable} names the {kind} sandbox plugin"),
-            PathBuf::from,
-        );
-        link_plugin(&plugin, &backend.link);
-        self.container = Some(backend);
+        self.container = Some(ContainerBackend { kind });
         self
     }
 
@@ -181,17 +149,11 @@ impl Case {
             .env_clear()
             .env("PATH", path)
             .env("HOME", self.root.join("home"))
-            // The system temp dir, not a per-case one: the sandbox plugin
-            // binds a Unix socket under it, and a long path exceeds the
-            // socket path limit.
             .env("TMPDIR", env::temp_dir())
             .env("PETRI_STORE", self.root.join("store"))
             .env("PETRI_CACHE_DIR", self.root.join("cache"))
-            .env("PETRI_SANDBOX_HOST_PLUGIN", &self.plugin_link)
-            .env("PETRI_SANDBOX_PLUGIN_DEV", "1")
             .env("PETRI_LOG", "warn");
         if let Some(backend) = &self.container {
-            command.env(backend.plugin_variable(), &backend.link);
             for name in backend.forwarded_env() {
                 if let Some(value) = env::var_os(name) {
                     command.env(name, value);
@@ -505,24 +467,12 @@ impl Case {
         Finished {
             case_root: self.root.clone(),
             run_dir: self.run_dir.clone(),
-            plugin_link: self.plugin_link.clone(),
             code: status.and_then(|status| status.code()),
             timed_out,
             stdout: String::from_utf8_lossy(&stdout).into_owned(),
             stderr: String::from_utf8_lossy(&stderr).into_owned(),
         }
     }
-}
-
-#[cfg(unix)]
-fn link_plugin(plugin: &Path, link: &Path) {
-    use std::os::unix::fs::symlink;
-    symlink(plugin, link).expect("link the plugin");
-}
-
-#[cfg(not(unix))]
-fn link_plugin(plugin: &Path, link: &Path) {
-    fs::copy(plugin, link).expect("copy the plugin");
 }
 
 /// How a launch differs from the plain `run`.
@@ -625,7 +575,6 @@ async fn kill_group(pid: u32) {
 pub(crate) struct Finished {
     pub(crate) case_root: PathBuf,
     pub(crate) run_dir:   PathBuf,
-    plugin_link:          PathBuf,
     /// The exit code, or `None` when the child was killed (deadline or
     /// signal).
     pub(crate) code:      Option<i32>,
@@ -742,13 +691,12 @@ impl Finished {
             .collect()
     }
 
-    /// Fail the test when a process launched for this case is still alive:
-    /// the plugin (by its per-case path) or anything naming the run dir.
+    /// Fail when a process naming the run dir outlives the settling window.
+    /// After a crash, idle Host sentinels poll owner death once per second.
     pub(crate) async fn assert_no_leaked_processes(&self) {
-        for needle in [
-            self.plugin_link.to_string_lossy().into_owned(),
-            self.run_dir.to_string_lossy().into_owned(),
-        ] {
+        let needle = self.run_dir.to_string_lossy().into_owned();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
             let output = Command::new("pgrep")
                 .args(["-f", &needle])
                 .stdin(Stdio::null())
@@ -761,10 +709,29 @@ impl Finished {
                 .map(str::trim)
                 .filter(|pid| !pid.is_empty())
                 .collect();
-            assert!(
-                pids.is_empty(),
-                "processes still running for `{needle}`: {pids:?}"
-            );
+            if pids.is_empty() {
+                return;
+            }
+            if Instant::now() >= deadline {
+                let details = Command::new("ps")
+                    .args([
+                        "-ww",
+                        "-o",
+                        "pid,ppid,pgid,stat,etime,args",
+                        "-p",
+                        &pids.join(","),
+                    ])
+                    .stdin(Stdio::null())
+                    .output()
+                    .await
+                    .expect("ps runs");
+                panic!(
+                    "processes still running for `{needle}`: {pids:?}\n{}\n{}",
+                    String::from_utf8_lossy(&details.stdout),
+                    String::from_utf8_lossy(&details.stderr),
+                );
+            }
+            sleep(Duration::from_millis(50)).await;
         }
     }
 }

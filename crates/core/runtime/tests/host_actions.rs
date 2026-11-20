@@ -9,8 +9,9 @@ use executor::{
     AcquireContext, ContainerRunner, Executor as _, OneShotContainer, ProcessSpec, Retention,
     SandboxLeaseId, ScopeOutcome, ScopeSpec, WorkspaceId,
 };
-use executor_sandbox::{MemoryLedger, PluginSettings, PluginSource, RoutingExecutor};
+use executor_sandbox::{MemoryLedger, RoutingExecutor, SandboxOptions};
 use ir::ScopeId;
+use testkit::in_process::{HostFactory, UnusedFactory, catalog};
 use testkit::{RunDir, container_id, is_docker_ready, list_containers};
 use tokio::fs;
 use tokio::process::Command;
@@ -29,9 +30,9 @@ async fn remote_docker_actions_fail_without_blocking_host_processes() {
                     "--nocapture",
                 ])
                 .env(CHILD, "1")
-                .env("DOCKER_HOST", "tcp://192.0.2.1:2375")
-                .env("PETRI_SANDBOX_DOCKER_HOST_ADDRESS", "petri.internal")
-                .env_remove("PETRI_SANDBOX_DOCKER_PLUGIN")
+                // A missing portable host mount must be refused without
+                // trying to activate the unreachable container provider.
+                .env("DOCKER_HOST", "tcp://127.0.0.1:1")
                 .stdin(process::Stdio::null())
                 .kill_on_drop(true)
                 .output(),
@@ -63,17 +64,13 @@ async fn remote_docker_actions_fail_without_blocking_host_processes() {
         .unwrap();
     assert!(process.wait().await.unwrap().is_success());
     let runner = handle.container_runner().expect("routable action refusal");
-    assert!(
-        runner
-            .host_address()
-            .unwrap_err()
-            .to_string()
-            .contains("local Docker daemon")
-    );
     let Err(error) = runner.run(OneShotContainer::registry("alpine:3.20")).await else {
-        panic!("a remote daemon cannot bind this Host workspace");
+        panic!("an unreachable daemon cannot bind this Host workspace");
     };
-    assert!(error.to_string().contains("--backend docker"), "{error}");
+    assert!(
+        error.to_string().contains("host-workspace mount"),
+        "{error}"
+    );
     assert!(
         router
             .release(handle, ScopeOutcome::Succeeded)
@@ -102,6 +99,7 @@ async fn action_env(runner: &dyn ContainerRunner) -> String {
 }
 
 #[tokio::test]
+#[ignore = "sandbox-driver lacks portable host-workspace mounts"]
 async fn inherited_host_scopes_share_the_helper_and_keep_their_own_env() {
     if !is_docker_ready().await {
         return;
@@ -162,16 +160,23 @@ async fn inherited_host_scopes_share_the_helper_and_keep_their_own_env() {
     assert!(list_containers(&prefix).await.is_empty());
 }
 
+/// A router whose `docker` entry refuses to activate: Docker is unreachable.
+fn without_docker(dir: &RunDir) -> RoutingExecutor {
+    RoutingExecutor::with_catalog(
+        catalog(
+            Arc::new(HostFactory::default()),
+            Some(Arc::new(UnusedFactory::new("docker"))),
+        ),
+        dir.path(),
+        Retention::Never,
+        SandboxOptions::default(),
+    )
+}
+
 #[tokio::test]
 async fn releasing_a_host_lease_needs_no_container_provider() {
     let dir = RunDir::new("host-actions-no-plugin");
-    let unavailable =
-        PluginSettings::at_path("docker", dir.path().join("no-docker-plugin")).expect("settings");
-    let router = RoutingExecutor::with_provider_source(
-        Arc::new(PluginSource::new(unavailable)),
-        dir.path(),
-        Retention::Never,
-    );
+    let router = without_docker(&dir);
     let ledger = Arc::new(MemoryLedger::default());
     let lease = SandboxLeaseId::new(0);
     router.set_ledger(ledger);
@@ -203,13 +208,7 @@ async fn failed_standalone_action_cleanup_preserves_the_host_workspace_until_ret
 
 async fn assert_failed_action_cleanup_preserves_workspace(lease: Option<SandboxLeaseId>) {
     let dir = RunDir::new("host-actions-cleanup-retry");
-    let unavailable =
-        PluginSettings::at_path("docker", dir.path().join("no-docker-plugin")).expect("settings");
-    let router = RoutingExecutor::with_provider_source(
-        Arc::new(PluginSource::new(unavailable)),
-        dir.path(),
-        Retention::Never,
-    );
+    let router = without_docker(&dir);
     router.set_ledger(Arc::new(MemoryLedger::default()));
     let ctx = lease.map_or_else(AcquireContext::bare, |lease| {
         AcquireContext::bare().with_lease(lease)

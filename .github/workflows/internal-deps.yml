@@ -1,7 +1,7 @@
 name: Internal dependencies
 
-# Unfrozen internal Git dependencies name `branch = "main"`; Cargo.lock picks
-# the commit CI builds. Each night this job moves the lock to the current main
+# Internal Git dependencies track branches, and Cargo.lock picks
+# the commit CI builds. Each night this job moves the lock to each branch head
 # of each internal library with `cargo update -p`, then runs the routine tests
 # against it, so drift is noticed without anyone asking. A failure opens one
 # tracking issue labeled `internal-deps`, or comments on the open one; the
@@ -71,17 +71,10 @@ jobs:
       # repository moves every package from that repository. The summary names
       # each repository whose locked commit moved, for the job summary and the
       # tracking issue.
-      #
-      # sandbox-driver is deliberately left out: its main is becoming
-      # new-API-only, so Cargo.toml pins tag v2 by revision (SANDBOX_DRIVER_PIN),
-      # the last commit with the old API that Petri, Fabro, and Pebble use.
-      # Lift the pin once all three are ported to the new API and switch
-      # together: restore branch = "main" in all three manifests, add
-      # sandbox-driver back here, and delete the pin check.
       - name: Update internal dependencies
         id: update
         env:
-          INTERNAL_CRATES: pebble-agent lithos-llm twin-openai
+          INTERNAL_CRATES: pebble-agent lithos-llm sandbox-driver twin-openai
         run: |
           set -euo pipefail
           cp Cargo.lock "$RUNNER_TEMP/Cargo.lock.before"
@@ -143,7 +136,7 @@ jobs:
           else
             git checkout -- Cargo.lock
             echo "changed=false" >> "$GITHUB_OUTPUT"
-            echo "Cargo.lock already locks every internal main; nothing to do."
+            echo "Cargo.lock already locks every internal branch head; nothing to do."
           fi
           delimiter="SUMMARY_$(openssl rand -hex 16)"
           {
@@ -152,22 +145,20 @@ jobs:
             echo "$delimiter"
           } >> "$GITHUB_OUTPUT"
 
-      # A Pebble main that names sandbox-driver differently would add a second
-      # copy to the lock instead of moving the pinned one.
-      - name: Check that sandbox-driver is still pinned
-        env:
-          SANDBOX_DRIVER_PIN: 0a073809773b0ae007b316973d8c0993ca6a5d21 # tag v2
+      # A Pebble update that names sandbox-driver differently would add a second
+      # copy to the lock instead of updating the shared source.
+      - name: Check that sandbox-driver has one main source
         run: |
           set -euo pipefail
           sources="$(grep -o 'git+https://github.com/lithoscomputer/sandbox-driver[^"]*' Cargo.lock | sort -u)"
-          if [ "$(wc -l <<< "$sources")" -ne 1 ] || [ "${sources##*#}" != "$SANDBOX_DRIVER_PIN" ]; then
-            echo "::error::Cargo.lock must lock sandbox-driver only at tag v2 ($SANDBOX_DRIVER_PIN), but locks: $sources"
+          if [ "$(wc -l <<< "$sources")" -ne 1 ] || [[ "$sources" != git+https://github.com/lithoscomputer/sandbox-driver.git\?branch=main#* ]]; then
+            echo "::error::Cargo.lock must lock sandbox-driver from one main source, but locks: $sources"
             exit 1
           fi
 
       # The rest mirrors the Linux half of the routine CI job, so the new lock
-      # meets the same test suite: the corpus, the vendored bundles, Docker,
-      # and the sandbox plugins, all required. It runs the lint, the tests, and
+      # meets the same test suite: the corpus, the vendored bundles and Docker,
+      # all required. It runs the lint, the tests, and
       # the compiler floor, not the whole `mise run check`: the release build
       # and the repository checks do not depend on the lock.
       - name: Fetch the corpus
@@ -185,11 +176,6 @@ jobs:
       - name: Pre-pull the test image
         if: steps.update.outputs.changed == 'true'
         run: docker pull alpine:3.20
-
-      # Built from the sandbox-driver commit the updated Cargo.lock locks.
-      - name: Build the sandbox plugins
-        if: steps.update.outputs.changed == 'true'
-        run: mise run plugins:build
 
       - name: Lint
         if: steps.update.outputs.changed == 'true'
@@ -252,7 +238,7 @@ jobs:
           {
             echo "The nightly internal dependency update failed: $RUN_URL"
             echo
-            echo "It moved Cargo.lock to the current main of each internal library with \`cargo update -p\` and ran the routine checks against it. Whoever broke an API this repository uses fixes it here promptly."
+            echo "It moved Cargo.lock to each internal library's configured branch head with \`cargo update -p\` and ran the routine checks against it. Whoever broke an API this repository uses fixes it here promptly."
             echo
             echo "${SUMMARY:-No summary was recorded: the run failed before \`cargo update\` finished.}"
           } > "$body"

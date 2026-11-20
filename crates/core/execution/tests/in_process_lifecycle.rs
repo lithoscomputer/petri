@@ -1,6 +1,6 @@
-//! Durable runs over built-in providers linked into this process: leases
-//! are recorded, retained, and pruned through the same records a plugin
-//! writes, and a run that cannot start closes what it opened.
+//! Durable runs over an application's own sandbox catalog: leases are
+//! recorded, retained, and pruned through the same records the standard
+//! catalog writes, and a run that cannot start closes what it opened.
 
 use std::collections::BTreeMap;
 use std::fs;
@@ -91,33 +91,28 @@ async fn a_retained_host_workspace_is_pruned_by_a_fresh_runtime_with_the_same_pr
     let (providers, host, docker) = host_providers();
     let runtime = Runtime::standard()
         .options(options.clone())
-        .in_process_providers(providers.clone());
+        .sandbox_catalog(providers.clone());
     let workspace = fail_and_retain(&runtime, &directory).await;
     assert_eq!(host.connects(), 1);
 
     // Prune runs later, in a runtime of its own, over the same recipe.
-    let fresh = Runtime::bare()
-        .options(options)
-        .in_process_providers(providers);
+    let fresh = Runtime::bare().options(options).sandbox_catalog(providers);
     assert_pruned(&fresh, &directory, &workspace).await;
     assert_eq!(host.connects(), 2, "prune opened the run's registry again");
     assert_eq!(docker.connects(), 0, "no action host was recorded");
 }
 
-/// A lease the Host plugin recorded carries the same fingerprint the
-/// built-in provider verifies, so a worker that switches to the built-in
-/// still prunes it.
+/// A lease the standard catalog recorded names its `host` entry, so a
+/// worker with its own catalog over the same entry name still prunes it.
 #[tokio::test]
-async fn a_lease_the_host_plugin_recorded_is_pruned_through_the_built_in_host() {
+async fn a_lease_the_standard_catalog_recorded_is_pruned_through_an_application_catalog() {
     let directory = RunDir::new("plugin-then-in-process-prune");
     let options = retained_on_failure(&directory);
-    let plugin_runtime = Runtime::standard().options(options.clone());
-    let workspace = fail_and_retain(&plugin_runtime, &directory).await;
+    let standard = Runtime::standard().options(options.clone());
+    let workspace = fail_and_retain(&standard, &directory).await;
 
     let (providers, host, _) = host_providers();
-    let fresh = Runtime::bare()
-        .options(options)
-        .in_process_providers(providers);
+    let fresh = Runtime::bare().options(options).sandbox_catalog(providers);
     assert_pruned(&fresh, &directory, &workspace).await;
     assert_eq!(host.connects(), 1);
 }
@@ -129,7 +124,7 @@ async fn a_coordinator_that_cannot_start_closes_its_run() {
         let (providers, ..) = host_providers();
         let runtime = Runtime::standard()
             .options(retained_on_failure(&directory))
-            .in_process_providers(providers);
+            .sandbox_catalog(providers);
         let run = runtime.prepare_run(directory.path());
         let router = run.sandbox_router().expect("standard router").clone();
         let env = router

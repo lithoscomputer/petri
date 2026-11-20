@@ -6,6 +6,7 @@
 //! capability. Dev-dependency only; never published.
 
 use std::collections::BTreeMap;
+use std::io::Cursor;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -14,13 +15,14 @@ use std::{env, fs, process, thread};
 
 use driver::ExecutionReport;
 use executor::Retention;
-use executor_sandbox::{LEASE_LABEL, PluginSettings, PluginSource, ProviderSource, RUN_LABEL};
+use executor_sandbox::{LEASE_LABEL, RUN_LABEL, SandboxBackend, SandboxCatalog, SandboxOptions};
 use ir::{Graph, GraphBuilder, NodeId, ScopeId, StepRef, Value};
-use sandbox_driver::{SandboxFilter, SandboxProvider, SandboxState, SandboxStatus};
+use sandbox_driver::{LabelFilter, SandboxState, SandboxSummary, Sandboxes, Status};
 use serde::Deserialize;
 use serde_json::json;
 use steps::PROCESS_KIND;
 use store::{Access, OwnerId, RunDirStore, RunLogs};
+use tokio::io::AsyncReadExt as _;
 use tokio::process::Command;
 use tokio::task::yield_now;
 use tokio::time;
@@ -318,19 +320,39 @@ pub fn assert_one_terminal_per_firing(report: &ExecutionReport) {
     );
 }
 
-/// Whether the Docker plugin can be launched from this process's environment
-/// and reports a healthy daemon: the same path every container scope takes.
-/// The plugin comes from `PETRI_SANDBOX_DOCKER_PLUGIN`, which `mise run
-/// plugins:build` installs under `target/plugins` and the test tasks point
-/// at.
-pub async fn is_docker_available() -> bool {
-    let Ok(settings) = PluginSettings::from_env("docker", None) else {
-        return false;
+/// The catalog a run with `backend` and no catalog file places scopes on,
+/// opened from this process's environment.
+fn standard_sandboxes(backend: SandboxBackend) -> Result<Sandboxes, String> {
+    SandboxCatalog::from_options(&SandboxOptions {
+        backend,
+        ..SandboxOptions::default()
+    })?
+    .open()
+    .map_err(|error| error.to_string())
+}
+
+/// Whether `entry` of the standard catalog activates from this process's
+/// environment and reports itself healthy.
+async fn entry_health(backend: SandboxBackend, entry: &str) -> Result<(), String> {
+    let sandboxes = standard_sandboxes(backend)?;
+    let health = match sandboxes.provider(entry) {
+        Ok(provider) => provider.health().await.map_err(|error| error.to_string()),
+        Err(error) => Err(error.to_string()),
     };
-    let supervisor = PluginSource::new(settings);
-    let ready = supervisor.current().await.is_ok();
-    supervisor.shutdown().await;
-    ready
+    let _ = sandboxes.shutdown().await;
+    match health? {
+        health if health.healthy => Ok(()),
+        health => Err(health
+            .message
+            .unwrap_or_else(|| format!("the {entry} provider reports itself unhealthy"))),
+    }
+}
+
+/// Whether the built-in Docker provider reaches a healthy daemon from this
+/// process's environment (`DOCKER_HOST`, or the default socket): the same
+/// path every container scope takes.
+pub async fn is_docker_available() -> bool {
+    entry_health(SandboxBackend::Docker, "docker").await.is_ok()
 }
 
 /// The run under `run_dir`, opened for reading: no lease, so a live run
@@ -548,9 +570,9 @@ pub async fn is_docker_ready() -> bool {
     }
     assert!(
         !env::var("PETRI_REQUIRE_DOCKER").is_ok_and(|v| !v.is_empty()),
-        "PETRI_REQUIRE_DOCKER is set, but the Docker plugin is missing or reports no daemon"
+        "PETRI_REQUIRE_DOCKER is set, but the Docker provider reaches no daemon"
     );
-    eprintln!("skipping: no Docker plugin with a reachable daemon");
+    eprintln!("skipping: no reachable Docker daemon");
     false
 }
 
@@ -558,12 +580,9 @@ pub async fn is_docker_ready() -> bool {
 pub const REQUIRE_DAYTONA: &str = "PETRI_REQUIRE_DAYTONA";
 
 /// Why the live Daytona tier cannot run from this process's environment, or
-/// `Ok` once the Daytona plugin launched and its backend accepted the
-/// credentials. The plugin comes from `PETRI_SANDBOX_DAYTONA_PLUGIN`, which
-/// `mise run plugins:build:daytona` installs under `target/plugins`; the
-/// credentials are `DAYTONA_API_KEY` or `DAYTONA_JWT_TOKEN`, forwarded to the
-/// plugin as they are. The credential check comes first so a machine without
-/// one never launches a plugin.
+/// `Ok` once the built-in Daytona provider activated and its backend accepted
+/// the credentials, `DAYTONA_API_KEY` or `DAYTONA_JWT_TOKEN`. The credential
+/// check comes first so a machine without one never contacts Daytona.
 pub async fn daytona_availability() -> Result<(), String> {
     let credential = ["DAYTONA_API_KEY", "DAYTONA_JWT_TOKEN"]
         .iter()
@@ -574,15 +593,7 @@ pub async fn daytona_availability() -> Result<(), String> {
                 .to_owned(),
         );
     }
-    let settings = PluginSettings::from_env("daytona", None).map_err(|error| error.to_string())?;
-    let supervisor = PluginSource::new(settings);
-    let ready = supervisor
-        .current()
-        .await
-        .map(|_| ())
-        .map_err(|error| error.to_string());
-    supervisor.shutdown().await;
-    ready
+    entry_health(SandboxBackend::Daytona, "daytona").await
 }
 
 /// The skip-or-require convention of the live Daytona tier, the Docker
@@ -611,59 +622,65 @@ pub async fn is_daytona_ready() -> bool {
 
 /// A view of a run's Daytona sandboxes from outside the executor under test:
 /// the oracle the Daytona battery compares against, as `docker inspect`
-/// through [`container_id`] is for the Docker one. It launches its own
-/// Daytona plugin from this process's environment, so it sees exactly what
-/// the executor's plugin sees, and lists by the labels every sandbox of a
-/// run carries. Shut it down when done; a dropped observer leaves its
-/// plugin to exit with the process.
+/// through [`container_id`] is for the Docker one. It opens its own catalog
+/// from this process's environment, so it reaches exactly what the
+/// executor's Daytona entry reaches, and finds by the labels every sandbox of
+/// a run carries. Shut it down when done.
 pub struct DaytonaObserver {
-    source:   PluginSource,
-    provider: Arc<dyn SandboxProvider>,
+    sandboxes: Sandboxes,
 }
 
 impl DaytonaObserver {
-    /// Launches the plugin. Call after [`is_daytona_ready`] said yes.
-    pub async fn from_env() -> Self {
-        let settings = PluginSettings::from_env("daytona", None).expect("daytona is a plugin kind");
-        let source = PluginSource::new(settings);
-        let (provider, _) = ProviderSource::current(&source)
-            .await
-            .expect("the Daytona plugin launched once for the gate, so it launches again");
-        Self { source, provider }
+    /// Opens the catalog. Call after [`is_daytona_ready`] said yes.
+    pub fn from_env() -> Self {
+        Self {
+            sandboxes: standard_sandboxes(SandboxBackend::Daytona)
+                .expect("the Daytona catalog opened once for the gate, so it opens again"),
+        }
     }
 
-    /// Every sandbox of the run with `run_id` that still exists on the
-    /// provider, in the provider's order: the leak check after a release.
-    pub async fn sandboxes(&self, run_id: &str) -> Vec<SandboxStatus> {
-        let mut filter = SandboxFilter::default();
-        filter
-            .labels
-            .insert(RUN_LABEL.to_owned(), run_id.to_owned());
-        self.provider
-            .list(&filter)
+    /// Every sandbox of the run with `run_id` that still exists on Daytona,
+    /// by id: the leak check after a release.
+    pub async fn sandboxes(&self, run_id: &str) -> Vec<SandboxSummary> {
+        let found = self
+            .sandboxes
+            .find(LabelFilter::eq(RUN_LABEL, run_id))
             .await
-            .expect("the Daytona plugin lists the run's sandboxes")
+            .expect("the catalog searches its entries");
+        if let Some(failure) = found
+            .failures
+            .iter()
+            .find(|failure| failure.entry.as_str() == "daytona")
+        {
+            panic!("Daytona lists the run's sandboxes: {}", failure.error);
+        }
+        found
+            .sandboxes
             .into_iter()
-            .filter(|status| {
-                !matches!(status.state, SandboxState::Deleted | SandboxState::Deleting)
+            .filter(|summary| summary.reference.provider.as_str() == "daytona")
+            .filter(|summary| {
+                !matches!(
+                    summary.state,
+                    SandboxState::Deleted | SandboxState::Deleting
+                )
             })
             .collect()
     }
 
     /// The sandbox of `lease` in the run with `run_id`, when it exists.
-    pub async fn sandbox(&self, run_id: &str, lease: u64) -> Option<SandboxStatus> {
+    pub async fn sandbox(&self, run_id: &str, lease: u64) -> Option<SandboxSummary> {
         let lease = lease.to_string();
         self.sandboxes(run_id)
             .await
             .into_iter()
-            .find(|status| status.labels.get(LEASE_LABEL) == Some(&lease))
+            .find(|summary| summary.labels.get(LEASE_LABEL) == Some(&lease))
     }
 
     /// Whether the sandbox of `lease` exists and is running.
     pub async fn is_running(&self, run_id: &str, lease: u64) -> bool {
         self.sandbox(run_id, lease)
             .await
-            .is_some_and(|status| status.state == SandboxState::Running)
+            .is_some_and(|summary| summary.state == SandboxState::Running)
     }
 
     /// Whether the sandbox of `lease` exists and is stopped: what retention
@@ -671,7 +688,44 @@ impl DaytonaObserver {
     pub async fn is_stopped(&self, run_id: &str, lease: u64) -> bool {
         self.sandbox(run_id, lease)
             .await
-            .is_some_and(|status| status.state == SandboxState::Stopped)
+            .is_some_and(|summary| summary.state == SandboxState::Stopped)
+    }
+
+    /// Whether the sandbox of `lease` is stopped within 30 seconds. Daytona
+    /// accepts a stop before its list endpoint reports the new state.
+    pub async fn eventually_stopped(&self, run_id: &str, lease: u64) -> bool {
+        let deadline = Instant::now() + Duration::from_secs(30);
+        loop {
+            if self.is_stopped(run_id, lease).await {
+                return true;
+            }
+            if Instant::now() >= deadline {
+                return false;
+            }
+            time::sleep(Duration::from_millis(250)).await;
+        }
+    }
+
+    /// The run's sandboxes still listed after up to 30 seconds: Daytona
+    /// accepts a delete before its list endpoint stops reporting the
+    /// sandbox, so an empty list may take a moment.
+    pub async fn eventually_gone(&self, run_id: &str) -> Vec<SandboxSummary> {
+        let deadline = Instant::now() + Duration::from_secs(30);
+        loop {
+            let left = self.sandboxes(run_id).await;
+            if left.is_empty() || Instant::now() >= deadline {
+                return left;
+            }
+            time::sleep(Duration::from_millis(250)).await;
+        }
+    }
+
+    /// What Daytona reports of the sandbox of `lease`, through a second
+    /// attachment: its image, snapshot and allocation.
+    pub async fn status(&self, run_id: &str, lease: u64) -> Option<Status> {
+        let summary = self.sandbox(run_id, lease).await?;
+        let sandbox = self.sandboxes.attach(&summary.reference).await.ok()?;
+        sandbox.status().await.ok()
     }
 
     /// The bytes of `path` inside the running sandbox of `lease`, through a
@@ -679,20 +733,27 @@ impl DaytonaObserver {
     /// holds the sandbox, or after it crashed. `None` when the sandbox or
     /// the file is absent.
     pub async fn read(&self, run_id: &str, lease: u64, path: &str) -> Option<Vec<u8>> {
-        let status = self.sandbox(run_id, lease).await?;
-        let sandbox = self.provider.attach(&status.id, None).await.ok()?;
-        sandbox.fs().read(path).await.ok()
+        let summary = self.sandbox(run_id, lease).await?;
+        let sandbox = self.sandboxes.attach(&summary.reference).await.ok()?;
+        let mut stream = sandbox.files().get(path, None).await.ok()?;
+        let mut bytes = Vec::new();
+        stream.read_to_end(&mut bytes).await.ok()?;
+        Some(bytes)
     }
 
     /// Writes `contents` to `path` inside the running sandbox of `lease`.
     pub async fn write(&self, run_id: &str, lease: u64, path: &str, contents: &[u8]) -> bool {
-        let Some(status) = self.sandbox(run_id, lease).await else {
+        let Some(summary) = self.sandbox(run_id, lease).await else {
             return false;
         };
-        let Ok(sandbox) = self.provider.attach(&status.id, None).await else {
+        let Ok(sandbox) = self.sandboxes.attach(&summary.reference).await else {
             return false;
         };
-        sandbox.fs().write(path, contents).await.is_ok()
+        sandbox
+            .files()
+            .put(path, Box::pin(Cursor::new(contents.to_vec())))
+            .await
+            .is_ok()
     }
 
     /// Waits for `path` to appear inside the sandbox of `lease`.
@@ -713,9 +774,9 @@ impl DaytonaObserver {
         false
     }
 
-    /// Stops the observer's plugin.
+    /// Shuts the observer's catalog down.
     pub async fn shutdown(self) {
-        self.source.shutdown().await;
+        let _ = self.sandboxes.shutdown().await;
     }
 }
 

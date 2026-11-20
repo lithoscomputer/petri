@@ -20,7 +20,4 @@ unset GH_TOKEN GITHUB_TOKEN GH_ENTERPRISE_TOKEN GITHUB_ENTERPRISE_TOKEN PETRI_SW
 # same credential policy and the token never enters the Cargo environment.
 export PETRI_SWEEP_READONLY=1
 
-# Use the same plugin locations as the repository's mise test tasks.
-export PETRI_SANDBOX_DOCKER_PLUGIN="${PETRI_SANDBOX_DOCKER_PLUGIN:-$PWD/target/plugins/bin/sandbox-driver-docker}"
-export PETRI_SANDBOX_HOST_PLUGIN="${PETRI_SANDBOX_HOST_PLUGIN:-$PWD/target/plugins/bin/sandbox-driver-host}"
 exec cargo test --locked -p petri-github-acceptance --test runs -- --ignored --nocapture "$@"

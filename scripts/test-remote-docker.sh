@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Run the real cross-job artifact battery against an isolated Docker daemon.
-# The daemon has no host bind mounts; workspace access must cross the plugin.
+# The daemon has no host bind mounts; workspace access must cross the provider.
 set -euo pipefail
 
 if ! docker info >/dev/null 2>&1; then

@@ -136,7 +136,6 @@ async fn run_finish_closes_its_plugin_and_preserves_other_runs_and_retained_file
         fs::read(first_dir.workspace().join("retained")).expect("retained workspace"),
         b"kept"
     );
-    assert!(first_dir.path().join("host-registry").is_dir());
     second_env
         .exec()
         .write_file(Path::new("still-live"), b"yes")

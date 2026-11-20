@@ -6,9 +6,9 @@
 
 mod support;
 
-use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
+use std::{env, fs};
 
 use executor::{Executor as _, ExitStatus, ProcessSpec, Retention, ScopeOutcome, ScopeSpec};
 use executor_sandbox::HostExecutor;
@@ -20,10 +20,22 @@ fn spec() -> ScopeSpec {
     ScopeSpec::new(ScopeId::new(0), "scope-0")
 }
 
-/// Process generations are durable provider records, separate from workspaces.
-fn generations(dir: &RunDir) -> Vec<PathBuf> {
+/// The built-in Host provider's private records for the instance that owns
+/// `sandbox` (a `host-<instance>-s<n>` id): its process groups live under
+/// `<tmp>/sandbox-driver-host/<instance>/<record>/groups`.
+fn host_root(sandbox: &str) -> PathBuf {
+    let instance = sandbox
+        .strip_prefix("host-")
+        .and_then(|rest| rest.rsplit_once("-s"))
+        .map(|(instance, _)| instance)
+        .expect("a built-in Host sandbox id");
+    env::temp_dir().join("sandbox-driver-host").join(instance)
+}
+
+/// Process generations are the provider's records, separate from workspaces.
+fn generations(root: &Path) -> Vec<PathBuf> {
     let mut generations = Vec::new();
-    if let Ok(resources) = fs::read_dir(dir.path().join("host-registry")) {
+    if let Ok(resources) = fs::read_dir(root) {
         for resource in resources.flatten() {
             if let Ok(entries) = fs::read_dir(resource.path().join("groups")) {
                 generations.extend(entries.flatten().map(|entry| entry.path()));
@@ -63,7 +75,7 @@ async fn reacquire_fences_the_survivor_and_isolates_status() {
     assert_eq!(done.wait().await.expect("wait"), ExitStatus::code(5));
 
     // And something still running: the survivor.
-    let _survivor = exec
+    let survivor = exec
         .spawn(ProcessSpec::new("sh", &[
             "-c",
             "while :; do echo tick >> heartbeat; sleep 0.05; done",
@@ -72,8 +84,12 @@ async fn reacquire_fences_the_survivor_and_isolates_status() {
         .expect("spawn");
     let heartbeat = dir.workspace().join("heartbeat");
     assert!(wait_for_file(&heartbeat, Duration::from_secs(10)).await);
-    // Drop the router without releasing its environment. Its plugin dies,
-    // while the sentinel and workload retain their own process group.
+    // The owner ends without releasing: the executor and every handle on
+    // its environment go, as they do when the driver's process dies. The
+    // built-in Host provider ends the groups its last owner leaves.
+    drop(survivor);
+    drop(exec);
+    drop(env);
     drop(crashed);
 
     let fresh = HostExecutor::new(dir.path());
@@ -117,6 +133,7 @@ async fn fencing_twice_is_a_noop() {
             .acquire(&spec(), &executor::AcquireContext::bare())
             .await
             .expect("acquire");
+        let root = host_root(&env.sandbox().instance);
         let mut process = env
             .exec()
             .spawn(ProcessSpec::new("sh", &["-c", "exit 0"]))
@@ -125,7 +142,7 @@ async fn fencing_twice_is_a_noop() {
         assert_eq!(process.wait().await.expect("wait"), ExitStatus::code(0));
         executor.release(env, ScopeOutcome::Succeeded).await;
         assert_eq!(
-            generations(&dir).len(),
+            generations(&root).len(),
             0,
             "stop removes drained generations after fencing"
         );

@@ -260,6 +260,7 @@ mod tests {
             image:             None,
             snapshot:          None,
             working_directory: "/work".into(),
+            reference:         None,
         };
         let handle = EnvHandle::new(ScopeId::new(0), "scope-0".into(), sandbox, exec.clone(), ())
             .with_runner(runner.clone())

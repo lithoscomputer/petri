@@ -1,149 +1,157 @@
-//! Petri executors over the sandbox-driver provider family.
+//! Petri executors over the shared sandbox API of sandbox-driver.
 //!
-//! [`SandboxExecutor`] maps scopes and durable leases to Host, Docker, or
-//! Daytona sandboxes. Providers own process execution, files, one-shot
-//! containers, and cleanup. [`RoutingExecutor`] selects the provider from
-//! runtime options and the scope's target. [`HostExecutor`] is a convenience
-//! wrapper for standalone Host execution.
+//! [`SandboxExecutor`] places each scope on a catalog environment and keeps
+//! one durable lease per workspace on the sandbox it gets. Providers own
+//! process execution, files, one-shot containers, and cleanup; Petri names
+//! environments and stores references, and never builds a provider's recipe.
+//! [`RoutingExecutor`] also recovers old action hosts and refuses new Host
+//! container actions until portable host-workspace mounts are available.
+//! It is what the runtime registers. [`HostExecutor`] is a convenience wrapper
+//! for standalone Host execution.
 //!
-//! No provider crate is linked here. A provider is reached one of two ways:
-//!
-//! - as a plugin process over sandbox-driver's JSON-RPC protocol ([`plugin`]),
-//!   the default, and the only path a third-party provider has;
-//! - as a built-in the embedding application links and hands over through
-//!   [`InProcessProviders`] ([`in_process`]), in which case no plugin is
-//!   launched.
-//!
-//! Both record the same fingerprints ([`fingerprint`]), so a lease recorded
-//! one way is recoverable the other. The [`SimulatedProvider`] is a dry
-//! run's: it creates nothing and runs nothing.
+//! Host, Docker and Daytona are built-in providers linked into this crate and
+//! registered with [`sandbox_driver::Registry::builtin`]
+//! ([`SandboxCatalog::builtin_registry`]); none is launched as a plugin. A
+//! dry run acquires every scope on the simulated provider, which creates
+//! nothing and runs nothing.
 
-#[cfg(test)]
-mod acquire_tests;
 mod actions;
 mod backend;
-#[cfg(test)]
-mod daytona_tests;
+mod catalog;
 mod env;
-pub mod fingerprint;
 mod gate;
 mod host;
-pub mod in_process;
-#[cfg(test)]
-mod in_process_tests;
 pub mod lease;
-pub mod plugin;
-#[cfg(test)]
-mod reconcile_tests;
 mod routing;
 mod run;
 mod simulated;
-#[cfg(test)]
-mod simulated_tests;
-mod snapshots;
 
+use std::collections::BTreeMap;
 use std::fmt;
+use std::num::{NonZeroU32, NonZeroU64};
 use std::sync::Arc;
-use std::time::Duration;
 
 use async_trait::async_trait;
 use executor::{
     AcquireContext, EnvError, EnvHandle, Executor, ReleaseReport, Retention, SandboxLeaseId,
     ScopeOutcome, ScopeSpec,
 };
-use ir::{ContainerOptions, RuntimeTarget, SandboxInstance};
+use ir::{RuntimeTarget, SandboxInstance};
 use sandbox_driver::{
-    NetworkPolicy, Sandbox, SandboxProvider, SandboxSource, SandboxSpec, WorkspaceOwnership,
+    ContainerSpec, Descriptor, Error as DriverError, Isolation, NetworkPolicy, ProviderName,
+    ReadinessCheck, Sandbox, SandboxSpec, Sandboxes, ServiceSpec, Source, WorkspaceOwnership,
 };
-use sandbox_driver_daytona_config::{
-    DaytonaProviderConfig, DockerExecutionTarget, NestedDockerConfig,
-};
-use sandbox_driver_docker_config::{DockerProviderConfig, Health, RegistryAuth, Sidecar};
 use smol_str::SmolStr;
 
 pub use crate::backend::{
     DaytonaResources, DaytonaSandboxKind, LostSandbox, SandboxBackend, SandboxOptions,
 };
+use crate::catalog::Credentials;
+pub use crate::catalog::{SIMULATED_ENVIRONMENT, SandboxCatalog};
 use crate::env::{OneShotRunner, SandboxEnv};
 use crate::gate::RunGate;
 pub use crate::host::HostExecutor;
-pub use crate::in_process::{
-    InProcessProviders, ProviderContext, ProviderFactory, ProviderNetwork,
-};
 pub use crate::lease::{
     LeaseLedger, LeaseRecord, LeaseState, LedgerError, MemoryLedger, PendingIntent,
-    ReconcileReport, RecordedLease, SandboxLeaseManager,
+    ReconcileReport, RecordedLease, SandboxAdmission, SandboxLeaseManager,
 };
-pub use crate::plugin::{FixedProvider, PluginError, PluginSettings, PluginSource, ProviderSource};
+use crate::lease::{LeaseRequest, Prepared, to_reference};
 pub use crate::routing::{CONTAINER_KIND, RoutingExecutor};
 use crate::run::workspace_dir;
 pub use crate::run::{LEASE_LABEL, RUN_LABEL, RunIdentity, WORKSPACE_LABEL};
-pub use crate::simulated::{SIMULATED_KIND, SimulatedProvider};
-use crate::snapshots::{RunnerSnapshot, RunnerSnapshots};
+pub use crate::simulated::{SIMULATED_KIND, SimulatedFactory};
 
-/// The container path every scope's workspace lives at.
+/// The container path every container scope's workspace lives at.
 pub const CONTAINER_WORKSPACE: &str = "/workspace";
 /// The alias a container on a local daemon reaches the driver's machine
-/// through; the provider config maps it to the daemon's gateway.
+/// through; the container maps it to the daemon's gateway.
 const DOCKER_HOST_ALIAS: &str = "host.docker.internal";
 
 /// The backend name this crate's errors carry.
 const BACKEND: &str = "sandbox";
 
-pub(crate) fn acquire_failed(error: &sandbox_driver::Error) -> EnvError {
-    if let sandbox_driver::Error::Provider(error) = error
-        && error.provider.as_str() == "host"
-        && error.code.as_deref() == Some("fence_leaked")
-    {
+/// A service readiness check states its whole budget; a workflow's health
+/// check states only some of it. These fill the rest, within the five
+/// minutes Docker waits for a service at most.
+const READY_DEADLINE_MS: u64 = 300_000;
+const READY_INTERVAL_MS: u64 = 1_000;
+const READY_TIMEOUT_MS: u64 = 30_000;
+const READY_RETRIES: u32 = 30;
+
+pub(crate) fn acquire_failed(error: &DriverError) -> EnvError {
+    if let DriverError::FenceLeaked { message } = error {
         return EnvError::FenceLeaked {
-            detail: error.message.clone(),
+            detail: message.clone(),
         };
     }
     EnvError::backend(BACKEND, "acquire", error.to_string())
 }
 
-/// An [`Executor`] that realizes container scopes on one sandbox-driver
-/// provider. The sandbox owns its workspace; every acquisition names the
-/// lease it lives under, and one live handle serves every holder of that
-/// lease.
+/// Refuse a feature the shared sandbox API cannot express yet.
+pub(crate) fn parity_gap(feature: &str) -> EnvError {
+    EnvError::backend(
+        BACKEND,
+        "acquire",
+        format!(
+            "{feature} is not yet carried by sandbox-driver's shared sandbox API; Petri supports \
+             it again once the API addition lands"
+        ),
+    )
+}
+
+/// An [`Executor`] that realizes scopes on the run's sandbox catalog. A
+/// sandbox owns its workspace; every acquisition names the lease it lives
+/// under, and one live handle serves every holder of that lease.
 pub struct SandboxExecutor {
-    manager:      Arc<SandboxLeaseManager>,
-    identity:     Arc<RunIdentity>,
-    retention:    Retention,
-    host_address: Option<String>,
-    options:      SandboxOptions,
-    snapshots:    RunnerSnapshots,
-    /// Every scope is realized on the [`SimulatedProvider`], whatever its
+    manager:        Arc<SandboxLeaseManager>,
+    identity:       Arc<RunIdentity>,
+    retention:      Retention,
+    options:        SandboxOptions,
+    credentials:    Arc<Credentials>,
+    /// Every scope is realized on the simulated environment, whatever its
     /// target: a bare spec, no host-process semantics, no route back.
-    simulated:    bool,
+    simulated:      bool,
     /// Admission to the environments this executor hands out.
-    gate:         RunGate,
+    gate:           RunGate,
+    /// Per environment, the configured route back to this machine.
+    host_addresses: BTreeMap<String, Option<String>>,
 }
 
 impl SandboxExecutor {
-    /// Builds an executor over `source`, with `ledger` as the durable
-    /// record of its leases; `identity` names the run.
-    pub fn new(
-        source: Arc<dyn ProviderSource>,
+    /// Builds an executor over the run's catalog, with `ledger` as the
+    /// durable record of its leases; `identity` names the run.
+    pub(crate) fn new(
+        sandboxes: Sandboxes,
+        credentials: Arc<Credentials>,
         ledger: Arc<dyn LeaseLedger>,
         identity: Arc<RunIdentity>,
         retention: Retention,
-        host_address: Option<String>,
         options: SandboxOptions,
     ) -> Self {
         Self {
             manager: Arc::new(
-                SandboxLeaseManager::new(source, ledger, identity.clone())
+                SandboxLeaseManager::new(sandboxes, credentials.clone(), ledger, identity.clone())
                     .with_lost_sandbox(options.lost_sandbox),
             ),
             identity,
             retention,
-            host_address,
             options,
-            snapshots: RunnerSnapshots::default(),
+            credentials,
             simulated: false,
             gate: RunGate::default(),
+            host_addresses: BTreeMap::new(),
         }
+    }
+
+    /// The configured route back to this machine, per environment, in
+    /// place of the provider's reported locality.
+    #[must_use]
+    pub(crate) fn with_host_addresses(
+        mut self,
+        host_addresses: BTreeMap<String, Option<String>>,
+    ) -> Self {
+        self.host_addresses = host_addresses;
+        self
     }
 
     /// Admits this executor's environments through the router's gate, so
@@ -154,23 +162,13 @@ impl SandboxExecutor {
         self
     }
 
-    /// An executor over the [`SimulatedProvider`] in `source`: what a dry
-    /// run acquires every scope on. A simulated sandbox does not outlive
-    /// its process, so a lease whose sandbox is gone gets a fresh one
-    /// ([`LostSandbox::Replace`]): there was never a workspace to lose. Nor
-    /// is there one to keep, so a standalone lease ends deleted.
-    pub fn simulated(
-        source: Arc<dyn ProviderSource>,
-        ledger: Arc<dyn LeaseLedger>,
-        identity: Arc<RunIdentity>,
-    ) -> Self {
-        let options = SandboxOptions {
-            lost_sandbox: LostSandbox::Replace,
-            ..SandboxOptions::default()
-        };
-        let mut executor = Self::new(source, ledger, identity, Retention::Never, None, options);
-        executor.simulated = true;
-        executor
+    /// Places every scope on the simulated environment: a dry run. Nor is
+    /// there a workspace to keep, so a standalone lease ends deleted.
+    #[must_use]
+    pub(crate) fn simulated(mut self) -> Self {
+        self.simulated = true;
+        self.retention = Retention::Never;
+        self
     }
 
     pub fn manager(&self) -> &Arc<SandboxLeaseManager> {
@@ -181,6 +179,25 @@ impl SandboxExecutor {
     /// `petri-<run id>-`, for a leak check after release.
     pub fn container_prefix(&self) -> String {
         self.identity.container_prefix()
+    }
+
+    /// The catalog environment a scope with this runtime is placed on.
+    pub(crate) fn environment_for(&self, runtime: &ir::RuntimeSpec) -> &str {
+        if self.simulated {
+            SIMULATED_ENVIRONMENT
+        } else {
+            self.options.environment_for(runtime)
+        }
+    }
+
+    async fn descriptor(&self, entry: &str) -> Result<Descriptor, EnvError> {
+        self.manager
+            .sandboxes()
+            .provider(entry)
+            .map_err(|error| acquire_failed(&error))?
+            .describe()
+            .await
+            .map_err(|error| acquire_failed(&error))
     }
 
     async fn acquire_inner(
@@ -194,74 +211,69 @@ impl SandboxExecutor {
             Some(lease) => (lease, false),
             None => (SandboxLeaseId::new(u64::from(scope.id.raw())), true),
         };
-        let name = self.identity.container_name(lease);
+        let environment = self.environment_for(&scope.runtime);
         let acquired = self
             .manager
             .acquire(
-                lease::LeaseRequest {
+                LeaseRequest {
                     lease,
                     workspace_id: scope.workspace_id.as_str(),
                     standalone,
                 },
-                |labels, provider| async move {
-                    let mut spec = self
-                        .build_spec(scope, &labels, &name, ctx, &*provider)
-                        .await?;
-                    if !self.simulated {
-                        spec.network = self.options.network.clone();
-                    }
-                    Ok(spec)
-                },
+                |labels| self.prepare(scope, environment, labels, lease, ctx),
             )
             .await?;
         let sandbox = acquired.sandbox();
+        let reference = sandbox.reference();
+        let descriptor = match self.descriptor(reference.provider.as_str()).await {
+            Ok(descriptor) => descriptor,
+            Err(error) => {
+                acquired.release().await;
+                return Err(error);
+            }
+        };
         // A retained sandbox may predate the requested block policy. Check
         // provider state before handing it to hooks or executing any stage.
         if !self.simulated && self.options.network == NetworkPolicy::Block {
-            let status = sandbox
-                .describe()
-                .await
-                .map_err(|error| acquire_failed(&error));
-            let verified = status.and_then(|status| {
-                if status.network == Some(NetworkPolicy::Block) {
-                    Ok(())
-                } else {
-                    Err(EnvError::backend(
-                        BACKEND,
-                        "acquire",
-                        "the sandbox does not report blocked networking; refusing to execute a blocked run",
-                    ))
-                }
-            });
+            let verified = match sandbox.status().await {
+                Ok(status) if status.network == Some(NetworkPolicy::Block) => Ok(()),
+                Ok(_) => Err(EnvError::backend(
+                    BACKEND,
+                    "acquire",
+                    "the sandbox does not report blocked networking; refusing to execute a \
+                     blocked run",
+                )),
+                Err(error) => Err(acquire_failed(&error)),
+            };
             if let Err(error) = verified {
                 acquired.release().await;
                 return Err(error);
             }
         }
 
-        // The ambient environment is a fact the steps rely on (`PATH` for
-        // the process step, say); a provider that cannot report it is not
-        // one this executor can serve, and says so at acquire.
-        let ambient = match sandbox.environment().await {
-            Ok(ambient) => ambient,
-            Err(error) => {
-                acquired.release().await;
-                return Err(EnvError::backend(
-                    BACKEND,
-                    "acquire",
-                    format!("the sandbox's environment could not be read: {error}"),
-                ));
-            }
-        };
+        let ambient = sandbox.env().clone();
         let mut env_overrides = scope.env.clone();
         if let RuntimeTarget::Container { options, .. } = &scope.runtime.target {
             env_overrides.extend(options.env.clone());
         }
-        let workspace = sandbox.working_directory().to_owned();
+        let workspace = sandbox.working_directory().to_string_lossy().into_owned();
         let instance = self.describe(&**sandbox, &workspace).await;
+        let locality = &descriptor.locality;
+        // A process on this machine, in a directory of this machine: the
+        // process step reads and writes it as one.
         let host = !self.simulated
-            && self.options.backend == SandboxBackend::Host
-            && matches!(scope.runtime.target, RuntimeTarget::HostProcess);
+            && descriptor.isolation == Isolation::None
+            && locality.mounts_host_paths;
+        // The configured route back for this environment, else what the
+        // provider reports: loopback for Host, the host alias on a local
+        // Docker daemon.
+        let host_address = match self.host_addresses.get(environment) {
+            Some(configured) => configured.clone(),
+            None => locality.host_address.clone().or_else(|| {
+                (locality.mounts_host_paths && descriptor.isolation != Isolation::None)
+                    .then(|| DOCKER_HOST_ALIAS.to_owned())
+            }),
+        };
         let env = SandboxEnv {
             host,
             sandbox: sandbox.clone(),
@@ -269,7 +281,7 @@ impl SandboxExecutor {
             ambient,
             env: env_overrides,
             grace: scope.grace,
-            host_address: self.host_address.clone(),
+            host_address: host_address.clone(),
             gate: self.gate.clone(),
         };
         // Docker actions in this scope run as one-shot containers in the
@@ -277,12 +289,11 @@ impl SandboxExecutor {
         let runner = OneShotRunner {
             sandbox: sandbox.clone(),
             workspace,
-            host_address: self.host_address.clone(),
+            host_address,
             env: scope.env.clone(),
             gate: self.gate.clone(),
         };
         let teardown = SandboxTeardown {
-            provider: self.manager.source().kind().to_owned(),
             sandbox: acquired.into_sandbox(),
             lease,
             standalone,
@@ -297,294 +308,283 @@ impl SandboxExecutor {
         .with_runner(Arc::new(runner)))
     }
 
-    /// The record of an acquired sandbox: its provider and id, and what the
-    /// provider reports it runs. A provider that cannot describe the sandbox
-    /// still has one: the image and snapshot are then unknown.
+    /// The record of an acquired sandbox: its reference, and what the
+    /// provider reports it runs. A provider that cannot report its status
+    /// still has the sandbox: the image and snapshot are then unknown.
     async fn describe(&self, sandbox: &dyn Sandbox, workspace: &str) -> SandboxInstance {
-        let (image, snapshot) = match sandbox.describe().await {
-            Ok(status) => (status.image, status.snapshot),
+        let reference = sandbox.reference();
+        let (image, snapshot) = match sandbox.status().await {
+            Ok(status) => (status.image, status.snapshot.map(|id| id.to_string())),
             Err(error) => {
                 tracing::warn!(
                     error = %error,
-                    sandbox = %sandbox.id(),
-                    "the acquired sandbox could not be described; its image is unrecorded"
+                    sandbox = %reference.id,
+                    "the acquired sandbox reported no status; its image is unrecorded"
                 );
                 (None, None)
             }
         };
         SandboxInstance {
-            provider:          SmolStr::new(self.manager.source().kind()),
-            instance:          SmolStr::new(sandbox.id().as_str()),
+            provider:          SmolStr::new(reference.provider.as_str()),
+            instance:          SmolStr::new(reference.id.as_str()),
             image:             image.map(SmolStr::new),
             snapshot:          snapshot.map(SmolStr::new),
             working_directory: SmolStr::new(workspace),
+            reference:         Some(to_reference(&reference)),
         }
     }
 
-    async fn build_spec(
+    /// The scope's sandbox over its environment's template: the run's
+    /// name and labels, the scope's env, its workload, and its services.
+    async fn prepare(
         &self,
         scope: &ScopeSpec,
-        labels: &[(String, String)],
-        name: &str,
+        environment: &str,
+        labels: Vec<(String, String)>,
+        lease: SandboxLeaseId,
         ctx: &AcquireContext,
-        provider: &dyn SandboxProvider,
-    ) -> Result<SandboxSpec, EnvError> {
+    ) -> Result<Prepared, EnvError> {
+        let sandboxes = self.manager.sandboxes();
+        let template = sandboxes
+            .environment(environment)
+            .await
+            .map_err(|error| acquire_failed(&error))?;
+        let name = self.identity.container_name(lease);
         if self.simulated {
             // A name, a working directory string and the run's labels:
             // nothing the scope declares (its image, services, env or
             // credentials) reaches a provider, because none is involved.
-            let mut spec = SandboxSpec::new(SandboxSource::HostDirectory)
-                .name(name)
-                .working_directory(format!("/{SIMULATED_KIND}/{}", scope.workspace_id));
-            spec.labels.extend(labels.iter().cloned());
-            return Ok(spec);
+            let mut spec = SandboxSpec::new(Source::HostDirectory);
+            spec.name = Some(name);
+            spec.working_directory = Some(format!("/{SIMULATED_KIND}/{}", scope.workspace_id));
+            spec.labels.extend(labels);
+            return self
+                .prepared(environment, template.provider, spec, Vec::new())
+                .await;
         }
-        if self.options.backend == SandboxBackend::Host
-            && matches!(scope.runtime.target, RuntimeTarget::HostProcess)
-        {
-            if !scope.services.is_empty() {
-                return Err(EnvError::backend(
-                    "host",
-                    "acquire",
-                    "services require a containerized job; set container: or select the docker backend",
-                ));
-            }
-            let workspace = workspace_dir(self.identity.run_dir(), scope.workspace_id.as_str());
-            let mut spec = SandboxSpec::new(SandboxSource::HostDirectory)
-                .name(name)
-                .working_directory(workspace.to_string_lossy());
-            spec.workspace_ownership = Some(WorkspaceOwnership::Managed);
-            spec.labels.extend(labels.iter().cloned());
-            spec.env.extend(
-                scope
-                    .env
-                    .iter()
-                    .map(|(key, value)| (key.to_string(), value.to_string())),
-            );
-            return Ok(spec);
-        }
-        if self.options.backend != SandboxBackend::Daytona {
-            if self.options.backend == SandboxBackend::Docker
-                && matches!(scope.runtime.target, RuntimeTarget::HostProcess)
-            {
-                let mut runner = scope.clone();
-                runner.runtime.target = RuntimeTarget::Container {
-                    image:       self.options.runner_image(&scope.runtime)?.into(),
-                    options:     ContainerOptions::default(),
-                    credentials: None,
-                };
-                return build_spec(&runner, labels, name, ctx);
-            }
-            return build_spec(scope, labels, name, ctx);
-        }
-        let image = self.options.runner_image(&scope.runtime)?;
-        let snapshot = RunnerSnapshot::new(
-            &image,
-            self.options.daytona_resources.validated()?,
-            self.options.daytona_kind.sandbox_kind(),
-            self.manager.source().region(),
-        );
-        let mut spec = build_daytona_spec(scope, ctx, &snapshot)?;
-        spec.name = Some(name.to_owned());
-        spec.labels.extend(labels.iter().cloned());
-        let snapshots = provider.snapshots().ok_or_else(|| {
-            EnvError::backend(
-                "daytona",
-                "snapshot",
-                "the provider does not support runner snapshots",
-            )
-        })?;
-        self.snapshots.ensure(snapshots, &snapshot).await?;
-        Ok(spec)
-    }
-}
-
-fn build_daytona_spec(
-    scope: &ScopeSpec,
-    ctx: &AcquireContext,
-    snapshot: &RunnerSnapshot,
-) -> Result<SandboxSpec, EnvError> {
-    let (target, image, user, options) = match &scope.runtime.target {
-        RuntimeTarget::HostProcess => {
-            if !scope.services.is_empty() {
-                return Err(EnvError::backend(
-                    "daytona",
-                    "acquire",
-                    "services require a container job",
-                ));
-            }
-            (
-                DockerExecutionTarget::VirtualMachine,
-                String::new(),
-                None,
-                DockerProviderConfig::default(),
-            )
-        }
-        RuntimeTarget::Container {
-            image,
-            options,
-            credentials,
-        } => {
-            let mut config = docker_provider_config(
-                registry_auth(credentials.as_ref(), ctx)?,
-                sidecars(scope, ctx)?,
-                options,
-            );
-            // A Daytona job cannot use the local Docker daemon's host alias.
-            config.extra_hosts.clear();
-            (
-                DockerExecutionTarget::Container,
-                image.to_string(),
-                options.user.as_ref().map(ToString::to_string),
-                config,
-            )
-        }
-    };
-    let mut spec = snapshot
-        .sandbox_spec()
-        .working_directory(CONTAINER_WORKSPACE);
-    spec.user = Some("root".to_owned());
-    spec.public = Some(false);
-    spec.timers.auto_stop_after_idle = Some(Duration::ZERO);
-    spec.timers.auto_pause_after_idle = Some(Duration::ZERO);
-    spec.timers.auto_delete_after_stop = Some(Duration::ZERO);
-    spec.timers.ttl = Some(Duration::ZERO);
-    spec.env.extend(
-        scope
-            .env
-            .iter()
-            .map(|(key, value)| (key.to_string(), value.to_string())),
-    );
-    if let RuntimeTarget::Container { options, .. } = &scope.runtime.target {
+        let descriptor = self.descriptor(template.provider.as_str()).await?;
+        let mut spec = template.spec;
+        spec.name = Some(name);
+        spec.labels.extend(labels);
         spec.env.extend(
-            options
+            scope
                 .env
                 .iter()
                 .map(|(key, value)| (key.to_string(), value.to_string())),
         );
-    }
-    spec.provider_config = DaytonaProviderConfig {
-        docker: Some(NestedDockerConfig {
-            image,
-            target,
-            user,
-            options,
-        }),
-        ..Default::default()
-    }
-    .into_value();
-    Ok(spec)
-}
-
-/// Maps a container scope to a `SandboxSpec`: the workspace inside the
-/// sandbox, the run's labels, and the provider's typed options.
-fn build_spec(
-    scope: &ScopeSpec,
-    labels: &[(String, String)],
-    name: &str,
-    ctx: &AcquireContext,
-) -> Result<SandboxSpec, EnvError> {
-    let RuntimeTarget::Container {
-        image,
-        options,
-        credentials,
-    } = &scope.runtime.target
-    else {
-        return Err(EnvError::backend(
-            BACKEND,
-            "acquire",
-            "this executor realizes container scopes only; a host-process scope needs the host \
-             executor or a runner image",
-        ));
-    };
-    let registry_auth = registry_auth(credentials.as_ref(), ctx)?;
-    let sidecars = sidecars(scope, ctx)?;
-    let provider_config = docker_provider_config(registry_auth, sidecars, options);
-    let mut spec = SandboxSpec::new(SandboxSource::Image {
-        reference: image.to_string(),
-    })
-    .working_directory(CONTAINER_WORKSPACE)
-    .provider_config(provider_config.into_value())
-    .name(name);
-    for (key, value) in labels {
-        spec = spec.label(key.clone(), value.clone());
-    }
-    spec.user = options.user.as_ref().map(ToString::to_string);
-
-    // Scope env is the trusted channel for the container; a `-e` option lands
-    // on top, as the later `docker create` flag would have.
-    for (key, value) in &scope.env {
-        spec = spec.env_var(key.as_str(), value.as_str());
-    }
-    for (key, value) in &options.env {
-        spec = spec.env_var(key.as_str(), value.as_str());
-    }
-    Ok(spec)
-}
-
-/// Resolves image pull credentials to registry auth, or `None` when the
-/// scope declares none.
-fn registry_auth(
-    credentials: Option<&ir::RegistryCredentials>,
-    ctx: &AcquireContext,
-) -> Result<Option<RegistryAuth>, EnvError> {
-    let Some(credentials) = credentials else {
-        return Ok(None);
-    };
-    let password = resolve_secret(&credentials.password_secret, ctx)?;
-    Ok(Some(RegistryAuth {
-        username: credentials.username.to_string(),
-        password,
-        server: None,
-    }))
-}
-
-/// Maps the scope's services to Docker sidecars. Ports are dropped: a
-/// containerized job reaches a service by its network alias, not a published
-/// port.
-fn sidecars(scope: &ScopeSpec, ctx: &AcquireContext) -> Result<Vec<Sidecar>, EnvError> {
-    let mut sidecars = Vec::with_capacity(scope.services.len());
-    for service in &scope.services {
-        let typed = &service.options;
-        let mut sidecar = Sidecar::new(service.name.as_str(), service.image.as_str());
-        // Declared env first, then `-e` flags on top, as `docker create`
-        // would apply them.
-        sidecar.env = service
-            .env
-            .iter()
-            .chain(typed.env.iter().map(|(key, value)| (key, value)))
-            .map(|(key, value)| (key.to_string(), value.to_string()))
-            .collect();
-        sidecar.dns = typed.dns.iter().map(ToString::to_string).collect();
-        sidecar.cap_add = typed.cap_add.iter().map(ToString::to_string).collect();
-        sidecar.user = typed.user.as_ref().map(ToString::to_string);
-        sidecar.privileged = typed.privileged;
-        sidecar.entrypoint = typed
-            .entrypoint
-            .as_ref()
-            .map(|words| words.iter().map(ToString::to_string).collect());
-        sidecar.health = typed.health.as_ref().map(|health| Health {
-            cmd:             health
-                .cmd
-                .as_ref()
-                .map(ToString::to_string)
-                .unwrap_or_default(),
-            interval_ms:     health.interval_ms,
-            timeout_ms:      health.timeout_ms,
-            retries:         health.retries,
-            start_period_ms: health.start_period_ms,
-        });
-        if let Some(credentials) = &service.credentials {
-            let password = resolve_secret(&credentials.password_secret, ctx)?;
-            sidecar.registry_auth = Some(RegistryAuth {
-                username: credentials.username.to_string(),
-                password,
-                server: None,
-            });
+        if self.options.network != NetworkPolicy::ProviderDefault {
+            spec.network = self.options.network.clone();
         }
-        sidecars.push(sidecar);
+        // An image sandbox's workspace is `/workspace` unless the
+        // environment names its own.
+        if spec.source != Source::HostDirectory && spec.working_directory.is_none() {
+            spec.working_directory = Some(CONTAINER_WORKSPACE.to_owned());
+        }
+        // On a local daemon a container reaches this machine through the
+        // host alias, as a process on it would through loopback.
+        let host_alias =
+            descriptor.locality.mounts_host_paths && descriptor.isolation != Isolation::None;
+        match (&spec.source, &scope.runtime.target) {
+            (Source::HostDirectory, RuntimeTarget::HostProcess) => {
+                if !scope.services.is_empty() {
+                    return Err(EnvError::backend(
+                        BACKEND,
+                        "acquire",
+                        format!(
+                            "services require a containerized job; environment `{environment}` \
+                             runs processes in a host directory"
+                        ),
+                    ));
+                }
+                // The run's own directory: it outlives the sandbox, so a
+                // kept workspace survives the provider, and Petri removes it
+                // when the lease is deleted.
+                let workspace = workspace_dir(self.identity.run_dir(), scope.workspace_id.as_str());
+                spec.working_directory = Some(workspace.to_string_lossy().into_owned());
+                spec.workspace_ownership = Some(WorkspaceOwnership::Designated);
+            }
+            (Source::HostDirectory, RuntimeTarget::Container { .. }) => {
+                return Err(EnvError::backend(
+                    BACKEND,
+                    "acquire",
+                    format!(
+                        "environment `{environment}` runs processes in a host directory; a \
+                         container scope needs an image environment"
+                    ),
+                ));
+            }
+            (_, RuntimeTarget::HostProcess) => {
+                if let Some(image) = self.options.runner_image(&scope.runtime)? {
+                    spec.source = Source::Image(image);
+                }
+                if host_alias {
+                    let container = spec.container.get_or_insert_with(ContainerSpec::default);
+                    container.init = Some(true);
+                    container
+                        .extra_hosts
+                        .insert(DOCKER_HOST_ALIAS.to_owned(), "host-gateway".to_owned());
+                }
+            }
+            (
+                _,
+                RuntimeTarget::Container {
+                    image,
+                    options,
+                    credentials,
+                },
+            ) => {
+                if credentials.is_some() {
+                    // sandbox-driver lacks workload image registry credentials.
+                    return Err(parity_gap("a registry credential for the job image"));
+                }
+                spec.source = Source::Image(image.to_string());
+                if let Some(user) = &options.user {
+                    spec.user = Some(user.to_string());
+                }
+                spec.env.extend(
+                    options
+                        .env
+                        .iter()
+                        .map(|(key, value)| (key.to_string(), value.to_string())),
+                );
+                // Steps run as a program plus arguments, so an image without
+                // bash works; an init process reaps what they leave.
+                let container = spec.container.get_or_insert_with(ContainerSpec::default);
+                container.init = Some(true);
+                if options.privileged {
+                    container.privileged = Some(true);
+                }
+                container
+                    .capabilities_add
+                    .extend(options.cap_add.iter().map(ToString::to_string));
+                container
+                    .dns
+                    .extend(options.dns.iter().map(ToString::to_string));
+                if host_alias {
+                    container
+                        .extra_hosts
+                        .insert(DOCKER_HOST_ALIAS.to_owned(), "host-gateway".to_owned());
+                }
+                // Providers must advertise portable platform support before
+                // admission accepts it; never substitute a provider option.
+                if let Some(platform) = &options.platform {
+                    container.platform = Some(platform.to_string());
+                }
+            }
+        }
+        let credentials = self.services(scope, lease, ctx, &mut spec)?;
+        self.prepared(environment, template.provider, spec, credentials)
+            .await
     }
-    Ok(sidecars)
+
+    async fn prepared(
+        &self,
+        environment: &str,
+        provider: ProviderName,
+        spec: SandboxSpec,
+        credentials: Vec<String>,
+    ) -> Result<Prepared, EnvError> {
+        let builder = self
+            .manager
+            .sandboxes()
+            .builder(environment)
+            .await
+            .map_err(|error| acquire_failed(&error))?
+            .spec(spec);
+        Ok(Prepared {
+            environment: environment.to_owned(),
+            provider,
+            builder,
+            credentials,
+        })
+    }
+
+    /// Maps the scope's services onto the spec. A registry credential is
+    /// resolved here, from the run's secrets, and handed to the driver
+    /// under a name only this create uses; the names come back so they are
+    /// dropped once the create settles.
+    fn services(
+        &self,
+        scope: &ScopeSpec,
+        lease: SandboxLeaseId,
+        ctx: &AcquireContext,
+        spec: &mut SandboxSpec,
+    ) -> Result<Vec<String>, EnvError> {
+        let mut credentials = Vec::new();
+        for service in &scope.services {
+            let typed = &service.options;
+            // sandbox-driver's ServiceSpec lacks these container options.
+            for (set, option) in [
+                (typed.user.is_some(), "user"),
+                (typed.entrypoint.is_some(), "entrypoint"),
+                (!typed.dns.is_empty(), "dns"),
+                (!typed.cap_add.is_empty(), "cap_add"),
+                (typed.privileged, "privileged"),
+            ] {
+                if set {
+                    return Err(parity_gap(&format!(
+                        "the service option `{option}` (service `{}`)",
+                        service.name
+                    )));
+                }
+            }
+            let mut mapped = ServiceSpec::new(service.image.as_str());
+            // Declared env first, then `-e` flags on top, as `docker create`
+            // would apply them.
+            mapped.env = service
+                .env
+                .iter()
+                .chain(typed.env.iter().map(|(key, value)| (key, value)))
+                .map(|(key, value)| (key.to_string(), value.to_string()))
+                .collect::<BTreeMap<_, _>>();
+            if let Some(registry) = &service.credentials {
+                let password = resolve_secret(&registry.password_secret, ctx)?;
+                let name = format!(
+                    "petri-{}-l{}-{}",
+                    self.identity.run_id(),
+                    lease.raw(),
+                    service.name
+                );
+                let value = serde_json::json!({
+                    "username": registry.username.as_str(),
+                    "password": password,
+                });
+                self.credentials.insert(name.clone(), value.to_string());
+                mapped.credential = Some(name.clone());
+                credentials.push(name);
+            }
+            if let Some(cmd) = typed.health.as_ref().and_then(|health| health.cmd.as_ref()) {
+                let health = typed.health.as_ref().expect("checked above");
+                let positive = |value: Option<u64>, default: u64| {
+                    value.filter(|value| *value > 0).unwrap_or(default)
+                };
+                let deadline = READY_DEADLINE_MS;
+                let interval = positive(health.interval_ms, READY_INTERVAL_MS).min(deadline - 1);
+                let timeout = positive(health.timeout_ms, READY_TIMEOUT_MS).min(deadline);
+                let retries = health
+                    .retries
+                    .filter(|retries| *retries > 0)
+                    .map_or(READY_RETRIES, |retries| {
+                        u32::try_from(retries).unwrap_or(u32::MAX)
+                    });
+                // A health check is a shell command, as Docker's CMD-SHELL
+                // runs it.
+                mapped.ready = Some(ReadinessCheck {
+                    command:     vec!["sh".to_owned(), "-c".to_owned(), cmd.to_string()],
+                    interval_ms: nonzero(interval),
+                    timeout_ms:  nonzero(timeout),
+                    deadline_ms: nonzero(deadline),
+                    retries:     NonZeroU32::new(retries).expect("positive"),
+                });
+            }
+            spec.services.insert(service.name.to_string(), mapped);
+        }
+        Ok(credentials)
+    }
+}
+
+fn nonzero(value: u64) -> NonZeroU64 {
+    NonZeroU64::new(value.max(1)).expect("positive")
 }
 
 /// Resolves a secret by name inside acquire, registering it for masking.
@@ -601,34 +601,9 @@ fn resolve_secret(name: &str, ctx: &AcquireContext) -> Result<String, EnvError> 
         })
 }
 
-/// The Docker `provider_config` for a scope container: an init process
-/// reaps zombies, the host alias resolves to the gateway, and the
-/// workspace is the sandbox's own volume — no bind from this machine.
-fn docker_provider_config(
-    registry_auth: Option<RegistryAuth>,
-    sidecars: Vec<Sidecar>,
-    container: &ir::ContainerOptions,
-) -> DockerProviderConfig {
-    // Steps run as a program plus arguments, so an image without bash
-    // (alpine) works: the provider's exec wrapper needs only /bin/sh.
-    DockerProviderConfig {
-        init: true,
-        privileged: container.privileged,
-        platform: container.platform.as_ref().map(ToString::to_string),
-        extra_hosts: vec![format!("{DOCKER_HOST_ALIAS}:host-gateway")],
-        dns: container.dns.iter().map(ToString::to_string).collect(),
-        cap_add: container.cap_add.iter().map(ToString::to_string).collect(),
-        registry_auth,
-        sidecars,
-        ..DockerProviderConfig::default()
-    }
-}
-
 /// What release needs: the lease the environment held, and whether this
 /// executor alone owns it.
 pub(crate) struct SandboxTeardown {
-    /// The provider kind that acquired the sandbox: where release goes.
-    provider:   String,
     sandbox:    Arc<dyn Sandbox>,
     lease:      SandboxLeaseId,
     /// No coordinator named the lease: the sandbox ends with the scope.
@@ -638,8 +613,7 @@ pub(crate) struct SandboxTeardown {
 impl fmt::Debug for SandboxTeardown {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("SandboxTeardown")
-            .field("provider", &self.provider)
-            .field("sandbox", &self.sandbox.id())
+            .field("sandbox", &self.sandbox.reference())
             .field("lease", &self.lease)
             .field("standalone", &self.standalone)
             .finish()

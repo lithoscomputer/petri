@@ -2028,7 +2028,7 @@ async fn check(
                 .rev()
                 .find(|sandbox| sandbox.id == id && sandbox.lease() == Some(&lease.to_string()))
         });
-        let reserved = record.state == LeaseState::Allocating && record.fingerprint.is_none();
+        let reserved = record.state == LeaseState::Allocating && record.admission.is_none();
         if let Some(intent) = record.pending {
             if sandbox.is_some_and(last_call_failed) {
                 *stats.entry("releases left failed").or_default() += 1;

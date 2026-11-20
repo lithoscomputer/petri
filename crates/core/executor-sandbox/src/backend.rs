@@ -3,11 +3,13 @@
 
 use std::collections::BTreeMap;
 use std::fmt;
+use std::num::{NonZeroU32, NonZeroU64};
+use std::path::PathBuf;
 use std::str::FromStr;
 
 use executor::EnvError;
 use ir::RuntimeSpec;
-use sandbox_driver::{NetworkPolicy, Resources, SandboxKind};
+use sandbox_driver::{NetworkPolicy, Resources};
 
 const RUNNER_PIN: &str = "f8bbbfd81934";
 const DEFAULT_LABEL: &str = "ubuntu-24.04";
@@ -66,21 +68,32 @@ pub enum LostSandbox {
 /// provider environment variables and never belong in this structure.
 #[derive(Clone, Debug, Default)]
 pub struct SandboxOptions {
-    pub backend:           SandboxBackend,
+    /// Which built-in environment process scopes go to when no catalog file
+    /// names environments ([`crate::SandboxCatalog::from_options`]).
+    pub backend:               SandboxBackend,
+    /// A catalog file of provider entries and environments, in place of the
+    /// one `backend` describes.
+    pub catalog:               Option<PathBuf>,
+    /// The environment process scopes are placed on; by default the
+    /// backend's own.
+    pub process_environment:   Option<String>,
+    /// The environment container scopes, and the action host of a process
+    /// scope on a host directory, are placed on; by default `daytona` on the
+    /// Daytona backend and `docker` otherwise.
+    pub container_environment: Option<String>,
     /// Network policy for every sandbox created by this run. Providers reject
     /// policies they cannot enforce. Blocked runs also verify attached
     /// sandboxes.
-    pub network:           NetworkPolicy,
+    pub network:               NetworkPolicy,
     /// What to do when a lease's recorded sandbox is gone from the provider.
-    pub lost_sandbox:      LostSandbox,
+    pub lost_sandbox:          LostSandbox,
     /// Label-to-image overrides. Daytona images must include Docker,
     /// `start-docker`, and Python 3. Empty requirements use `ubuntu-24.04`.
-    pub runner_images:     BTreeMap<String, String>,
-    pub daytona_resources: DaytonaResources,
+    pub runner_images:         BTreeMap<String, String>,
+    pub daytona_resources:     DaytonaResources,
     /// The outer Daytona sandbox. Workflow `container:` selects a nested job.
-    pub daytona_kind:      DaytonaSandboxKind,
-    /// `None` leaves development mode to the environment and build profile.
-    pub plugin_dev:        Option<bool>,
+    /// The Daytona provider offers container sandboxes only.
+    pub daytona_kind:          DaytonaSandboxKind,
 }
 
 /// The Daytona offering that hosts a workflow runner.
@@ -89,15 +102,6 @@ pub enum DaytonaSandboxKind {
     #[default]
     Container,
     VirtualMachine,
-}
-
-impl DaytonaSandboxKind {
-    pub(crate) fn sandbox_kind(self) -> SandboxKind {
-        match self {
-            Self::Container => SandboxKind::Container,
-            Self::VirtualMachine => SandboxKind::VirtualMachine,
-        }
-    }
 }
 
 impl FromStr for DaytonaSandboxKind {
@@ -140,49 +144,124 @@ impl Default for DaytonaResources {
 
 impl DaytonaResources {
     pub(crate) fn validated(self) -> Result<Resources, EnvError> {
-        let memory_mb = sandbox_driver_daytona_config::allocation_mib(self.memory_mb);
-        if self.cpu_cores < 2 || memory_mb < 4096 || self.disk_mb == Some(0) {
+        if self.cpu_cores < 2 || self.memory_mb < 4096 || self.disk_mb == Some(0) {
             return Err(EnvError::backend(
                 "daytona",
                 "configure",
                 "the Daytona runner needs at least 2 CPUs and 4096 MiB of memory; an explicit disk allocation must be positive",
             ));
         }
-        let mut resources = Resources::default();
-        resources.cpu_cores = Some(self.cpu_cores);
-        // Snapshot identity, creation and status validation all use the
-        // same effective allocation that the provider sends to Daytona.
-        resources.memory_mb = Some(memory_mb);
-        resources.disk_mb = self
-            .disk_mb
-            .map(sandbox_driver_daytona_config::allocation_mib);
-        Ok(resources)
+        Ok(Resources {
+            cpu_cores: NonZeroU32::new(self.cpu_cores),
+            memory_mb: NonZeroU64::new(self.memory_mb),
+            disk_mb:   self.disk_mb.and_then(NonZeroU64::new),
+            gpus:      None,
+        })
     }
 }
 
 impl SandboxOptions {
-    pub(crate) fn runner_image(&self, runtime: &RuntimeSpec) -> Result<String, EnvError> {
-        let mut selected = None;
+    /// The environment a scope with this runtime is placed on.
+    pub(crate) fn environment_for(&self, runtime: &RuntimeSpec) -> &str {
+        match runtime.target {
+            ir::RuntimeTarget::HostProcess => self
+                .process_environment
+                .as_deref()
+                .unwrap_or_else(|| self.backend_environment()),
+            ir::RuntimeTarget::Container { .. } => self.container_environment(),
+        }
+    }
+
+    /// The environment container scopes and action hosts are placed on.
+    pub(crate) fn container_environment(&self) -> &str {
+        self.container_environment
+            .as_deref()
+            .unwrap_or(match self.backend {
+                SandboxBackend::Daytona => "daytona",
+                SandboxBackend::Host | SandboxBackend::Docker => "docker",
+            })
+    }
+
+    fn backend_environment(&self) -> &str {
+        match self.backend {
+            SandboxBackend::Host => "host",
+            SandboxBackend::Docker => "docker",
+            SandboxBackend::Daytona => "daytona",
+        }
+    }
+
+    /// The pinned runner image a backend's built-in environment starts from.
+    pub(crate) fn default_runner_image(backend: SandboxBackend) -> String {
+        let options = Self {
+            backend,
+            ..Self::default()
+        };
+        options
+            .default_image(DEFAULT_LABEL)
+            .expect("the default label has a pinned image on every image backend")
+    }
+
+    /// The image a process scope on an image environment runs, when its
+    /// placement labels choose one other than the environment's own: a
+    /// `--runner-image` override, or, with no catalog file, the backend's
+    /// pinned image for that label. `None` keeps the environment's image.
+    pub(crate) fn runner_image(&self, runtime: &RuntimeSpec) -> Result<Option<String>, EnvError> {
+        let backend = self.backend.to_string();
+        let mut selected: Option<Option<String>> = None;
         let labels = runtime
             .requirements
             .iter()
             .map(smol_str::SmolStr::as_str)
             .chain(runtime.requirements.is_empty().then_some(DEFAULT_LABEL));
         for label in labels {
-            let image = self.runner_images.get(label).cloned().or_else(|| self.default_image(label))
+            let overridden = self
+                .runner_images
+                .get(label)
                 .filter(|image| !image.trim().is_empty())
-                .ok_or_else(|| EnvError::backend(&self.backend.to_string(), "configure",
-                    format!("no runner image for label {label:?}; configure --runner-image {label}=IMAGE")))?;
+                .cloned();
+            let image = match overridden {
+                Some(image) => Some(image),
+                None if self.catalog.is_none() => {
+                    Some(self.default_image(label).ok_or_else(|| {
+                        EnvError::backend(
+                            &backend,
+                            "configure",
+                            format!(
+                                "no runner image for label {label:?}; configure --runner-image \
+                             {label}=IMAGE"
+                            ),
+                        )
+                    })?)
+                }
+                // A catalog's environment is the default label's image.
+                None if matches!(label, "ubuntu-latest" | DEFAULT_LABEL) => None,
+                None => {
+                    return Err(EnvError::backend(
+                        &backend,
+                        "configure",
+                        format!(
+                            "no runner image for label {label:?}; configure --runner-image \
+                             {label}=IMAGE"
+                        ),
+                    ));
+                }
+            };
             if selected.as_ref().is_some_and(|previous| previous != &image) {
                 return Err(EnvError::backend(
-                    &self.backend.to_string(),
+                    &backend,
                     "configure",
                     "placement labels select different runner images",
                 ));
             }
             selected = Some(image);
         }
-        Ok(selected.expect("the default supplies a label for empty requirements"))
+        let image = selected.expect("the default supplies a label for empty requirements");
+        let pinned = self
+            .catalog
+            .is_none()
+            .then(|| self.default_image(DEFAULT_LABEL))
+            .flatten();
+        Ok(image.filter(|image| Some(image) != pinned.as_ref()))
     }
 
     fn default_image(&self, label: &str) -> Option<String> {
@@ -222,8 +301,10 @@ mod tests {
             backend: SandboxBackend::Daytona,
             ..Default::default()
         };
+        // The default label keeps the environment's own pinned image.
+        assert_eq!(options.runner_image(&runtime(&[])).unwrap(), None);
         assert_eq!(
-            options.runner_image(&runtime(&[])).unwrap(),
+            SandboxOptions::default_runner_image(SandboxBackend::Daytona),
             format!("ghcr.io/lithoscomputer/ubuntu-24.04:dind-{RUNNER_PIN}")
         );
         assert!(options.runner_image(&runtime(&["ubuntu-22.04"])).is_err());
@@ -233,7 +314,7 @@ mod tests {
         );
         assert_eq!(
             options.runner_image(&runtime(&["ubuntu-22.04"])).unwrap(),
-            "custom:22-dind-pinned"
+            Some("custom:22-dind-pinned".to_owned())
         );
         assert!(
             options
@@ -250,9 +331,34 @@ mod tests {
         };
         assert_eq!(
             options.runner_image(&runtime(&["ubuntu-22.04"])).unwrap(),
-            format!("ghcr.io/lithoscomputer/ubuntu-22.04:slim-{RUNNER_PIN}")
+            Some(format!(
+                "ghcr.io/lithoscomputer/ubuntu-22.04:slim-{RUNNER_PIN}"
+            ))
         );
         assert!(options.runner_image(&runtime(&["custom-runner"])).is_err());
+    }
+
+    #[test]
+    fn a_catalog_keeps_its_environment_image_for_the_default_label_only() {
+        let mut options = SandboxOptions {
+            backend: SandboxBackend::Docker,
+            catalog: Some("catalog.toml".into()),
+            ..Default::default()
+        };
+        assert_eq!(options.runner_image(&runtime(&[])).unwrap(), None);
+        assert_eq!(
+            options.runner_image(&runtime(&["ubuntu-latest"])).unwrap(),
+            None
+        );
+        // A catalog has no pinned images of Petri's for other labels.
+        assert!(options.runner_image(&runtime(&["ubuntu-22.04"])).is_err());
+        options
+            .runner_images
+            .insert("ubuntu-22.04".to_owned(), "custom:22".to_owned());
+        assert_eq!(
+            options.runner_image(&runtime(&["ubuntu-22.04"])).unwrap(),
+            Some("custom:22".to_owned())
+        );
     }
 
     #[test]
@@ -282,14 +388,14 @@ mod tests {
             .validated()
             .is_err()
         );
-        for disk in [1024, 3 * 1024, 4096, 20 * 1024] {
+        for disk in [1, 1024, 3073, 4096, 20 * 1024] {
             let resources = DaytonaResources {
                 disk_mb: Some(disk),
                 ..Default::default()
             }
             .validated()
             .unwrap();
-            assert_eq!(resources.disk_mb, Some(disk));
+            assert_eq!(resources.disk_mb.map(NonZeroU64::get), Some(disk));
         }
     }
 
@@ -299,16 +405,16 @@ mod tests {
             backend: SandboxBackend::Daytona,
             ..Default::default()
         };
-        assert_eq!(options.daytona_kind.sandbox_kind(), SandboxKind::Container);
+        assert_eq!(options.daytona_kind, DaytonaSandboxKind::Container);
         let resources = options.daytona_resources.validated().unwrap();
-        assert_eq!(resources.cpu_cores, Some(2));
-        assert_eq!(resources.memory_mb, Some(4096));
+        assert_eq!(resources.cpu_cores.map(NonZeroU32::get), Some(2));
+        assert_eq!(resources.memory_mb.map(NonZeroU64::get), Some(4096));
         assert_eq!(resources.disk_mb, None);
     }
 
     #[test]
-    fn daytona_validates_the_effective_memory_allocation() {
-        for memory_mb in [0, 1, 2048, 3072] {
+    fn daytona_validates_requested_memory_without_rounding() {
+        for memory_mb in [0, 1, 2048, 3072, 3073, 3815, 4095] {
             assert!(
                 DaytonaResources {
                     memory_mb,
@@ -318,14 +424,14 @@ mod tests {
                 .is_err()
             );
         }
-        for memory_mb in [3073, 3815, 4096] {
+        for memory_mb in [4096, 4097, 8191] {
             let resources = DaytonaResources {
                 memory_mb,
                 ..Default::default()
             }
             .validated()
             .unwrap();
-            assert_eq!(resources.memory_mb, Some(4096));
+            assert_eq!(resources.memory_mb.map(NonZeroU64::get), Some(memory_mb));
             assert_eq!(resources.disk_mb, None);
         }
     }

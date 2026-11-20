@@ -20,7 +20,7 @@ use engine::{EngineStart, EventLog, ReplayMismatch};
 use executor::{
     DEFAULT_GRACE, Executor, MapSecrets, Masker, ProgressSink, Retention, SecretProvider,
 };
-use executor_sandbox::{InProcessProviders, LeaseLedger, RoutingExecutor, SandboxOptions};
+use executor_sandbox::{LeaseLedger, RoutingExecutor, SandboxCatalog, SandboxOptions};
 use frontend::{
     CompileInputs, DirFiles, FileSource, Frontend, Lowered, REPOSITORY_VAR, Span, absolute_repo,
 };
@@ -170,8 +170,9 @@ pub struct Runtime {
     /// The standard router acquires every scope on the simulated provider:
     /// a dry run.
     simulated:       bool,
-    /// Built-in providers the standard router reaches instead of plugins.
-    in_process:      Option<InProcessProviders>,
+    /// The application's sandbox catalog, in place of the one the sandbox
+    /// options describe.
+    catalog:         Option<SandboxCatalog>,
     sources:         Sources,
 }
 
@@ -251,7 +252,7 @@ impl Runtime {
                 env::temp_dir().join(format!("petri-run-{}", process::id())),
             ),
             simulated:       false,
-            in_process:      None,
+            catalog:         None,
             sources:         Sources::default(),
         }
     }
@@ -276,7 +277,7 @@ impl Runtime {
                 env::temp_dir().join(format!("petri-run-{}", process::id())),
             ),
             simulated:       false,
-            in_process:      None,
+            catalog:         None,
             sources:         Sources::default(),
         }
     }
@@ -366,16 +367,17 @@ impl Runtime {
         self
     }
 
-    /// Reach Host, Docker, and Daytona through the built-in providers the
-    /// embedding application links, instead of launching their plugins.
-    /// Every standard router this runtime builds uses them: runs, resumes,
-    /// [`Runtime::sandbox_router_for`], and prune. A kind with no factory
-    /// fails routably at acquire; no plugin is launched in its place. A dry
+    /// Place scopes on the embedding application's sandbox catalog: its
+    /// provider entries, environments, registered providers and credential
+    /// store, in place of the catalog the sandbox options describe. Every
+    /// standard router this runtime builds uses it: runs, resumes,
+    /// [`Runtime::sandbox_router_for`], and prune. The sandbox options still
+    /// name which environments process and container scopes go to. A dry
     /// run ([`Runtime::simulated_sandboxes`]) still touches no provider,
     /// and [`Runtime::executor`] still replaces the router outright.
     #[must_use]
-    pub fn in_process_providers(mut self, providers: InProcessProviders) -> Self {
-        self.in_process = Some(providers);
+    pub fn sandbox_catalog(mut self, catalog: SandboxCatalog) -> Self {
+        self.catalog = Some(catalog);
         self
     }
 
@@ -962,14 +964,18 @@ impl Runtime {
         let router = if self.simulated {
             RoutingExecutor::simulated(run_dir)
         } else {
-            let router = RoutingExecutor::with_options(
-                run_dir,
-                self.options.retention,
-                self.options.sandbox.clone(),
-            );
-            match &self.in_process {
-                Some(providers) => router.with_in_process(providers.clone()),
-                None => router,
+            match &self.catalog {
+                Some(catalog) => RoutingExecutor::with_catalog(
+                    catalog.clone(),
+                    run_dir,
+                    self.options.retention,
+                    self.options.sandbox.clone(),
+                ),
+                None => RoutingExecutor::with_options(
+                    run_dir,
+                    self.options.retention,
+                    self.options.sandbox.clone(),
+                ),
             }
         };
         Arc::new(router.with_run_id(key.as_str()))

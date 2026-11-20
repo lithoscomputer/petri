@@ -1,18 +1,20 @@
-//! Built-in provider factories, linked the way an embedding application
-//! links them, for tests of the in-process provider path.
+//! Built-in provider factories, registered the way an embedding application
+//! registers them, for tests of an application's own sandbox catalog.
 
+use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use async_trait::async_trait;
-use executor_sandbox::{
-    InProcessProviders, ProviderContext, ProviderFactory, ProviderNetwork, fingerprint,
+use executor_sandbox::SandboxCatalog;
+use sandbox_driver::{
+    Activation, Environment, EnvironmentName, Error, MutationOutcome, PluginLocation, Provider,
+    ProviderEntry, ProviderFactory, ProviderKind, ProviderName, ProviderSchemas, Registry,
+    SandboxSpec, SecretResolver, Source, StaticEnvironments,
 };
-use sandbox_driver::SandboxProvider;
-use sandbox_driver_host::HostProvider;
 
-/// sandbox-driver's Host provider over the run's own registry, counting
-/// how many times a run connected it.
+/// sandbox-driver's built-in Host provider, counting how many times a run
+/// activated it.
 #[derive(Default)]
 pub struct HostFactory {
     connects: AtomicUsize,
@@ -26,35 +28,17 @@ impl HostFactory {
 
 #[async_trait]
 impl ProviderFactory for HostFactory {
-    fn kind(&self) -> &'static str {
-        "host"
+    async fn discover(&self, location: &PluginLocation) -> Result<ProviderSchemas, Error> {
+        sandbox_driver_host::HostFactory.discover(location).await
     }
 
-    fn fingerprint_seed(&self, context: &ProviderContext) -> String {
-        fingerprint::host(
-            context
-                .host_registry()
-                .expect("the router names the Host registry"),
-        )
-    }
-
-    fn network(&self) -> ProviderNetwork {
-        ProviderNetwork::host()
-    }
-
-    async fn connect(
-        &self,
-        context: &ProviderContext,
-    ) -> sandbox_driver::Result<Arc<dyn SandboxProvider>> {
+    async fn activate(&self, activation: Activation) -> Result<Arc<dyn Provider>, Error> {
         self.connects.fetch_add(1, Ordering::SeqCst);
-        let registry = context
-            .host_registry()
-            .expect("the router names the Host registry");
-        Ok(Arc::new(HostProvider::with_registry(registry).await?))
+        sandbox_driver_host::HostFactory.activate(activation).await
     }
 }
 
-/// A factory for `kind` that must never be connected: it counts the
+/// A factory for `kind` that must never be activated: it counts the
 /// attempt and refuses it.
 pub struct UnusedFactory {
     kind:     &'static str,
@@ -76,36 +60,80 @@ impl UnusedFactory {
 
 #[async_trait]
 impl ProviderFactory for UnusedFactory {
-    fn kind(&self) -> &str {
-        self.kind
-    }
-
-    fn fingerprint_seed(&self, _: &ProviderContext) -> String {
-        format!("{}:unused", self.kind)
-    }
-
-    fn network(&self) -> ProviderNetwork {
-        ProviderNetwork::docker(None, None)
-    }
-
-    async fn connect(
-        &self,
-        _: &ProviderContext,
-    ) -> sandbox_driver::Result<Arc<dyn SandboxProvider>> {
+    async fn discover(&self, _: &PluginLocation) -> Result<ProviderSchemas, Error> {
         self.connects.fetch_add(1, Ordering::SeqCst);
-        Err(sandbox_driver::Error::invalid_spec(
-            "provider",
-            "this test's run must not connect this provider",
-        ))
+        Err(Error::Unavailable {
+            message: format!(
+                "this test's run must not activate the {} provider",
+                self.kind
+            ),
+            outcome: MutationOutcome::NotStarted,
+        })
+    }
+
+    async fn activate(&self, _: Activation) -> Result<Arc<dyn Provider>, Error> {
+        unreachable!("discovery refuses first")
     }
 }
 
-/// Built-in Host, with a Docker factory that must stay unconnected.
-pub fn host_providers() -> (InProcessProviders, Arc<HostFactory>, Arc<UnusedFactory>) {
+struct NoSecrets;
+
+#[async_trait]
+impl SecretResolver for NoSecrets {
+    async fn resolve(&self, _: &str) -> Result<Option<String>, Error> {
+        Ok(None)
+    }
+}
+
+/// A catalog of `host` and `docker` entries and environments over the given
+/// factories, as an application that registers its own providers builds it.
+/// With no Docker factory, the `docker` entry has no adapter installed.
+pub fn catalog(
+    host: Arc<dyn ProviderFactory>,
+    docker: Option<Arc<dyn ProviderFactory>>,
+) -> SandboxCatalog {
+    let name = |name: &str| ProviderName::try_new(name).expect("a constant entry name");
+    let entry = |kind: &str| -> ProviderEntry {
+        serde_json::from_value(serde_json::json!({ "plugin": kind })).expect("a constant entry")
+    };
+    let mut registry = Registry::new()
+        .builtin(ProviderKind::try_new("host").expect("kind"), host)
+        .expect("one registration");
+    if let Some(docker) = docker {
+        registry = registry
+            .builtin(ProviderKind::try_new("docker").expect("kind"), docker)
+            .expect("each kind registers once");
+    }
+    let environments = BTreeMap::from([
+        (
+            EnvironmentName::try_new("host").expect("name"),
+            Environment {
+                provider: name("host"),
+                spec:     SandboxSpec::new(Source::HostDirectory),
+            },
+        ),
+        (
+            EnvironmentName::try_new("docker").expect("name"),
+            Environment {
+                provider: name("docker"),
+                spec:     SandboxSpec::new(Source::Image("alpine:3.20".to_owned())),
+            },
+        ),
+    ]);
+    SandboxCatalog::new(
+        [
+            (name("host"), entry("host")),
+            (name("docker"), entry("docker")),
+        ],
+        Arc::new(StaticEnvironments(environments)),
+        registry,
+        Arc::new(NoSecrets),
+    )
+}
+
+/// Built-in Host, with a Docker factory that must stay unactivated.
+pub fn host_providers() -> (SandboxCatalog, Arc<HostFactory>, Arc<UnusedFactory>) {
     let host = Arc::new(HostFactory::default());
     let docker = Arc::new(UnusedFactory::new("docker"));
-    let providers = InProcessProviders::new()
-        .with(host.clone())
-        .with(docker.clone());
-    (providers, host, docker)
+    (catalog(host.clone(), Some(docker.clone())), host, docker)
 }

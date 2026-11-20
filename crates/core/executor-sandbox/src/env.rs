@@ -1,21 +1,24 @@
 //! [`ExecEnv`] and [`ContainerRunner`] over one [`Sandbox`].
 //!
-//! A step spawn becomes one `run_streaming` call in an owned task; a
-//! Docker action becomes one `OneShot::run` call the same way. Output
+//! A step spawn becomes one contract `exec` call in an owned task; a
+//! Docker action becomes one `Containers::run` call the same way. Output
 //! chunks are fed through the interface crate's own line pump (a duplex
 //! pipe per stream), so the 64 KiB line cap and truncation marker match
 //! every other executor exactly. The step's cancellation ladder is the only
 //! one: `SIGTERM` fires the sandbox-driver `term` token, `SIGKILL` fires
 //! `kill`, and the provider sends exactly that signal and nothing more.
 //!
-//! Workspace files go through the sandbox's filesystem facet. The
+//! Workspace files go through the sandbox's `Files` facet. The
 //! workspace lives inside the sandbox — a volume it owns — and nothing on
 //! Petri's machine mirrors it, so this is the only path to it, on a local
 //! daemon and a remote one alike.
 
 use std::collections::BTreeMap;
+use std::io::Cursor;
+use std::iter;
+use std::num::NonZeroU16;
 use std::path::Path;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex as StdMutex, PoisonError};
 use std::time::Duration;
 
 use async_trait::async_trait;
@@ -26,8 +29,8 @@ use executor::{
     Sig, StdinMode, StdinWriter,
 };
 use sandbox_driver::{
-    Error as DriverError, ExecControls, ExecSpec, ExecStreamingResult, OneShotImage, OneShotSpec,
-    OutputLoss, OutputStream, Sandbox, StdinSource, Termination,
+    ByteStream as ContractByteStream, Error as DriverError, ExecControls, ExecOutcome, ExecSpec,
+    Expose, FileRange, OneShotImage, OneShotSpec, OutputLoss, OutputStream, Sandbox, Termination,
 };
 use smol_str::SmolStr;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt, DuplexStream, duplex};
@@ -62,55 +65,38 @@ pub(crate) struct SandboxEnv {
     pub(crate) gate:         RunGate,
 }
 
-/// Maps a finished `run_streaming` to the executor's exit status. The
-/// observed signal wins over a code, so a foreign signal and the step's own
-/// ladder read the same on every backend. The fallbacks below are for a
-/// provider that stopped the command but could not observe how (Daytona ends
-/// a session without seeing the child's status).
-fn exit_status(termination: Termination, code: Option<i32>, signal: Option<i32>) -> ExitStatus {
+/// Maps a finished exec to the executor's exit status. The observed signal
+/// wins over a code, so a foreign signal and the step's own ladder read the
+/// same on every backend. The fallbacks below are for a provider that
+/// stopped the command but could not observe how (Daytona ends a session
+/// without seeing the child's status). A command whose outcome the provider
+/// lost has no status to report.
+fn exit_status(outcome: &ExecOutcome) -> Result<ExitStatus, String> {
+    let (termination, code, signal) = (outcome.termination, outcome.exit_code, outcome.signal);
     // The provider's own deadline ended the command: the step reads it as a
     // timeout, whatever signal the provider observed on the way.
     if termination == Termination::TimedOut {
-        return ExitStatus::timed_out(signal.unwrap_or_else(|| Sig::Kill.number()));
+        return Ok(ExitStatus::timed_out(
+            signal.unwrap_or_else(|| Sig::Kill.number()),
+        ));
+    }
+    if termination == Termination::Lost {
+        return Err("the sandbox lost the command; its outcome is unknown".to_owned());
     }
     if let Some(signal) = signal {
-        return ExitStatus::signalled(signal);
+        return Ok(ExitStatus::signalled(signal));
     }
-    match termination {
+    Ok(match termination {
         Termination::Killed => ExitStatus::signalled(Sig::Kill.number()),
         // The step's ladder decides cancel vs timeout; the handle only needs a
         // plausible signalled status for a stop it did not exit from.
-        Termination::Cancelled => ExitStatus::signalled(Sig::Term.number()),
-        // Exited, Unknown, and any future variant: report the code as-is.
-        _ => ExitStatus {
+        Termination::Terminated => ExitStatus::signalled(Sig::Term.number()),
+        Termination::Exited | Termination::TimedOut | Termination::Lost => ExitStatus {
             code,
             signal: None,
             timed_out: false,
         },
-    }
-}
-
-/// Retained bytes are deliberately omitted, but delivery to the line pumps
-/// must be complete before Petri can report the command's exit status. A
-/// loss the provider counted is the exception: it marks both captures
-/// truncated because it cannot say which stream lost the bytes, the
-/// command still ran to its status, and the loss reaches the step as one
-/// stderr line ([`output_loss_line`]) instead of failing it.
-fn streaming_exit_status(streaming: &ExecStreamingResult) -> Result<ExitStatus, String> {
-    let status = exit_status(
-        streaming.result.termination,
-        streaming.result.exit_code,
-        streaming.result.signal,
-    );
-    // A command the provider killed at its deadline has its output cut off
-    // by design; the timeout is the status, not an incomplete delivery.
-    if status.timed_out || streaming.output_loss.is_lossy() {
-        return Ok(status);
-    }
-    if streaming.stdout_capture.truncated || streaming.stderr_capture.truncated {
-        return Err("sandbox command output delivery was incomplete".to_owned());
-    }
-    Ok(status)
+    })
 }
 
 /// The line appended to a command's stderr when the provider dropped
@@ -163,11 +149,13 @@ fn spawn_streamed(
 ) -> SandboxProcess {
     // Stdin: a piped step gets a writer whose read half streams into the
     // command for its whole life.
-    let stdin_writer = stdin.then(|| {
+    let (stdin_writer, stdin_source) = if stdin {
         let (writer, reader) = duplex(OUTPUT_PIPE_CAPACITY);
-        let source = StdinSource::new(reader);
-        (Box::new(writer) as StdinWriter, source)
-    });
+        let source: ContractByteStream = Box::pin(reader);
+        (Some(Box::new(writer) as StdinWriter), Some(source))
+    } else {
+        (None, None)
+    };
 
     // Output: one duplex per stream feeds the interface line pump, so the
     // line cap and truncation marker are the shared ones.
@@ -204,14 +192,14 @@ fn spawn_streamed(
     let stderr_slot = Arc::new(Mutex::new(Some(stderr_writer)));
     let sink_stdout = stdout_slot.clone();
     let sink_stderr = stderr_slot.clone();
-    let stdin_source = stdin_writer.as_ref().map(|(_, source)| source.clone());
     let controls = ExecControls {
-        term:                  Some(term.clone()),
-        kill:                  Some(kill.clone()),
-        stdin:                 stdin_source,
-        sink:                  Some(Arc::new(move |stream, chunk| {
+        term:   Some(term.clone()),
+        kill:   Some(kill.clone()),
+        stdin:  stdin_source,
+        resize: None,
+        sink:   Some(Arc::new(move |stream, chunk| {
             let slot = match stream {
-                OutputStream::Stdout => sink_stdout.clone(),
+                OutputStream::Stdout | OutputStream::Terminal => sink_stdout.clone(),
                 OutputStream::Stderr => sink_stderr.clone(),
             };
             Box::pin(async move {
@@ -222,21 +210,22 @@ fn spawn_streamed(
                 Ok(())
             })
         })),
-        retained_output_limit: Some(0),
     };
 
     workers.spawn(async move {
-        let outcome: Result<ExecStreamingResult, DriverError> = match &job {
-            Job::Exec(spec) => sandbox.exec().run_streaming(spec, controls).await,
-            Job::OneShot(spec) => match sandbox.one_shot() {
-                Some(one_shot) => one_shot.run(spec, controls).await,
-                None => Err(DriverError::unsupported(
-                    sandbox_driver::Capability::OneShot,
-                )),
+        let outcome: Result<ExecOutcome, DriverError> = match job {
+            Job::Exec(spec) => sandbox.exec(spec, controls).await,
+            Job::OneShot(spec) => match sandbox.containers() {
+                Some(containers) => containers.run(spec, controls).await,
+                None => Err(DriverError::Unsupported {
+                    capability: "containers".to_owned(),
+                }),
             },
         };
-        if let Ok(streaming) = &outcome {
-            report_output_loss(streaming.output_loss, &stderr_slot).await;
+        // A loss the provider counted does not fail the command: it ran to
+        // its status, and the loss reaches the step as one stderr line.
+        if let Ok(outcome) = &outcome {
+            report_output_loss(outcome.output_loss, &stderr_slot).await;
         }
         // Close the pipes so the pumps flush and end.
         if let Some(mut writer) = stdout_slot.lock().await.take() {
@@ -246,7 +235,7 @@ fn spawn_streamed(
             let _ = writer.shutdown().await;
         }
         let status: Result<ExitStatus, String> = match outcome {
-            Ok(streaming) => streaming_exit_status(&streaming),
+            Ok(outcome) => exit_status(&outcome),
             Err(error) => Err(error.to_string()),
         };
         let _ = status_tx.send(Some(status));
@@ -256,7 +245,7 @@ fn spawn_streamed(
     SandboxProcess {
         lines,
         bytes,
-        stdin: stdin_writer.map(|(writer, _)| writer),
+        stdin: stdin_writer,
         term,
         kill,
         status: status_rx,
@@ -298,6 +287,44 @@ fn facet_error(operation: &str, error: &DriverError) -> EnvError {
     EnvError::backend(BACKEND, operation, error.to_string())
 }
 
+fn millis(duration: Duration) -> u64 {
+    u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)
+}
+
+/// The scope's env, with the spec's own on top.
+fn merged_env(
+    scope: &BTreeMap<SmolStr, SmolStr>,
+    own: &BTreeMap<SmolStr, SmolStr>,
+) -> BTreeMap<String, String> {
+    scope
+        .iter()
+        .chain(own.iter())
+        .map(|(key, value)| (key.to_string(), value.to_string()))
+        .collect()
+}
+
+/// Reads a workspace file, or `None` when the sandbox has no such file.
+async fn read(
+    sandbox: &dyn Sandbox,
+    relative: &Path,
+    range: Option<FileRange>,
+) -> Result<Option<Vec<u8>>, EnvError> {
+    let mut stream = match sandbox
+        .files()
+        .get(&relative.to_string_lossy(), range)
+        .await
+    {
+        Ok(stream) => stream,
+        Err(DriverError::NotFound { .. }) => return Ok(None),
+        Err(error) => return Err(facet_error("read", &error)),
+    };
+    let mut bytes = Vec::new();
+    stream.read_to_end(&mut bytes).await.map_err(|error| {
+        EnvError::backend(BACKEND, "read", format!("reading the file failed: {error}"))
+    })?;
+    Ok(Some(bytes))
+}
+
 #[async_trait]
 impl ExecEnv for SandboxEnv {
     async fn spawn(&self, spec: ProcessSpec) -> Result<Box<dyn ProcessHandle>, EnvError> {
@@ -307,20 +334,39 @@ impl ExecEnv for SandboxEnv {
         // first, with the one command every image contract provides.
         if let Some(cwd) = &spec.cwd {
             let cwd = cwd.to_string_lossy().into_owned();
-            let mkdir = ExecSpec::new("mkdir")
-                .args(["-p", cwd.as_str()])
-                .timeout(MKDIR_TIMEOUT);
-            let result = self
+            let mut mkdir = ExecSpec::argv(["mkdir", "-p", cwd.as_str()]);
+            mkdir.timeout_ms = Some(millis(MKDIR_TIMEOUT));
+            let stderr = Arc::new(StdMutex::new(Vec::new()));
+            let sink_stderr = stderr.clone();
+            let controls = ExecControls {
+                sink: Some(Arc::new(move |stream, chunk| {
+                    if stream == OutputStream::Stderr {
+                        sink_stderr
+                            .lock()
+                            .unwrap_or_else(PoisonError::into_inner)
+                            .extend_from_slice(&chunk);
+                    }
+                    Box::pin(async { Ok(()) })
+                })),
+                ..ExecControls::default()
+            };
+            let outcome = self
                 .sandbox
-                .exec()
-                .run(&mkdir)
+                .exec(mkdir, controls)
                 .await
                 .map_err(|error| facet_error("mkdir", &error))?;
-            if !result.success() {
+            if outcome.termination != Termination::Exited || outcome.exit_code != Some(0) {
+                let stderr = stderr
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .clone();
                 return Err(EnvError::backend(
                     BACKEND,
                     "mkdir",
-                    format!("could not create `{cwd}`: {}", result.stderr_lossy().trim()),
+                    format!(
+                        "could not create `{cwd}`: {}",
+                        String::from_utf8_lossy(&stderr).trim()
+                    ),
                 ));
             }
         }
@@ -334,23 +380,12 @@ impl ExecEnv for SandboxEnv {
         // interpreted on the way.
         // The step's deadline rides to the provider, which ends the command
         // itself; a step that sets none runs until it exits or is stopped.
-        let mut exec_spec =
-            ExecSpec::new(spec.program.as_str()).args(spec.args.iter().map(SmolStr::as_str));
-        exec_spec = match spec.timeout {
-            Some(timeout) => exec_spec.timeout(timeout),
-            None => exec_spec.no_timeout(),
-        };
-        if let Some(dir) = working_dir {
-            exec_spec = exec_spec.working_dir(dir);
-        }
-        for (key, value) in self
-            .env
-            .iter()
-            .filter(|(key, _)| !spec.env.contains_key(*key))
-            .chain(spec.env.iter())
-        {
-            exec_spec = exec_spec.env_var(key.as_str(), value.as_str());
-        }
+        let mut exec_spec = ExecSpec::argv(
+            iter::once(spec.program.as_str()).chain(spec.args.iter().map(SmolStr::as_str)),
+        );
+        exec_spec.timeout_ms = spec.timeout.map(millis);
+        exec_spec.working_directory = working_dir;
+        exec_spec.env = merged_env(&self.env, &spec.env);
         let stdin = matches!(spec.stdin, StdinMode::Piped);
         Ok(Box::new(spawn_streamed(
             self.sandbox.clone(),
@@ -389,37 +424,38 @@ impl ExecEnv for SandboxEnv {
     /// provider without the facet offers no route.
     async fn preview_url(&self, port: u16) -> Result<Option<PreviewUrl>, EnvError> {
         let _admission = self.gate.admit("preview_url")?;
-        let Some(previews) = self.sandbox.preview_urls() else {
+        let Some(port) = NonZeroU16::new(port) else {
             return Ok(None);
         };
-        let preview = previews
-            .preview_url(port)
-            .await
-            .map_err(|error| facet_error("preview_url", &error))?;
-        Ok(Some(PreviewUrl {
-            url:     preview.url,
-            headers: preview.headers,
-        }))
+        let options = Expose {
+            signed: false,
+            ttl_ms: None,
+        };
+        match self.sandbox.ports().expose(port, options).await {
+            Ok(exposure) => Ok(Some(PreviewUrl {
+                url:     exposure.url,
+                headers: exposure.headers,
+            })),
+            // A provider that exposes no port offers no route.
+            Err(DriverError::Unsupported { .. }) => Ok(None),
+            Err(error) => Err(facet_error("preview_url", &error)),
+        }
     }
 
     async fn release_preview_url(&self, port: u16) -> Result<(), EnvError> {
         let _admission = self.gate.admit("release_preview_url")?;
-        match self.sandbox.preview_urls() {
-            Some(previews) => previews
-                .release_preview_url(port)
-                .await
-                .map_err(|error| facet_error("release_preview_url", &error)),
-            None => Ok(()),
+        let Some(port) = NonZeroU16::new(port) else {
+            return Ok(());
+        };
+        match self.sandbox.ports().release(port).await {
+            Ok(()) | Err(DriverError::Unsupported { .. }) => Ok(()),
+            Err(error) => Err(facet_error("release_preview_url", &error)),
         }
     }
 
     async fn read_file(&self, relative: &Path) -> Result<Option<Vec<u8>>, EnvError> {
         let _admission = self.gate.admit("read")?;
-        match self.sandbox.fs().read(&relative.to_string_lossy()).await {
-            Ok(bytes) => Ok(Some(bytes)),
-            Err(DriverError::NotFound { .. }) => Ok(None),
-            Err(error) => Err(facet_error("read", &error)),
-        }
+        read(&*self.sandbox, relative, None).await
     }
 
     async fn read_file_limited(
@@ -431,28 +467,28 @@ impl ExecEnv for SandboxEnv {
         // One byte past the limit is enough to know the file is too big,
         // without ever pulling the whole of it across.
         let bounded = limit.saturating_add(1) as u64;
-        match self
-            .sandbox
-            .fs()
-            .read_range(&relative.to_string_lossy(), 0, Some(bounded))
-            .await
-        {
-            Ok(bytes) if bytes.len() > limit => Err(EnvError::workspace(
+        let range = FileRange {
+            offset: 0,
+            length: Some(bounded),
+        };
+        match read(&*self.sandbox, relative, Some(range)).await? {
+            Some(bytes) if bytes.len() > limit => Err(EnvError::workspace(
                 "read",
                 relative.display(),
                 executor::oversized_read(limit),
             )),
-            Ok(bytes) => Ok(Some(bytes)),
-            Err(DriverError::NotFound { .. }) => Ok(None),
-            Err(error) => Err(facet_error("read", &error)),
+            bytes => Ok(bytes),
         }
     }
 
     async fn write_file(&self, relative: &Path, contents: &[u8]) -> Result<(), EnvError> {
         let _admission = self.gate.admit("write")?;
         self.sandbox
-            .fs()
-            .write(&relative.to_string_lossy(), contents)
+            .files()
+            .put(
+                &relative.to_string_lossy(),
+                Box::pin(Cursor::new(contents.to_vec())),
+            )
             .await
             .map_err(|error| facet_error("write", &error))
     }
@@ -463,21 +499,33 @@ impl ExecEnv for SandboxEnv {
         depth: usize,
     ) -> Result<Vec<DirectoryEntry>, EnvError> {
         let _admission = self.gate.admit("list_directory")?;
+        // Petri counts immediate children as depth one; the contract counts
+        // them as depth zero.
+        let Some(depth) = depth.checked_sub(1) else {
+            return Ok(Vec::new());
+        };
+        let depth = u32::try_from(depth).unwrap_or(u32::MAX);
+        // Older providers return the requested or absolute path prefixed
+        // to each entry; sandbox-driver#108 makes entries directory-relative.
+        // Request an absolute directory so the old prefix is unambiguous,
+        // and leave already-relative paths unchanged below.
+        let root = Path::new(&self.workspace).join(path);
         self.sandbox
-            .fs()
-            .list_dir(&path.to_string_lossy(), depth)
+            .files()
+            .list(&root.to_string_lossy(), depth)
             .await
             .map(|entries| {
                 entries
                     .into_iter()
                     .map(|entry| DirectoryEntry {
-                        path:   entry.path,
+                        path:   Path::new(&entry.path)
+                            .strip_prefix(&root)
+                            .map_or(entry.path.clone(), |relative| {
+                                relative.to_string_lossy().into_owned()
+                            }),
                         is_dir: entry.kind == sandbox_driver::FileKind::Directory,
-                        size:   if entry.kind == sandbox_driver::FileKind::File {
-                            entry.size
-                        } else {
-                            None
-                        },
+                        size:   (entry.kind == sandbox_driver::FileKind::File)
+                            .then_some(entry.size),
                     })
                     .collect()
             })
@@ -572,7 +620,7 @@ impl OneShotRunner {
         spec: OneShotContainer,
         admission: Admission,
     ) -> Result<Box<dyn ProcessHandle>, EnvError> {
-        if self.sandbox.one_shot().is_none() {
+        if self.sandbox.containers().is_none() {
             return Err(EnvError::backend(
                 BACKEND,
                 "one-shot",
@@ -580,9 +628,7 @@ impl OneShotRunner {
             ));
         }
         let image = match spec.image {
-            ContainerImage::Registry { image } => OneShotImage::Registry {
-                reference: image.to_string(),
-            },
+            ContainerImage::Registry { image } => OneShotImage::Image(image.to_string()),
             ContainerImage::Build {
                 context,
                 dockerfile,
@@ -596,22 +642,11 @@ impl OneShotRunner {
             },
         };
         let mut one_shot = OneShotSpec::new(image);
-        if let Some(entrypoint) = spec.entrypoint {
-            one_shot = one_shot.entrypoint(entrypoint.as_str());
-        }
-        one_shot = one_shot.args(spec.args.iter().map(SmolStr::as_str));
+        one_shot.entrypoint = spec.entrypoint.map(|entrypoint| entrypoint.to_string());
+        one_shot.args = spec.args.iter().map(ToString::to_string).collect();
         // The scope's env first, the spec's own on top.
-        for (key, value) in self
-            .env
-            .iter()
-            .filter(|(key, _)| !spec.env.contains_key(*key))
-            .chain(spec.env.iter())
-        {
-            one_shot = one_shot.env_var(key.as_str(), value.as_str());
-        }
-        if let Some(workdir) = spec.workdir {
-            one_shot = one_shot.working_dir(workdir.as_str());
-        }
+        one_shot.env = merged_env(&self.env, &spec.env);
+        one_shot.working_directory = spec.workdir.map(|workdir| workdir.to_string());
         Ok(Box::new(spawn_streamed(
             self.sandbox.clone(),
             Job::OneShot(one_shot),
@@ -642,56 +677,33 @@ impl ContainerRunner for OneShotRunner {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::OnceLock;
+    use std::num::NonZeroU16;
+    use std::path::PathBuf;
 
-    use sandbox_driver::{
-        Capabilities, CaptureStats, Exec, ExecResult, Filesystem, Isolation, PlatformInfo,
-        SandboxId, SandboxStatus,
-    };
+    use sandbox_driver::{ByteStream, Exposure, FileEntry, Files, Ports, SandboxRef, Status};
 
     use super::*;
 
-    fn completed_command() -> ExecStreamingResult {
-        ExecStreamingResult::new(ExecResult::new(
-            Termination::Exited,
-            Some(0),
-            Duration::ZERO,
-        ))
-    }
-
-    #[test]
-    fn incomplete_stdout_or_stderr_fails_even_when_the_command_exits_zero() {
-        for stream in [OutputStream::Stdout, OutputStream::Stderr] {
-            let mut result = completed_command();
-            match stream {
-                OutputStream::Stdout => result.stdout_capture.truncated = true,
-                OutputStream::Stderr => result.stderr_capture.truncated = true,
-            }
-            let error = streaming_exit_status(&result).expect_err("incomplete delivery");
-            assert_eq!(error, "sandbox command output delivery was incomplete");
+    fn outcome(termination: Termination, code: Option<i32>, signal: Option<i32>) -> ExecOutcome {
+        ExecOutcome {
+            termination,
+            exit_code: code,
+            signal,
+            output_loss: OutputLoss::default(),
         }
     }
 
     #[test]
-    fn output_delivered_without_a_retained_copy_keeps_the_exit_status() {
-        let mut result = completed_command();
-        let mut stats = CaptureStats::default();
-        stats.observed_bytes = 4096;
-        stats.omitted_bytes = 4096;
-        result.stdout_capture = stats;
-        result.stderr_capture = stats;
-        result.result.exit_code = Some(3);
-        let status = streaming_exit_status(&result).expect("complete delivery");
-        assert_eq!(status.code, Some(3));
-        assert_eq!(status.signal, None);
-    }
-
-    #[test]
-    fn complete_delivery_preserves_the_observed_signal() {
-        let mut result = completed_command();
-        result.result.signal = Some(Sig::Term.number());
-        let status = streaming_exit_status(&result).expect("complete delivery");
+    fn the_observed_signal_wins_and_a_lost_command_has_no_status() {
+        let status = exit_status(&outcome(Termination::Exited, Some(3), None)).expect("exited");
+        assert_eq!((status.code, status.signal), (Some(3), None));
+        let status = exit_status(&outcome(Termination::Terminated, None, Some(9))).expect("ended");
+        assert_eq!(status.signal, Some(9));
+        let status = exit_status(&outcome(Termination::Terminated, None, None)).expect("ended");
         assert_eq!(status.signal, Some(Sig::Term.number()));
+        let status = exit_status(&outcome(Termination::TimedOut, None, None)).expect("timed out");
+        assert!(status.timed_out);
+        assert!(exit_status(&outcome(Termination::Lost, Some(0), None)).is_err());
     }
 
     fn counted_loss() -> OutputLoss {
@@ -702,100 +714,95 @@ mod tests {
     }
 
     #[test]
-    fn a_counted_loss_keeps_the_exit_status_although_both_captures_are_marked() {
-        let mut result = completed_command();
-        result.result.exit_code = Some(3);
-        result.output_loss = counted_loss();
-        result.stdout_capture.truncated = true;
-        result.stderr_capture.truncated = true;
-        let status = streaming_exit_status(&result).expect("a counted loss is reported, not fatal");
-        assert_eq!(status.code, Some(3));
+    fn a_counted_loss_is_described_in_one_line() {
         assert_eq!(
-            output_loss_line(result.output_loss).as_deref(),
+            output_loss_line(counted_loss()).as_deref(),
             Some("[sandbox] 2 output frame(s), 300 bytes dropped by the provider")
         );
         assert_eq!(output_loss_line(OutputLoss::default()), None);
     }
 
-    /// A command whose output is scripted: one stdout chunk, one stderr
-    /// chunk, exit 2, and the given loss report.
-    struct ScriptedExec {
-        loss: OutputLoss,
-    }
-
-    #[async_trait]
-    impl Exec for ScriptedExec {
-        async fn run(&self, _spec: &ExecSpec) -> sandbox_driver::Result<ExecResult> {
-            panic!("a step runs its command streaming")
-        }
-
-        async fn run_streaming(
-            &self,
-            _spec: &ExecSpec,
-            controls: ExecControls,
-        ) -> sandbox_driver::Result<ExecStreamingResult> {
-            let sink = controls.sink.expect("the step supplies a sink");
-            sink(OutputStream::Stdout, b"first\n".to_vec()).await?;
-            sink(OutputStream::Stderr, b"warned\n".to_vec()).await?;
-            let mut result = completed_command();
-            result.result.exit_code = Some(2);
-            result.output_loss = self.loss;
-            // The provider cannot tell which stream lost bytes, so a loss
-            // marks both captures, as the protocol requires.
-            if self.loss.is_lossy() {
-                result.stdout_capture.truncated = true;
-                result.stderr_capture.truncated = true;
-            }
-            Ok(result)
-        }
-    }
-
+    /// A sandbox whose one command prints a line to each stream and exits
+    /// 2, reporting the given loss.
     struct ScriptedSandbox {
-        id:   SandboxId,
-        exec: ScriptedExec,
+        loss:      OutputLoss,
+        directory: PathBuf,
+        env:       BTreeMap<String, String>,
+        listing:   Option<Vec<FileEntry>>,
     }
 
     #[async_trait]
     impl Sandbox for ScriptedSandbox {
-        fn id(&self) -> &SandboxId {
-            &self.id
+        fn reference(&self) -> SandboxRef {
+            panic!("a step does not read its sandbox's reference")
         }
 
-        fn capabilities(&self) -> &Capabilities {
-            static CAPABILITIES: OnceLock<Capabilities> = OnceLock::new();
-            CAPABILITIES.get_or_init(|| Capabilities::minimal(Isolation::Container))
+        fn working_directory(&self) -> &Path {
+            &self.directory
         }
 
-        async fn describe(&self) -> sandbox_driver::Result<SandboxStatus> {
-            panic!("a step does not describe its sandbox")
+        fn env(&self) -> &BTreeMap<String, String> {
+            &self.env
         }
 
-        fn working_directory(&self) -> &str {
-            crate::CONTAINER_WORKSPACE
+        async fn status(&self) -> Result<Status, DriverError> {
+            panic!("a step does not read its sandbox's status")
         }
 
-        async fn platform_info(&self) -> sandbox_driver::Result<PlatformInfo> {
-            panic!("a step does not probe the platform")
-        }
-
-        async fn start(&self) -> sandbox_driver::Result<()> {
+        async fn start(&self) -> Result<(), DriverError> {
             panic!("a step does not start its sandbox")
         }
 
-        async fn stop(&self) -> sandbox_driver::Result<()> {
+        async fn stop(&self) -> Result<(), DriverError> {
             panic!("a step does not stop its sandbox")
         }
 
-        async fn delete(&self) -> sandbox_driver::Result<()> {
-            panic!("a step does not delete its sandbox")
+        async fn exec(
+            &self,
+            spec: ExecSpec,
+            controls: ExecControls,
+        ) -> Result<ExecOutcome, DriverError> {
+            assert_eq!(spec.argv, vec!["true".to_owned()]);
+            let sink = controls.sink.expect("the step supplies a sink");
+            sink(OutputStream::Stdout, b"first\n".to_vec()).await?;
+            sink(OutputStream::Stderr, b"warned\n".to_vec()).await?;
+            let mut outcome = outcome(Termination::Exited, Some(2), None);
+            outcome.output_loss = self.loss;
+            Ok(outcome)
         }
 
-        fn exec(&self) -> &dyn Exec {
-            &self.exec
+        fn files(&self) -> &dyn Files {
+            self
         }
 
-        fn fs(&self) -> &dyn Filesystem {
+        fn ports(&self) -> &dyn Ports {
+            self
+        }
+    }
+
+    #[async_trait]
+    impl Files for ScriptedSandbox {
+        async fn get(&self, _: &str, _: Option<FileRange>) -> Result<ByteStream, DriverError> {
             panic!("a step's spawn does not touch the filesystem")
+        }
+
+        async fn put(&self, _: &str, _: ByteStream) -> Result<(), DriverError> {
+            panic!("a step's spawn does not touch the filesystem")
+        }
+
+        async fn list(&self, _: &str, _: u32) -> Result<Vec<FileEntry>, DriverError> {
+            Ok(self.listing.clone().expect("a scripted directory listing"))
+        }
+    }
+
+    #[async_trait]
+    impl Ports for ScriptedSandbox {
+        async fn expose(&self, _: NonZeroU16, _: Expose) -> Result<Exposure, DriverError> {
+            panic!("a step's spawn exposes no port")
+        }
+
+        async fn release(&self, _: NonZeroU16) -> Result<(), DriverError> {
+            panic!("a step's spawn exposes no port")
         }
     }
 
@@ -803,15 +810,17 @@ mod tests {
     /// its stdout lines, its stderr lines in order, and its exit status.
     async fn run_scripted(loss: OutputLoss) -> (Vec<String>, Vec<String>, ExitStatus) {
         let sandbox: Arc<dyn Sandbox> = Arc::new(ScriptedSandbox {
-            id:   SandboxId::try_new("scripted").expect("the test sandbox id is valid"),
-            exec: ScriptedExec { loss },
+            loss,
+            directory: PathBuf::from(crate::CONTAINER_WORKSPACE),
+            env: BTreeMap::new(),
+            listing: None,
         });
         let admission = RunGate::default()
             .admit("exec")
             .expect("an open gate admits");
         let mut process = spawn_streamed(
             sandbox,
-            Job::Exec(ExecSpec::new("true")),
+            Job::Exec(ExecSpec::argv(["true"])),
             false,
             OutputMode::Lines,
             admission,
@@ -845,5 +854,42 @@ mod tests {
         assert_eq!(status.code, Some(2));
         assert_eq!(stdout, vec!["first".to_owned()]);
         assert_eq!(stderr, vec!["warned".to_owned()]);
+    }
+
+    #[tokio::test]
+    async fn directory_lists_accept_absolute_and_already_relative_entries() {
+        for entry_path in ["/workspace/src/src/nested.rs", "src/nested.rs"] {
+            let sandbox = Arc::new(ScriptedSandbox {
+                loss:      OutputLoss::default(),
+                directory: PathBuf::from("/workspace"),
+                env:       BTreeMap::new(),
+                listing:   Some(vec![FileEntry {
+                    path: entry_path.to_owned(),
+                    kind: sandbox_driver::FileKind::File,
+                    size: 7,
+                }]),
+            });
+            let env = SandboxEnv {
+                host: false,
+                sandbox,
+                workspace: "/workspace".to_owned(),
+                ambient: BTreeMap::new(),
+                env: BTreeMap::new(),
+                grace: Duration::from_secs(1),
+                host_address: None,
+                gate: RunGate::default(),
+            };
+            for path in ["src", "src/", "/workspace/src"] {
+                assert_eq!(
+                    env.list_directory(Path::new(path), 2).await.unwrap(),
+                    vec![DirectoryEntry {
+                        path:   "src/nested.rs".to_owned(),
+                        is_dir: false,
+                        size:   Some(7),
+                    }],
+                    "a relative entry that starts with the listed directory's name must stay intact"
+                );
+            }
+        }
     }
 }

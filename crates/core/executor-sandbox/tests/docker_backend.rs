@@ -6,13 +6,14 @@
 
 use std::mem;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use executor::{
     AcquireContext, EnvError, ExecEnv, Executor, ProcessSpec, Retention, ScopeOutcome, ScopeSpec,
     Sig,
 };
-use executor_sandbox::RoutingExecutor;
+use executor_sandbox::{MemoryLedger, RoutingExecutor};
 use testkit::{RunDir, container_id, container_is_running, is_docker_ready, list_containers};
 use tokio::time;
 
@@ -72,6 +73,29 @@ async fn workspace_len(env: &dyn ExecEnv, relative: &str) -> usize {
         .await
         .expect("read")
         .map_or(0, |bytes| bytes.len())
+}
+
+#[tokio::test]
+async fn an_explicit_platform_requires_portable_provider_support() {
+    if !is_docker_ready().await {
+        return;
+    }
+    let dir = RunDir::new("sandbox-portable-platform");
+    let executor = executor(&dir, Retention::Never);
+    let mut scope = container_scope(ALPINE);
+    let ir::RuntimeTarget::Container { options, .. } = &mut scope.runtime.target else {
+        unreachable!("a container scope");
+    };
+    options.platform = Some("linux/amd64".into());
+    // The locked Docker provider accepts its own platform option but does
+    // not advertise ContainerSpec.platform. Petri must not bypass admission.
+    let error = executor
+        .acquire(&scope, &AcquireContext::bare())
+        .await
+        .expect_err("portable platform support is not advertised");
+    assert!(error.to_string().contains("container.platform"), "{error}");
+    assert!(list_containers(&dir.container_prefix()).await.is_empty());
+    executor.shutdown().await;
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -271,11 +295,10 @@ async fn term_reaches_the_step_process_group() {
     assert!(report.is_clean(), "{report:?}");
 }
 
-/// Crash recovery attaches the *same* sandbox — its workspace is the run's
-/// state — and fences it with one stop and one start, so whatever a dead
-/// execution left running is gone before any holder resumes.
+/// Without a recorded reference, adoption needs the provider to identify
+/// the conflicting sandbox with AlreadyExists, not InvalidSpec.
 #[tokio::test(flavor = "multi_thread")]
-async fn a_reacquire_attaches_and_fences_the_crashed_predecessor() {
+async fn a_name_conflict_is_refused_without_provider_identification() {
     if !is_docker_ready().await {
         return;
     }
@@ -298,10 +321,6 @@ async fn a_reacquire_attaches_and_fences_the_crashed_predecessor() {
         wait_for_workspace_file(&*env, "heartbeat", Duration::from_secs(60)).await,
         "the beater never started"
     );
-    let crashed_id = container_id(&name(&dir))
-        .await
-        .expect("the sandbox container exists");
-
     // The crash: no release, and the process's plugin dies with it.
     mem::forget(handle);
     drop(env);
@@ -313,31 +332,16 @@ async fn a_reacquire_attaches_and_fences_the_crashed_predecessor() {
     );
 
     let second = executor(&dir, Retention::Never);
-    let handle2 = second
+    let error = second
         .acquire(&container_scope(ALPINE), &AcquireContext::bare())
         .await
-        .expect("second acquire");
-    let same_id = container_id(&name(&dir))
-        .await
-        .expect("the sandbox is still there");
-    assert_eq!(
-        same_id, crashed_id,
-        "the same sandbox was attached, not replaced"
+        .expect_err("the provider must identify the conflicting sandbox");
+    assert!(error.to_string().contains("name"), "{error}");
+    assert!(
+        container_id(&name(&dir)).await.is_none(),
+        "failed acquire cleaned up"
     );
-
-    let env2 = handle2.exec();
-    let before = workspace_len(&*env2, "heartbeat").await;
-    assert!(before > 0, "the workspace survived the fence");
-    time::sleep(Duration::from_millis(600)).await;
-    assert_eq!(
-        workspace_len(&*env2, "heartbeat").await,
-        before,
-        "the crashed execution's beater kept writing: the fence missed it"
-    );
-
-    let report = second.release(handle2, ScopeOutcome::Succeeded).await;
-    assert!(report.is_clean(), "{report:?}");
-    assert!(container_id(&name(&dir)).await.is_none(), "released");
+    second.shutdown().await;
 }
 
 /// Retention keeps the *sandbox*, stopped, with its workspace inside; a
@@ -349,7 +353,9 @@ async fn a_kept_sandbox_is_stopped_and_reattached_later() {
         return;
     }
     let dir = RunDir::new("sandbox-docker-keep");
+    let ledger = Arc::new(MemoryLedger::default());
     let keeper = executor(&dir, Retention::Always);
+    keeper.set_ledger(ledger.clone());
     let handle = keeper
         .acquire(&container_scope(ALPINE), &AcquireContext::bare())
         .await
@@ -368,6 +374,7 @@ async fn a_kept_sandbox_is_stopped_and_reattached_later() {
     );
 
     let later = executor(&dir, Retention::Never);
+    later.set_ledger(ledger);
     let handle = later
         .acquire(&container_scope(ALPINE), &AcquireContext::bare())
         .await

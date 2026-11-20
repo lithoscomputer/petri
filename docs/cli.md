@@ -5,45 +5,43 @@ Use `petri --help` and `petri run --help` for the complete option list.
 
 ## Source installation
 
-The README installs the CLI from Git and the host plugin from the revision in
-Petri's lockfile. Source-built release binaries have no bundled plugin digests.
-Use `--sandbox-plugin-dev` for commands that launch these plugins, or set
-`PETRI_SANDBOX_PLUGIN_DEV=1` for an embedding application. This opts into
-launching unverified plugins from your installation. Debug builds enable this
-mode by default.
-
-Install additional providers at the same revision as the host plugin:
-
-```sh
-cargo install --locked --git https://github.com/lithoscomputer/sandbox-driver --rev 691cb4e5b8425434c1fe24becc47962a4fae9ce4 sandbox-driver-docker sandbox-driver-daytona
-```
-
-Docker needs a running daemon. Daytona needs account credentials. Release
-archives built by the repository's release workflow bundle all three plugins
-and their expected digests. Keep those executables together when installing an archive.
+The README installs the CLI from Git. The Host, Docker, and Daytona providers
+are sandbox-driver built-ins linked into the binary at the revision Petri's
+lockfile pins; no provider executable is installed or launched. Docker needs a
+running daemon. Daytona needs account credentials.
 
 ## Execution backends
 
-Host and container scopes use the `sandbox-driver-host` and
-`sandbox-driver-docker` plugins by default. Petri launches them and
-communicates over JSON-RPC; no provider crate is linked into Petri itself. An
-embedder that links the built-in providers (Fabro does) passes a factory per
-kind to `Runtime::in_process_providers`; the runtime then uses those providers
-directly and launches no plugin, and leases keep the same fingerprints either
-way (`crates/core/executor-sandbox/src/in_process.rs`). `mise run plugins:build`
-installs both plugins from the locked sandbox-driver commit under `target/plugins/bin`. The development
-and test tasks select those binaries. Docker tests skip when no daemon is
-reachable; Host execution requires its plugin and no daemon. A provider that
-lost command output on its own transport (Daytona's encoded exec can tear a
-frame) counts the loss in its result; Petri keeps the command's exit status
-and appends one line, `[sandbox] N output frame(s), M bytes dropped by the
-provider`, to the command's stderr, so the agent and the run log see it.
+Petri places every scope on a sandbox catalog through sandbox-driver's shared
+sandbox API (`Sandboxes`): provider entries, and named environments on them.
+Host, Docker, and Daytona are built-ins registered in-process with
+`Registry::builtin` (`crates/core/executor-sandbox/src/catalog.rs`); no
+provider executable is launched. With no catalog file, `--backend` describes
+one entry and one environment per built-in: `host` (a directory of the run),
+`docker` (the pinned slim runner image, `DOCKER_HOST` or the default socket),
+and `daytona` (the pinned Docker-in-Docker runner, `DAYTONA_*`). Process scopes
+go to the backend's environment and container scopes to `docker`, or to
+`daytona` on the Daytona backend. `--sandbox-catalog PATH` reads
+`[providers.*]` and `[environments.*]` from a TOML file instead; an embedder
+passes its own entries, environment store and credential store to
+`Runtime::sandbox_catalog` (Fabro does). Docker tests skip when no daemon is
+reachable. A provider that lost command output on its own transport
+(Daytona's encoded exec can tear a frame) counts the loss in its result;
+Petri keeps the command's exit status and appends one line, `[sandbox] N
+output frame(s), M bytes dropped by the provider`, to the command's stderr, so
+the agent and the run log see it.
 
-The Host plugin keeps private records under `<run_dir>/host-registry`.
-It owns each lease's workspace and process groups. After a plugin crash,
-recovery fences old work before reuse and never signals saved process ids.
-Retention keeps or deletes the workspace with its sandbox; `petri sandbox
-prune` deletes retained Host resources through a fresh plugin.
+Every lease records its sandbox's reference (provider entry, namespace and
+id) and the environment and resolved spec it was admitted with. A resume or
+prune reaches the sandbox through that reference, and refuses an entry that
+now reaches another namespace (a changed `DOCKER_HOST` or Daytona
+organization). Leases recorded before this release name no reference; Petri
+finds their sandboxes by the run's `petri.run` label and their recorded id.
+The built-in Host provider owns each lease's process groups for the life of
+the process that created it; a resumed run creates a new Host sandbox over the
+same workspace directory, which Petri keeps under the run directory.
+Retention keeps or deletes that workspace with its lease; `petri sandbox
+prune` deletes retained workspaces.
 
 Host jobs inherit `PATH`, `HOME`, `USER`, `SHELL`, `LANG`, `TERM`,
 `TMPDIR`, `GOPATH`, `CARGO_HOME`, and `NVM_DIR`. Pass other values and secrets
@@ -56,8 +54,8 @@ lowered graph through `Frontend::launch_settings`; `petri resume` finds the
 format from the stored graph through `Frontend::claims_graph`); an explicit
 `--backend` always wins. Docker runs process jobs in a pinned slim runner image.
 Daytona runs them in a container with nested Docker; container jobs, services,
-and Docker actions stay inside that sandbox. `--daytona-kind vm` explicitly
-selects a VM when the account supports it. `--runner-image LABEL=IMAGE` overrides a
+and Docker actions stay inside that sandbox. `--daytona-kind vm` is
+refused until sandbox-driver's shared API carries Daytona's VM class. `--runner-image LABEL=IMAGE` overrides a
 runner label. Docker defaults cover Ubuntu 22.04, 24.04, and 26.04. Daytona's
 published Docker-in-Docker default covers Ubuntu 24.04 and `ubuntu-latest`;
 other labels need an override. Unknown or conflicting labels fail at acquire.
@@ -88,10 +86,6 @@ live Daytona tier (`mise run test:daytona`, see
 credentials. Its default process and nested-container smoke tests have passed
 against the hosted service; the full tier remains separate validation.
 
-Release archives bundle the Docker, Host, and Daytona plugin executables from
-the locked sandbox-driver commit. Petri embeds their SHA-256 digests at release build time.
-`scripts/release-verify.sh` checks the archive, runs Host and Docker workflows
-without development mode, and verifies rejection of modified plugins.
 sandbox-driver, Pebble, and lithos-llm are public repositories fetched over
 HTTPS, so no job needs a deploy key. See
 [git dependencies](https://github.com/lithoscomputer/petri/blob/main/DEVELOPING.md#git-dependencies).

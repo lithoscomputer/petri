@@ -263,32 +263,32 @@ async fn complete(execution_status: RunStatus, failure: Option<FinalizationFailu
 
 #[tokio::test]
 async fn rejected_finalization_is_durable_failure_with_details() {
-    complete(
+    Box::pin(complete(
         RunStatus::Success,
         Some(FinalizationFailure::new("publish_failed", "push rejected")),
-    )
+    ))
     .await;
 }
 
 #[tokio::test]
 async fn successful_execution_and_finalization_succeed() {
-    complete(RunStatus::Success, None).await;
+    Box::pin(complete(RunStatus::Success, None)).await;
 }
 
 #[tokio::test]
 async fn successful_finalization_cannot_upgrade_failed_execution() {
-    complete(RunStatus::Failed, None).await;
+    Box::pin(complete(RunStatus::Failed, None)).await;
 }
 
 #[tokio::test]
 async fn cancellation_keeps_precedence_and_releases_resources() {
-    complete(
+    Box::pin(complete(
         RunStatus::Cancelled,
         Some(FinalizationFailure::new(
             "cleanup_failed",
             "host work failed",
         )),
-    )
+    ))
     .await;
 }
 
@@ -372,12 +372,12 @@ async fn interrupted_completion_requires_the_finalizer_on_resume() {
 
 #[tokio::test]
 async fn failed_execution_retains_a_rejected_finalization_detail() {
-    complete(
+    Box::pin(complete(
         RunStatus::Failed,
         Some(FinalizationFailure::new(
             "finalize_failed",
             "host work rejected",
         )),
-    )
+    ))
     .await;
 }

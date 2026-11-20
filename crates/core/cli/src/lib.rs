@@ -195,11 +195,12 @@ struct ProviderArgs {
     /// Where workflow processes run: host, docker, or daytona. Defaults to
     /// what the workflow's own configuration asks for, else host.
     #[arg(long)]
-    backend:            Option<SandboxBackend>,
-    /// Allow plugins without a pinned checksum. Debug builds allow them by
-    /// default.
-    #[arg(long)]
-    sandbox_plugin_dev: bool,
+    backend:         Option<SandboxBackend>,
+    /// A sandbox catalog file (`[providers.*]` and `[environments.*]`) to
+    /// place scopes on, in place of the built-in entries `--backend`
+    /// describes.
+    #[arg(long, value_name = "PATH")]
+    sandbox_catalog: Option<PathBuf>,
 }
 
 impl ProviderArgs {
@@ -212,7 +213,7 @@ impl ProviderArgs {
     fn options(self) -> SandboxOptions {
         SandboxOptions {
             backend: self.backend.unwrap_or_default(),
-            plugin_dev: self.sandbox_plugin_dev.then_some(true),
+            catalog: self.sandbox_catalog,
             ..Default::default()
         }
     }

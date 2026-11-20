@@ -36,7 +36,7 @@ async fn a_daytona_run_keeps_its_sandbox_stopped_and_prune_deletes_it() {
     if !is_daytona_ready().await {
         return;
     }
-    let observer = DaytonaObserver::from_env().await;
+    let observer = DaytonaObserver::from_env();
     let dir = RunDir::new("host-daytona-prune");
     let rt = petri::runtime().options(options(&dir, Retention::Always));
     let mut b = GraphBuilder::bare();
@@ -63,7 +63,7 @@ async fn a_daytona_run_keeps_its_sandbox_stopped_and_prune_deletes_it() {
         .await
         .expect("retention kept the sandbox");
     assert!(
-        observer.is_stopped(&run_id, LEASE).await,
+        observer.eventually_stopped(&run_id, LEASE).await,
         "retention kept the sandbox, stopped: {status:?}"
     );
     let records = execution::ResourceStore::load(&testkit::read_run_dir(dir.path()).await)
@@ -76,10 +76,10 @@ async fn a_daytona_run_keeps_its_sandbox_stopped_and_prune_deletes_it() {
     assert_eq!(record.provider, "daytona");
     assert_eq!(
         record.resource_id.as_deref(),
-        Some(status.id.as_str()),
+        Some(status.reference.id.as_str()),
         "the record names the provider's sandbox"
     );
-    assert!(record.fingerprint.is_some());
+    assert!(record.admission.is_some() && record.reference.is_some());
     drop(records);
 
     let prune_rt = petri::runtime().options(options(&dir, Retention::Never));
@@ -113,7 +113,7 @@ async fn a_daytona_run_keeps_its_sandbox_stopped_and_prune_deletes_it() {
         .expect_err("a held run is not pruned");
     assert!(matches!(error, PruneError::RunHeld(_)), "{error}");
     drop(held);
-    assert!(observer.sandboxes(&run_id).await.is_empty());
+    assert!(observer.eventually_gone(&run_id).await.is_empty());
     observer.shutdown().await;
 }
 
@@ -127,7 +127,7 @@ async fn resume_fences_the_crashed_daytona_sandbox() {
     if !is_daytona_ready().await {
         return;
     }
-    let observer = DaytonaObserver::from_env().await;
+    let observer = DaytonaObserver::from_env();
     let dir = RunDir::new("host-daytona-resume");
     let rt = petri::runtime().options(options(&dir, Retention::Never));
     let mut b = GraphBuilder::bare();
@@ -210,12 +210,12 @@ sleep 300
         .sandboxes(&run_id)
         .await
         .into_iter()
-        .map(|status| format!("{} ({:?})", status.id, status.state))
+        .map(|status| format!("{} ({:?})", status.reference.id, status.state))
         .collect();
     assert!(
         leftovers.is_empty(),
         "the run's release ended the sandbox (was {}): {leftovers:?}",
-        crashed.id
+        crashed.reference.id
     );
     observer.shutdown().await;
 }

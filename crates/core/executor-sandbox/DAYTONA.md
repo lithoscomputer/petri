@@ -12,25 +12,21 @@ what the port left open.
 Every Daytona test starts with `testkit::is_daytona_ready()`. The check
 mirrors the Docker battery's `is_docker_ready()` and `PETRI_REQUIRE_DOCKER`:
 
-- Without a credential (`DAYTONA_API_KEY` or `DAYTONA_JWT_TOKEN`) or without
-  a Daytona plugin whose backend accepts it, the test prints a `skipping:`
+- Without a credential (`DAYTONA_API_KEY` or `DAYTONA_JWT_TOKEN`) that the
+  Daytona backend accepts, the test prints a `skipping:`
   notice with the reason and returns. The routine suite (`mise run test`,
   `mise run check`) therefore passes on a machine with no account.
 - With `PETRI_REQUIRE_DAYTONA=1`, the same absence fails the test with the
-  reason in the message: no credential, a plugin that is not where
-  `PETRI_SANDBOX_DAYTONA_PLUGIN` says, or a backend that rejected the key.
+  reason in the message: no credential, or a backend that rejected the key.
   A silently skipped live battery would be indistinguishable from a passing
   one.
 
-The plugin comes from `PETRI_SANDBOX_DAYTONA_PLUGIN`. `mise run
-plugins:build:daytona` installs it under `target/plugins/bin` beside the host
-and Docker plugins, from the sandbox-driver revision the workspace pins. The
-plugin receives `DAYTONA_API_KEY`, `DAYTONA_JWT_TOKEN`,
-`DAYTONA_ORGANIZATION_ID`, `DAYTONA_API_URL` and `DAYTONA_TARGET` from the
-environment and nothing else.
+Daytona is a sandbox-driver built-in linked into Petri. Its catalog entry
+takes `DAYTONA_ORGANIZATION_ID`, `DAYTONA_API_URL` and `DAYTONA_TARGET` as
+configuration and `DAYTONA_API_KEY` or `DAYTONA_JWT_TOKEN` as its secret.
 
-`mise run test:daytona` is the tier's entry point. It builds the Daytona
-plugin, sets `PETRI_REQUIRE_DAYTONA=1`, and runs every test whose binary or
+`mise run test:daytona` is the tier's entry point. It sets
+`PETRI_REQUIRE_DAYTONA=1`, and runs every test whose binary or
 name says `daytona`:
 
 ```sh

@@ -16,24 +16,25 @@
 //! store ([`LeaseRecords`]), and can crash the lifetime at a chosen call,
 //! before its effect or after it ([`CallCrash`]).
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::future::pending;
+use std::num::NonZeroU16;
+use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
 
 use async_trait::async_trait;
 use executor::ExitStatus;
-use executor_sandbox::{
-    LEASE_LABEL, LeaseState, PendingIntent, ProviderContext, ProviderFactory, ProviderNetwork,
-    fingerprint,
-};
+use executor_sandbox::{LEASE_LABEL, LeaseState, PendingIntent, SandboxCatalog};
 use sandbox_driver::{
-    Capabilities, DirEntry, Error, EventContext, Exec, ExecControls, ExecResult, ExecSpec,
-    ExecStreamingResult, FileMetadata, Filesystem, HealthStatus, Isolation, OutputStream,
-    PlatformInfo, ProviderError, ProviderHealth, ProviderKind, ResourceKind, Sandbox,
-    SandboxFilter, SandboxId, SandboxProvider, SandboxSpec, SandboxState, SandboxStatus,
-    Termination,
+    AccessScope, Activation, ByteStream, CapabilitySet, ContainerField, Descriptor, Durability,
+    Environment, EnvironmentName, Error, ExecControls, ExecOutcome, ExecSpec, Expose, Exposure,
+    FileEntry, FileRange, Files, Health, Isolation, LabelFilter, Locality, MutationOutcome,
+    Namespace, NamespaceId, NamespaceScope, NetworkMode, OutputStream, PluginLocation, PortSupport,
+    Ports, Provider, ProviderEntry, ProviderFactory, ProviderKind, ProviderName, ProviderSchemas,
+    Registry, Resources, Sandbox, SandboxId, SandboxRef, SandboxSpec, SandboxState, SandboxSummary,
+    SecretResolver, Source, SourceKind, StaticEnvironments, Status, Termination, WorkloadAdmission,
 };
 use smol_str::SmolStr;
 use tokio::sync::Notify;
@@ -41,9 +42,12 @@ use tokio::time;
 
 use super::{Place, World, execution_of, line};
 
-/// The provider kind the world serves as: its sandboxes, like containers,
-/// outlive the process that created them.
+/// The provider kind, entry and environment the world serves as: its
+/// sandboxes, like containers, outlive the process that created them.
 pub const WORLD_KIND: &str = "docker";
+
+/// The namespace every lifetime of the world reaches.
+const WORLD_NAMESPACE: &str = "world";
 
 /// Where every sandbox runs its processes.
 const WORKING_DIRECTORY: &str = "/work";
@@ -53,8 +57,8 @@ const WORKING_DIRECTORY: &str = "/work";
 pub struct LeaseView {
     pub state:       LeaseState,
     pub pending:     Option<PendingIntent>,
-    /// The allocation names the backend it creates on.
-    pub fingerprint: bool,
+    /// The allocation names the entry, namespace and spec it creates with.
+    pub admitted:    bool,
     pub resource_id: Option<String>,
 }
 
@@ -143,6 +147,40 @@ impl World {
         }
     }
 
+    /// The catalog a run of the current lifetime places its scopes on: one
+    /// `docker` entry and environment over [`World::factory`].
+    pub fn catalog(self: &Arc<Self>) -> SandboxCatalog {
+        struct NoSecrets;
+        #[async_trait]
+        impl SecretResolver for NoSecrets {
+            async fn resolve(&self, _: &str) -> Result<Option<String>, Error> {
+                Ok(None)
+            }
+        }
+        let name = ProviderName::try_new(WORLD_KIND).expect("a constant entry name");
+        let entry: ProviderEntry =
+            serde_json::from_value(serde_json::json!({ "plugin": WORLD_KIND }))
+                .expect("a constant entry");
+        let registry = Registry::new()
+            .builtin(
+                ProviderKind::try_new(WORLD_KIND).expect("a constant kind"),
+                Arc::new(self.factory()),
+            )
+            .expect("one registration");
+        SandboxCatalog::new(
+            [(name.clone(), entry)],
+            Arc::new(StaticEnvironments(BTreeMap::from([(
+                EnvironmentName::try_new(WORLD_KIND).expect("a constant environment name"),
+                Environment {
+                    provider: name,
+                    spec:     SandboxSpec::new(Source::Image("world:runner".to_owned())),
+                },
+            )]))),
+            registry,
+            Arc::new(NoSecrets),
+        )
+    }
+
     /// Check every provider call against `records`.
     pub fn check_leases(&self, records: Arc<dyn LeaseRecords>) {
         self.lock().records = Some(records);
@@ -195,39 +233,41 @@ pub struct WorldFactory {
     lifetime: u32,
 }
 
+fn schemas() -> ProviderSchemas {
+    ProviderSchemas {
+        kind:          ProviderKind::try_new(WORLD_KIND).expect("a valid provider kind"),
+        version:       "1".to_owned(),
+        config_schema: serde_json::from_value(serde_json::json!({
+            "$schema": "https://json-schema.org/draft/2020-12/schema",
+            "type": "object",
+            "additionalProperties": false,
+        }))
+        .expect("a constant schema"),
+        spec_schema:   None,
+        secrets:       Vec::new(),
+    }
+}
+
 #[async_trait]
 impl ProviderFactory for WorldFactory {
-    fn kind(&self) -> &str {
-        WORLD_KIND
+    async fn discover(&self, _location: &PluginLocation) -> Result<ProviderSchemas, Error> {
+        Ok(schemas())
     }
 
-    fn fingerprint_seed(&self, _context: &ProviderContext) -> String {
-        fingerprint::docker(Some("world"))
-    }
-
-    fn network(&self) -> ProviderNetwork {
-        ProviderNetwork::docker(None, None)
-    }
-
-    async fn connect(
-        &self,
-        _context: &ProviderContext,
-    ) -> sandbox_driver::Result<Arc<dyn SandboxProvider>> {
+    async fn activate(&self, activation: Activation) -> Result<Arc<dyn Provider>, Error> {
         Ok(Arc::new(WorldProvider {
-            world:        Arc::clone(&self.world),
-            lifetime:     self.lifetime,
-            kind:         ProviderKind::try_new(WORLD_KIND).expect("a valid provider kind"),
-            capabilities: Capabilities::minimal(Isolation::Container),
+            world:    Arc::clone(&self.world),
+            lifetime: self.lifetime,
+            entry:    activation.name,
         }))
     }
 }
 
 /// The world's sandboxes, as one lifetime reaches them.
 struct WorldProvider {
-    world:        Arc<World>,
-    lifetime:     u32,
-    kind:         ProviderKind,
-    capabilities: Capabilities,
+    world:    Arc<World>,
+    lifetime: u32,
+    entry:    ProviderName,
 }
 
 /// What every handle on a lifetime's side of the provider shares.
@@ -235,7 +275,7 @@ struct WorldProvider {
 struct Side {
     world:    Arc<World>,
     lifetime: u32,
-    kind:     ProviderKind,
+    entry:    ProviderName,
 }
 
 impl Side {
@@ -305,11 +345,11 @@ impl Side {
         state.dice.chance(percent)
     }
 
-    fn failure(&self, what: &str) -> Error {
-        Error::Provider(ProviderError::new(
-            self.kind.clone(),
-            format!("simulated {what} failure"),
-        ))
+    fn failure(what: &str) -> Error {
+        Error::Unavailable {
+            message: format!("simulated {what} failure"),
+            outcome: MutationOutcome::Unknown,
+        }
     }
 
     fn record(&self, call: Call, sandbox: &str, unrecorded: bool, failed: bool) {
@@ -328,6 +368,102 @@ impl Side {
         let lease = lease?;
         Some(records.lease(lease).await)
     }
+
+    fn reference(&self, id: &str) -> SandboxRef {
+        SandboxRef {
+            provider:  self.entry.clone(),
+            namespace: NamespaceId::try_new(WORLD_NAMESPACE).expect("a constant namespace"),
+            id:        SandboxId::try_new(id).expect("the world's sandbox ids are valid"),
+        }
+    }
+
+    fn gone(id: &str) -> Error {
+        Error::NotFound {
+            resource: "sandbox".to_owned(),
+            id:       id.to_owned(),
+        }
+    }
+
+    /// End every process running in the sandbox `id`'s `incarnation`,
+    /// whichever lifetime ran it.
+    fn end_processes(&self, id: &str, incarnation: u32) {
+        let mut state = self.world.lock();
+        let lifetime = state.lifetime;
+        let now = time::Instant::now();
+        let mut fenced = 0;
+        for process in &state.processes {
+            if process.key == id && process.generation == incarnation && process.running(now) {
+                if process.lifetime < lifetime {
+                    fenced += 1;
+                }
+                process.state.kill(9);
+            }
+        }
+        state.fenced += fenced;
+    }
+
+    /// Stop, start or destroy the sandbox at `index`: check the lease's
+    /// intent, crash where planned, apply `effect`, and note the call.
+    async fn change(
+        &self,
+        index: usize,
+        call: Call,
+        effect: impl FnOnce(&mut WorldSandbox),
+    ) -> Result<(), Error> {
+        let (id, incarnation, lease) = {
+            let state = self.world.lock();
+            let sandbox = &state.sandboxes[index];
+            (
+                sandbox.id.clone(),
+                sandbox.incarnation,
+                sandbox.lease().map(ToOwned::to_owned),
+            )
+        };
+        let superseded = self.superseded(&id);
+        let mut unrecorded = false;
+        if let Some(view) = self.view(lease.as_deref()).await {
+            let names = view
+                .as_ref()
+                .and_then(|view| view.resource_id.as_deref())
+                .is_some_and(|resource| resource == id);
+            let pending = view.as_ref().and_then(|view| view.pending);
+            let allowed = match call {
+                Call::Stop => pending == Some(PendingIntent::Stop),
+                Call::Delete => {
+                    unrecorded = !names;
+                    pending == Some(PendingIntent::Delete) || !names
+                }
+                Call::Start | Call::Create => true,
+            };
+            if !allowed && !superseded {
+                self.world.violation(format!(
+                    "{call:?} of {id} before its lease recorded the intent ({view:?})"
+                ));
+            }
+        }
+        let crash = self.count(call);
+        if let Some((Moment::Before, crash)) = &crash {
+            Self::crash(crash).await;
+        }
+        let failed = matches!(call, Call::Stop | Call::Delete)
+            && self.fails(|faults| faults.release_failure);
+        if !failed {
+            if matches!(call, Call::Stop | Call::Delete) {
+                self.end_processes(&id, incarnation);
+            }
+            let mut state = self.world.lock();
+            effect(&mut state.sandboxes[index]);
+        }
+        self.record(call, &id, unrecorded, failed);
+        if let Some((Moment::After, crash)) = &crash {
+            Self::crash(crash).await;
+        }
+        self.delay(|faults| faults.release_ms).await;
+        if failed {
+            return Err(Self::failure(&format!("{call:?}").to_lowercase()));
+        }
+        Ok(())
+    }
 }
 
 /// The world's sandbox with `id` that is not deleted.
@@ -342,63 +478,75 @@ impl WorldProvider {
         Side {
             world:    Arc::clone(&self.world),
             lifetime: self.lifetime,
-            kind:     self.kind.clone(),
+            entry:    self.entry.clone(),
         }
     }
 
-    fn handle(&self, index: usize) -> Arc<dyn Sandbox> {
+    fn handle(&self, index: usize) -> Box<dyn Sandbox> {
         let (id, incarnation) = {
             let state = self.world.lock();
             let sandbox = &state.sandboxes[index];
             (sandbox.id.clone(), sandbox.incarnation)
         };
-        Arc::new(WorldSandboxHandle {
+        Box::new(WorldSandboxHandle {
             side: self.side(),
-            id: SandboxId::try_new(id.as_str()).expect("the world's sandbox ids are valid"),
+            id,
             incarnation,
-            capabilities: self.capabilities.clone(),
-            exec: WorldExec {
-                side: self.side(),
-                id,
-                incarnation,
-            },
+            env: BTreeMap::new(),
         })
     }
 }
 
 #[async_trait]
-impl SandboxProvider for WorldProvider {
-    fn kind(&self) -> &ProviderKind {
-        &self.kind
+impl Provider for WorldProvider {
+    async fn describe(&self) -> Result<Descriptor, Error> {
+        Ok(Descriptor {
+            schemas:      schemas(),
+            namespace:    Namespace {
+                id:    NamespaceId::try_new(WORLD_NAMESPACE).expect("a constant namespace"),
+                scope: NamespaceScope::Machine,
+            },
+            isolation:    Isolation::Container,
+            durability:   Durability::Machine,
+            access:       AccessScope::Shared,
+            sources:      [SourceKind::Image].into(),
+            locality:     Locality::default(),
+            resources:    BTreeSet::new(),
+            network:      [NetworkMode::ProviderDefault].into(),
+            ports:        PortSupport::None,
+            capabilities: CapabilitySet {
+                container_fields: [ContainerField::Init].into(),
+                ..CapabilitySet::default()
+            },
+        })
     }
 
-    fn capabilities(&self) -> &Capabilities {
-        &self.capabilities
+    async fn health(&self) -> Result<Health, Error> {
+        Ok(Health {
+            healthy: true,
+            message: None,
+        })
     }
 
     /// A sandbox named as the spec asks, carrying its labels. It exists from
     /// the call's start, whether or not the call returns.
-    async fn create(
-        &self,
-        spec: &SandboxSpec,
-        _events: Option<EventContext>,
-    ) -> sandbox_driver::Result<Arc<dyn Sandbox>> {
+    async fn create(&self, admission: WorkloadAdmission) -> Result<Box<dyn Sandbox>, Error> {
+        let spec = admission.spec;
         let side = self.side();
         side.alive().await;
-        let id = spec
-            .name
-            .clone()
-            .ok_or_else(|| Error::invalid_spec("name", "the world names every sandbox"))?;
+        let id = spec.name.clone().ok_or_else(|| Error::InvalidSpec {
+            path:    "name".to_owned(),
+            message: "the world names every sandbox".to_owned(),
+        })?;
         let superseded = side.superseded(&id);
         if let Some(Some(view)) = side
             .view(spec.labels.get(LEASE_LABEL).map(String::as_str))
             .await
             && !superseded
-            && (view.state != LeaseState::Allocating || !view.fingerprint || view.pending.is_some())
+            && (view.state != LeaseState::Allocating || !view.admitted || view.pending.is_some())
         {
             self.world.violation(format!(
-                "created {id} before its lease recorded an allocation with a fingerprint \
-                 ({view:?})"
+                "created {id} before its lease recorded an admitted allocation ({view:?})"
             ));
         }
         let crash = side.count(Call::Create);
@@ -409,10 +557,10 @@ impl SandboxProvider for WorldProvider {
         let index = {
             let mut state = self.world.lock();
             if live_index(&state.sandboxes, &id).is_some() {
-                return Err(Error::Provider(ProviderError::new(
-                    self.kind.clone(),
-                    format!("a sandbox named {id} already exists"),
-                )));
+                return Err(Error::AlreadyExists {
+                    name: id.clone(),
+                    id,
+                });
             }
             let incarnation = u32::try_from(
                 state
@@ -445,65 +593,63 @@ impl SandboxProvider for WorldProvider {
         }
         side.delay(|faults| faults.acquire_ms).await;
         if failed {
-            return Err(side.failure("create"));
+            return Err(Side::failure("create"));
         }
         Ok(self.handle(index))
     }
 
-    async fn attach(
-        &self,
-        id: &SandboxId,
-        _events: Option<EventContext>,
-    ) -> sandbox_driver::Result<Arc<dyn Sandbox>> {
+    async fn attach(&self, id: &SandboxId) -> Result<Box<dyn Sandbox>, Error> {
         self.side().alive().await;
         let index = live_index(&self.world.lock().sandboxes, id.as_str());
         index
             .map(|index| self.handle(index))
-            .ok_or_else(|| Error::NotFound {
-                resource: ResourceKind::Sandbox,
-                id:       id.as_str().to_owned(),
-            })
+            .ok_or_else(|| Side::gone(id.as_str()))
     }
 
-    async fn list(&self, filter: &SandboxFilter) -> sandbox_driver::Result<Vec<SandboxStatus>> {
-        self.side().alive().await;
+    async fn list(&self, filter: &LabelFilter) -> Result<Vec<SandboxSummary>, Error> {
+        let side = self.side();
+        side.alive().await;
         let state = self.world.lock();
         Ok(state
             .sandboxes
             .iter()
             .filter(|sandbox| sandbox.state != SandboxState::Deleted)
-            .filter(|sandbox| {
-                filter
-                    .labels
-                    .iter()
-                    .all(|(key, value)| sandbox.labels.get(key) == Some(value))
+            .filter(|sandbox| filter.matches(&sandbox.labels))
+            .map(|sandbox| SandboxSummary {
+                reference: side.reference(&sandbox.id),
+                name:      Some(sandbox.id.clone()),
+                state:     sandbox.state,
+                labels:    sandbox.labels.clone(),
             })
-            .map(status)
             .collect())
     }
 
-    async fn health(&self) -> sandbox_driver::Result<ProviderHealth> {
-        Ok(ProviderHealth::new(HealthStatus::Ok))
+    /// Deletes the live sandbox `id`; one already gone is deleted.
+    async fn destroy(&self, id: &SandboxId) -> Result<(), Error> {
+        let side = self.side();
+        side.alive().await;
+        let Some(index) = live_index(&self.world.lock().sandboxes, id.as_str()) else {
+            return Ok(());
+        };
+        side.change(index, Call::Delete, |sandbox| {
+            sandbox.state = SandboxState::Deleted;
+        })
+        .await
     }
-}
 
-fn status(sandbox: &WorldSandbox) -> SandboxStatus {
-    let mut status = SandboxStatus::new(
-        SandboxId::try_new(sandbox.id.as_str()).expect("the world's sandbox ids are valid"),
-        sandbox.state,
-    );
-    status.name = Some(sandbox.id.clone());
-    status.labels = sandbox.labels.clone();
-    status
+    async fn shutdown(&self) -> Result<(), Error> {
+        Ok(())
+    }
 }
 
 /// A sandbox, as the lifetime that attached or created it holds it.
 struct WorldSandboxHandle {
-    side:         Side,
-    id:           SandboxId,
-    incarnation:  u32,
-    capabilities: Capabilities,
-    exec:         WorldExec,
+    side:        Side,
+    id:          String,
+    incarnation: u32,
+    /// Empty: a simulated process reads its parameters from its own
+    /// environment only.
+    env:         BTreeMap<String, String>,
 }
 
 impl WorldSandboxHandle {
@@ -511,183 +657,24 @@ impl WorldSandboxHandle {
     fn index(&self) -> Option<usize> {
         let state = self.side.world.lock();
         state.sandboxes.iter().position(|sandbox| {
-            sandbox.id == self.id.as_str()
+            sandbox.id == self.id
                 && sandbox.incarnation == self.incarnation
                 && sandbox.state != SandboxState::Deleted
         })
     }
 
-    fn gone(&self) -> Error {
-        Error::NotFound {
-            resource: ResourceKind::Sandbox,
-            id:       self.id.as_str().to_owned(),
-        }
-    }
-
-    /// End every process running in this sandbox, whichever lifetime ran it.
-    fn end_processes(&self) {
-        let mut state = self.side.world.lock();
-        let lifetime = state.lifetime;
-        let now = time::Instant::now();
-        let mut fenced = 0;
-        for process in &state.processes {
-            if process.key == self.id.as_str()
-                && process.generation == self.incarnation
-                && process.running(now)
-            {
-                if process.lifetime < lifetime {
-                    fenced += 1;
-                }
-                process.state.kill(9);
-            }
-        }
-        state.fenced += fenced;
-    }
-
-    /// Stop or delete: check the lease's intent, crash where planned, apply
-    /// `effect`, and note the call.
     async fn change(
         &self,
         call: Call,
         effect: impl FnOnce(&mut WorldSandbox),
-    ) -> sandbox_driver::Result<()> {
+    ) -> Result<(), Error> {
         self.side.alive().await;
         let Some(index) = self.index() else {
-            return Err(self.gone());
+            return Err(Side::gone(&self.id));
         };
-        let superseded = self.side.superseded(self.id.as_str());
-        let lease = self.side.world.lock().sandboxes[index]
-            .lease()
-            .map(ToOwned::to_owned);
-        let mut unrecorded = false;
-        if let Some(view) = self.side.view(lease.as_deref()).await {
-            let names = view
-                .as_ref()
-                .and_then(|view| view.resource_id.as_deref())
-                .is_some_and(|resource| resource == self.id.as_str());
-            let pending = view.as_ref().and_then(|view| view.pending);
-            let allowed = match call {
-                Call::Stop => pending == Some(PendingIntent::Stop),
-                Call::Delete => {
-                    unrecorded = !names;
-                    pending == Some(PendingIntent::Delete) || !names
-                }
-                Call::Start | Call::Create => true,
-            };
-            if !allowed && !superseded {
-                self.side.world.violation(format!(
-                    "{call:?} of {} before its lease recorded the intent ({view:?})",
-                    self.id.as_str()
-                ));
-            }
-        }
-        let crash = self.side.count(call);
-        if let Some((Moment::Before, crash)) = &crash {
-            Side::crash(crash).await;
-        }
-        let failed = matches!(call, Call::Stop | Call::Delete)
-            && self.side.fails(|faults| faults.release_failure);
-        if !failed {
-            if matches!(call, Call::Stop | Call::Delete) {
-                self.end_processes();
-            }
-            let mut state = self.side.world.lock();
-            effect(&mut state.sandboxes[index]);
-        }
-        self.side.record(call, self.id.as_str(), unrecorded, failed);
-        if let Some((Moment::After, crash)) = &crash {
-            Side::crash(crash).await;
-        }
-        self.side.delay(|faults| faults.release_ms).await;
-        if failed {
-            return Err(self.side.failure(&format!("{call:?}").to_lowercase()));
-        }
-        Ok(())
-    }
-}
-
-#[async_trait]
-impl Sandbox for WorldSandboxHandle {
-    fn id(&self) -> &SandboxId {
-        &self.id
+        self.side.change(index, call, effect).await
     }
 
-    fn capabilities(&self) -> &Capabilities {
-        &self.capabilities
-    }
-
-    async fn describe(&self) -> sandbox_driver::Result<SandboxStatus> {
-        self.side.alive().await;
-        let state = self.side.world.lock();
-        state
-            .sandboxes
-            .iter()
-            .rev()
-            .find(|sandbox| {
-                sandbox.id == self.id.as_str() && sandbox.incarnation == self.incarnation
-            })
-            .map(status)
-            .ok_or_else(|| self.gone())
-    }
-
-    fn working_directory(&self) -> &str {
-        WORKING_DIRECTORY
-    }
-
-    /// Empty: a simulated process reads its parameters from its own
-    /// environment only.
-    async fn environment(&self) -> sandbox_driver::Result<BTreeMap<String, String>> {
-        self.side.alive().await;
-        Ok(BTreeMap::new())
-    }
-
-    async fn platform_info(&self) -> sandbox_driver::Result<PlatformInfo> {
-        Err(Error::Provider(ProviderError::new(
-            self.side.kind.clone(),
-            "a world sandbox reports no platform",
-        )))
-    }
-
-    async fn start(&self) -> sandbox_driver::Result<()> {
-        self.change(Call::Start, |sandbox| {
-            sandbox.state = SandboxState::Running;
-            sandbox.starts += 1;
-        })
-        .await
-    }
-
-    async fn stop(&self) -> sandbox_driver::Result<()> {
-        self.change(Call::Stop, |sandbox| {
-            sandbox.state = SandboxState::Stopped;
-            sandbox.stops += 1;
-        })
-        .await
-    }
-
-    async fn delete(&self) -> sandbox_driver::Result<()> {
-        self.change(Call::Delete, |sandbox| {
-            sandbox.state = SandboxState::Deleted;
-        })
-        .await
-    }
-
-    fn exec(&self) -> &dyn Exec {
-        &self.exec
-    }
-
-    fn fs(&self) -> &dyn Filesystem {
-        &WorldFilesystem
-    }
-}
-
-/// Runs the world's processes in one sandbox.
-struct WorldExec {
-    side:        Side,
-    id:          String,
-    incarnation: u32,
-}
-
-impl WorldExec {
     /// The sandbox runs: not stopped, not deleted.
     fn running(&self) -> bool {
         self.side.world.lock().sandboxes.iter().any(|sandbox| {
@@ -707,30 +694,11 @@ impl WorldExec {
             .and_then(WorldSandbox::lease)
             .map(ToOwned::to_owned)
     }
-}
-
-#[async_trait]
-impl Exec for WorldExec {
-    /// A buffered command (the executor's `mkdir -p` of a step's working
-    /// directory) succeeds and does nothing.
-    async fn run(&self, _spec: &ExecSpec) -> sandbox_driver::Result<ExecResult> {
-        self.side.alive().await;
-        Ok(ExecResult::new(
-            Termination::Exited,
-            Some(0),
-            Duration::ZERO,
-        ))
-    }
 
     /// One simulated process, from the step's `SIM_*` parameters: its lines
     /// go to the sink, and it runs for its work time unless the caller's
     /// `term` or `kill`, or the sandbox's stop, ends it first.
-    async fn run_streaming(
-        &self,
-        spec: &ExecSpec,
-        controls: ExecControls,
-    ) -> sandbox_driver::Result<ExecStreamingResult> {
-        self.side.alive().await;
+    async fn process(&self, spec: &ExecSpec, controls: ExecControls) -> Result<ExecOutcome, Error> {
         // A zombie's start, or a start in a sandbox a zombie changed, is
         // the zombie's doing: counted, not a violation.
         let excused = {
@@ -744,10 +712,9 @@ impl Exec for WorldExec {
                     self.id
                 ));
             }
-            return Err(Error::Provider(ProviderError::new(
-                self.side.kind.clone(),
-                format!("{} is not running", self.id),
-            )));
+            return Err(Error::Busy {
+                message: format!("{} is not running", self.id),
+            });
         }
         if let Some(Some(view)) = self.side.view(self.lease().as_deref()).await
             && !excused
@@ -813,67 +780,133 @@ impl Exec for WorldExec {
                 }, if !term_sent => {
                     term_sent = true;
                     if process.honor_term {
-                        ended_by = Termination::Cancelled;
+                        ended_by = Termination::Terminated;
                         process.kill(15);
                     }
                 }
             }
         };
-        let mut result = ExecResult::new(
-            if exit.signal.is_some() {
+        Ok(ExecOutcome {
+            termination: if exit.signal.is_some() {
                 ended_by
             } else {
                 Termination::Exited
             },
-            exit.code,
-            Duration::ZERO,
-        );
-        result.signal = exit.signal;
-        Ok(ExecStreamingResult::new(result))
-    }
-}
-
-/// The filesystem facet: nothing is kept, and every write succeeds.
-struct WorldFilesystem;
-
-fn not_found(path: &str) -> Error {
-    Error::NotFound {
-        resource: ResourceKind::File,
-        id:       path.to_owned(),
+            exit_code:   exit.code,
+            signal:      exit.signal,
+            output_loss: sandbox_driver::OutputLoss::default(),
+        })
     }
 }
 
 #[async_trait]
-impl Filesystem for WorldFilesystem {
-    async fn read(&self, path: &str) -> sandbox_driver::Result<Vec<u8>> {
-        Err(not_found(path))
+impl Sandbox for WorldSandboxHandle {
+    fn reference(&self) -> SandboxRef {
+        self.side.reference(&self.id)
     }
 
-    async fn write(&self, _path: &str, _content: &[u8]) -> sandbox_driver::Result<()> {
+    fn working_directory(&self) -> &Path {
+        Path::new(WORKING_DIRECTORY)
+    }
+
+    fn env(&self) -> &BTreeMap<String, String> {
+        &self.env
+    }
+
+    async fn status(&self) -> Result<Status, Error> {
+        self.side.alive().await;
+        let state = self.side.world.lock();
+        let sandbox = state
+            .sandboxes
+            .iter()
+            .rev()
+            .find(|sandbox| sandbox.id == self.id && sandbox.incarnation == self.incarnation)
+            .ok_or_else(|| Side::gone(&self.id))?;
+        Ok(Status {
+            reference: self.reference(),
+            state:     sandbox.state,
+            name:      Some(sandbox.id.clone()),
+            labels:    sandbox.labels.clone(),
+            image:     None,
+            snapshot:  None,
+            resources: Resources::default(),
+            network:   None,
+            services:  BTreeMap::new(),
+            web_url:   None,
+        })
+    }
+
+    async fn start(&self) -> Result<(), Error> {
+        self.change(Call::Start, |sandbox| {
+            sandbox.state = SandboxState::Running;
+            sandbox.starts += 1;
+        })
+        .await
+    }
+
+    async fn stop(&self) -> Result<(), Error> {
+        self.change(Call::Stop, |sandbox| {
+            sandbox.state = SandboxState::Stopped;
+            sandbox.stops += 1;
+        })
+        .await
+    }
+
+    /// The executor's `mkdir -p` of a step's working directory succeeds and
+    /// does nothing; every other command is a simulated process.
+    async fn exec(&self, spec: ExecSpec, controls: ExecControls) -> Result<ExecOutcome, Error> {
+        self.side.alive().await;
+        if spec.argv.first().map(String::as_str) == Some("mkdir") {
+            return Ok(ExecOutcome {
+                termination: Termination::Exited,
+                exit_code:   Some(0),
+                signal:      None,
+                output_loss: sandbox_driver::OutputLoss::default(),
+            });
+        }
+        self.process(&spec, controls).await
+    }
+
+    fn files(&self) -> &dyn Files {
+        &WorldFiles
+    }
+
+    fn ports(&self) -> &dyn Ports {
+        &WorldFiles
+    }
+}
+
+/// The files facet: nothing is kept, and every write succeeds. No port is
+/// exposed.
+struct WorldFiles;
+
+#[async_trait]
+impl Files for WorldFiles {
+    async fn get(&self, path: &str, _range: Option<FileRange>) -> Result<ByteStream, Error> {
+        Err(Error::NotFound {
+            resource: "file".to_owned(),
+            id:       path.to_owned(),
+        })
+    }
+
+    async fn put(&self, _path: &str, _bytes: ByteStream) -> Result<(), Error> {
         Ok(())
     }
 
-    async fn delete(&self, _path: &str, _recursive: bool) -> sandbox_driver::Result<()> {
-        Ok(())
-    }
-
-    async fn exists(&self, _path: &str) -> sandbox_driver::Result<bool> {
-        Ok(false)
-    }
-
-    async fn metadata(&self, path: &str) -> sandbox_driver::Result<FileMetadata> {
-        Err(not_found(path))
-    }
-
-    async fn list_dir(&self, _path: &str, _depth: usize) -> sandbox_driver::Result<Vec<DirEntry>> {
+    async fn list(&self, _path: &str, _depth: u32) -> Result<Vec<FileEntry>, Error> {
         Ok(Vec::new())
     }
+}
 
-    async fn create_dir(&self, _path: &str) -> sandbox_driver::Result<()> {
-        Ok(())
+#[async_trait]
+impl Ports for WorldFiles {
+    async fn expose(&self, _port: NonZeroU16, _options: Expose) -> Result<Exposure, Error> {
+        Err(Error::Unsupported {
+            capability: "ports".to_owned(),
+        })
     }
 
-    async fn rename(&self, from: &str, _to: &str) -> sandbox_driver::Result<()> {
-        Err(not_found(from))
+    async fn release(&self, _port: NonZeroU16) -> Result<(), Error> {
+        Ok(())
     }
 }

@@ -103,12 +103,6 @@ jobs:
         if: matrix.docker == 'required'
         run: docker pull alpine:3.20
 
-      # Container scopes reach Docker through the sandbox-driver plugin, built
-      # from the commit Cargo.lock locks. A separate step, so a plugin
-      # build failure reads as one.
-      - name: Build the sandbox plugins
-        run: mise run plugins:build
-
       # check:nightly adds to the routine gate: the compiler floor, the long
       # tests, the driver and execution simulations over many more seeds,
       # three repeated black box runs under different schedules, the pinned

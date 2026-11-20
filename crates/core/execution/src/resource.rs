@@ -20,7 +20,7 @@ use std::sync::{Arc, Weak};
 use driver::RecordingClock;
 use executor::WorkspaceId;
 use executor_sandbox::{LeaseLedger, LeaseRecord, LedgerError};
-pub use executor_sandbox::{LeaseState, PendingIntent};
+pub use executor_sandbox::{LeaseState, PendingIntent, SandboxAdmission};
 use serde::de::Error as _;
 use serde::{Deserialize, Serialize};
 use smol_str::SmolStr;
@@ -56,8 +56,17 @@ pub struct SandboxResourceRecord {
     pub pending:       Option<PendingIntent>,
     /// The non-secret fingerprint of the backend the resource lives on: the
     /// daemon or endpoint, and the account or target. Never credentials.
+    /// Leases allocated before the shared sandbox API carry it; newer ones
+    /// record `admission` instead.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub fingerprint:   Option<SmolStr>,
+    /// The provider entry, namespace, environment and resolved spec the
+    /// lease's sandbox was admitted with, written before the create.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub admission:     Option<SandboxAdmission>,
+    /// The sandbox's durable reference, once it exists.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reference:     Option<ir::SandboxReference>,
 }
 
 impl SandboxResourceRecord {
@@ -68,7 +77,8 @@ impl SandboxResourceRecord {
         self.state != LeaseState::Deleted
             && (self.pending.is_some()
                 || self.state == LeaseState::Live
-                || (self.state == LeaseState::Allocating && self.fingerprint.is_some()))
+                || (self.state == LeaseState::Allocating
+                    && (self.fingerprint.is_some() || self.admission.is_some())))
     }
 }
 
@@ -266,6 +276,8 @@ impl ResourceStore {
             state: LeaseState::Allocating,
             pending: None,
             fingerprint: None,
+            admission: None,
+            reference: None,
         };
         self.write(&record).await?;
         self.next_lease = self.next_lease.saturating_add(1);
@@ -377,29 +389,36 @@ impl LeaseLedger for ResourceLedger {
             provider:    Some(record.provider.clone()),
             resource_id: record.resource_id.clone(),
             fingerprint: record.fingerprint.clone(),
+            admission:   record.admission.clone(),
+            reference:   record.reference.clone(),
         }))
     }
 
     async fn allocating(
         &self,
         lease: SandboxLeaseId,
-        provider: &str,
-        fingerprint: &str,
+        admission: &SandboxAdmission,
     ) -> Result<(), LedgerError> {
         self.update(lease, |record| {
             record.state = LeaseState::Allocating;
             record.pending = None;
-            record.provider = SmolStr::new(provider);
-            record.fingerprint = Some(SmolStr::new(fingerprint));
+            record.provider = admission.provider.clone();
+            record.admission = Some(admission.clone());
         })
         .await
     }
 
-    async fn live(&self, lease: SandboxLeaseId, resource_id: &str) -> Result<(), LedgerError> {
+    async fn live(
+        &self,
+        lease: SandboxLeaseId,
+        reference: &ir::SandboxReference,
+    ) -> Result<(), LedgerError> {
         self.update(lease, |record| {
             record.state = LeaseState::Live;
             record.pending = None;
-            record.resource_id = Some(SmolStr::new(resource_id));
+            record.provider = reference.provider.clone();
+            record.resource_id = Some(reference.id.clone());
+            record.reference = Some(reference.clone());
         })
         .await
     }
@@ -427,5 +446,28 @@ impl LeaseLedger for ResourceLedger {
             record.pending = None;
         })
         .await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A lease record written before the shared sandbox API: a provider
+    /// kind and a fingerprint, no admission and no reference.
+    const LEGACY_RECORD: &str = r#"{"lease":3,"allocation":{"invocation":1,"scope":{"declared":0}},"provider":"docker","resource_id":"c0ffee","workspace":"i1-0","runtime":{"target":"HostProcess","requirements":[]},"introduced_by":null,"state":"stopped","fingerprint":"docker:unix:///var/run/docker.sock"}"#;
+
+    #[test]
+    fn legacy_lease_records_decode_without_a_reference() {
+        let record: SandboxResourceRecord = serde_json::from_str(LEGACY_RECORD).expect("decodes");
+        assert_eq!(record.provider, "docker");
+        assert_eq!(record.resource_id.as_deref(), Some("c0ffee"));
+        assert!(record.admission.is_none());
+        assert!(record.reference.is_none());
+        // Re-encoding adds nothing: an old record stays readable by an
+        // older build.
+        let encoded = serde_json::to_value(&record).expect("encodes");
+        assert!(encoded.get("admission").is_none());
+        assert!(encoded.get("reference").is_none());
     }
 }

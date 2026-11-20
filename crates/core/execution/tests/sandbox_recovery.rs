@@ -11,6 +11,7 @@ use execution::{
 use executor::{AcquireContext, Executor, Retention, SandboxLeaseId, ScopeOutcome, ScopeSpec};
 use executor_sandbox::{
     LeaseLedger, LeaseRecord, LeaseState, LedgerError, PendingIntent, RoutingExecutor,
+    SandboxAdmission,
 };
 use ir::{RuntimeSpec, ScopeId};
 use testkit::{RunDir, container_id, container_write, is_docker_ready};
@@ -56,16 +57,19 @@ impl LeaseLedger for InterruptedLedger {
     async fn allocating(
         &self,
         lease: SandboxLeaseId,
-        provider: &str,
-        fingerprint: &str,
+        admission: &SandboxAdmission,
     ) -> Result<(), LedgerError> {
-        self.inner.allocating(lease, provider, fingerprint).await?;
+        self.inner.allocating(lease, admission).await?;
         self.interrupt(Crash::Reserved)
     }
 
-    async fn live(&self, lease: SandboxLeaseId, resource_id: &str) -> Result<(), LedgerError> {
+    async fn live(
+        &self,
+        lease: SandboxLeaseId,
+        reference: &ir::SandboxReference,
+    ) -> Result<(), LedgerError> {
         self.interrupt(Crash::Created)?;
-        self.inner.live(lease, resource_id).await
+        self.inner.live(lease, reference).await
     }
 
     async fn pending(
@@ -311,7 +315,7 @@ async fn interrupted_delete_finishes_as_a_tombstone() {
 }
 
 #[tokio::test]
-async fn recovery_refuses_a_changed_fingerprint_or_a_lost_workspace() {
+async fn recovery_refuses_a_changed_namespace_or_a_lost_workspace() {
     if !is_docker_ready().await {
         return;
     }
@@ -331,7 +335,8 @@ async fn recovery_refuses_a_changed_fingerprint_or_a_lost_workspace() {
         .store()
         .await
         .update(LEASE, |record| {
-            record.fingerprint = Some("another-daemon".into());
+            let admission = record.admission.as_mut().expect("the lease was admitted");
+            admission.namespace = "another-daemon".into();
         })
         .await
         .unwrap();
@@ -344,7 +349,7 @@ async fn recovery_refuses_a_changed_fingerprint_or_a_lost_workspace() {
         .store()
         .await
         .update(LEASE, |record| {
-            record.fingerprint.clone_from(&original.fingerprint);
+            record.admission.clone_from(&original.admission);
         })
         .await
         .unwrap();

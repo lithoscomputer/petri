@@ -13,39 +13,53 @@
 //!
 //! # Recovery
 //!
-//! When no live holder exists — a fresh process over a run dir, or a plugin
-//! generation change that invalidated every old handle — acquire
-//! reconciles: it lists the provider by the workspace label, attaches the
-//! one recorded match, stops it once (ending whatever a dead execution or a
-//! dead plugin left running), and starts it once before any holder resumes.
-//! More than one match is an error, never an arbitrary choice; a confirmed
-//! record whose resource is missing is an error, never a silent replacement,
-//! because its workspace was lost. A create happens only when reconciliation
-//! finds nothing.
+//! When no live holder exists (a fresh process over a run dir), acquire
+//! reconciles: it attaches the lease's recorded reference, or finds the one
+//! sandbox under its workspace label on the entry it was admitted to, stops
+//! it once (ending whatever a dead execution left running), and starts it
+//! once before any holder resumes. More than one match is an error, never an
+//! arbitrary choice; a confirmed record whose resource is missing is an
+//! error, never a silent replacement, because its workspace was lost. A
+//! provider whose sandboxes last only as long as their owner process
+//! (`Durability::Process`, built-in Host) is the exception: its sandbox is
+//! created again from the admitted spec, provided its designated workspace
+//! still exists or the run permits replacing lost workspaces.
+//!
+//! A lease recorded before the shared sandbox API names a provider kind and
+//! the provider's id, with no reference. Its sandbox is found by the run's
+//! label across every entry and matched on that id; nothing about its
+//! namespace is inferred from today's configuration.
 //!
 //! # The ledger
 //!
 //! Every transition is written to a [`LeaseLedger`] before the provider call
-//! that makes it true (`allocating` before create, `pending: stop` before
-//! stop, `pending: delete` before delete) and confirmed only after the
-//! provider succeeds. Recovery repeats a pending idempotent operation. The
-//! coordinator's resource store is the durable ledger; a standalone driver
-//! uses an in-memory one and releases its sandbox at scope release.
+//! that makes it true (`allocating`, with the admission, before create;
+//! `pending: stop` before stop, `pending: delete` before delete) and confirmed
+//! only after the provider succeeds. Recovery repeats a pending idempotent
+//! operation. The coordinator's resource store is the durable ledger; a
+//! standalone driver uses an in-memory one and releases its sandbox at scope
+//! release.
 
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
+use std::fmt;
+use std::io::ErrorKind;
+use std::path::PathBuf;
 use std::sync::{Arc, Mutex, PoisonError};
 
 use executor::{EnvError, ReleaseReport, Retention, SandboxLeaseId, ScopeOutcome};
+use ir::SandboxReference;
 use sandbox_driver::{
-    Error as DriverError, Sandbox, SandboxFilter, SandboxId, SandboxProvider, SandboxSpec,
+    Descriptor, Durability, Error as DriverError, LabelFilter, NamespaceId, ProviderName, Sandbox,
+    SandboxBuilder, SandboxId, SandboxRef, SandboxSpec, Sandboxes, Source,
 };
 use serde::{Deserialize, Serialize};
 use smol_str::SmolStr;
+use tokio::fs;
 use tokio::sync::{Mutex as AsyncMutex, OwnedMutexGuard};
 use tokio::task::JoinSet;
 
-use crate::plugin::ProviderSource;
-use crate::run::{LEASE_LABEL, RUN_LABEL, RunIdentity, WORKSPACE_LABEL};
+use crate::catalog::Credentials;
+use crate::run::{LEASE_LABEL, RUN_LABEL, RunIdentity};
 use crate::{BACKEND, LostSandbox, acquire_failed};
 
 /// Where a lease's sandbox stands, durably.
@@ -72,16 +86,36 @@ pub enum PendingIntent {
 }
 
 /// The durable facts about one lease the manager reads and writes.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct LeaseRecord {
     pub state:       LeaseState,
     pub pending:     Option<PendingIntent>,
-    /// The real provider kind, once known.
+    /// The provider entry, once known; a provider kind on a lease recorded
+    /// before the shared sandbox API.
     pub provider:    Option<SmolStr>,
     /// The provider's resource id, once known.
     pub resource_id: Option<SmolStr>,
-    /// The non-secret provider fingerprint recorded at allocation.
+    /// The non-secret provider fingerprint a lease allocated before the
+    /// shared sandbox API recorded. Read, never written.
     pub fingerprint: Option<SmolStr>,
+    /// Where the lease's sandbox is admitted, written before the create.
+    pub admission:   Option<SandboxAdmission>,
+    /// The sandbox's durable reference, once it exists.
+    pub reference:   Option<SandboxReference>,
+}
+
+/// What a lease's sandbox was admitted as, recorded before the provider is
+/// asked to create it: the provider entry and the namespace it reported, the
+/// catalog environment the template came from, and the resolved spec. A
+/// recovery uses these, never the catalog's current state, so an edited
+/// environment cannot redirect a lease.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct SandboxAdmission {
+    pub provider:    SmolStr,
+    pub namespace:   SmolStr,
+    pub environment: SmolStr,
+    /// The resolved `SandboxSpec`, as its JSON encoding.
+    pub spec:        serde_json::Value,
 }
 
 /// Why a ledger operation failed.
@@ -99,16 +133,21 @@ pub trait LeaseLedger: Send + Sync {
     async fn lookup(&self, lease: SandboxLeaseId) -> Result<Option<LeaseRecord>, LedgerError>;
 
     /// Records that the provider is about to be asked to create the
-    /// resource, and which provider on which backend.
+    /// resource, and what it is admitted as: entry, namespace, environment
+    /// and resolved spec.
     async fn allocating(
         &self,
         lease: SandboxLeaseId,
-        provider: &str,
-        fingerprint: &str,
+        admission: &SandboxAdmission,
     ) -> Result<(), LedgerError>;
 
-    /// Records the resource as created (or found) and running.
-    async fn live(&self, lease: SandboxLeaseId, resource_id: &str) -> Result<(), LedgerError>;
+    /// Records the resource as created (or found) and running, under its
+    /// durable reference.
+    async fn live(
+        &self,
+        lease: SandboxLeaseId,
+        reference: &SandboxReference,
+    ) -> Result<(), LedgerError>;
 
     /// Records an intent before the provider call. The intent stays until
     /// the matching confirmation.
@@ -139,6 +178,8 @@ impl MemoryLedger {
             provider:    None,
             resource_id: None,
             fingerprint: None,
+            admission:   None,
+            reference:   None,
         });
         update(record);
     }
@@ -158,22 +199,27 @@ impl LeaseLedger for MemoryLedger {
     async fn allocating(
         &self,
         lease: SandboxLeaseId,
-        provider: &str,
-        fingerprint: &str,
+        admission: &SandboxAdmission,
     ) -> Result<(), LedgerError> {
         self.update(lease, |record| {
             record.state = LeaseState::Allocating;
-            record.provider = Some(SmolStr::new(provider));
-            record.fingerprint = Some(SmolStr::new(fingerprint));
+            record.provider = Some(admission.provider.clone());
+            record.admission = Some(admission.clone());
         });
         Ok(())
     }
 
-    async fn live(&self, lease: SandboxLeaseId, resource_id: &str) -> Result<(), LedgerError> {
+    async fn live(
+        &self,
+        lease: SandboxLeaseId,
+        reference: &SandboxReference,
+    ) -> Result<(), LedgerError> {
         self.update(lease, |record| {
             record.state = LeaseState::Live;
             record.pending = None;
-            record.resource_id = Some(SmolStr::new(resource_id));
+            record.provider = Some(reference.provider.clone());
+            record.resource_id = Some(reference.id.clone());
+            record.reference = Some(reference.clone());
         });
         Ok(())
     }
@@ -237,17 +283,16 @@ impl ReconcileReport {
     }
 }
 
-/// The live handle a lease currently has.
-pub(crate) struct LiveSandbox {
-    pub(crate) sandbox:    Arc<dyn Sandbox>,
-    pub(crate) generation: u64,
-}
+/// A lease recorded before the shared sandbox API on the Host plugin. The
+/// built-in Host cannot reach another process's sandboxes; the workspace
+/// it left is a directory under the run dir.
+const LEGACY_HOST: &str = "host";
 
 /// Per-lease state, serialized by one lock so allocation and recovery for
 /// one lease never race.
 #[derive(Default)]
 struct LeaseSlot {
-    live:    Option<LiveSandbox>,
+    live:    Option<Arc<dyn Sandbox>>,
     holders: usize,
 }
 
@@ -260,9 +305,29 @@ pub(crate) struct LeaseRequest<'a> {
     pub standalone:   bool,
 }
 
-/// One live handle and a holder count per lease, over one provider source.
+/// A sandbox ready to be created: the environment its template came from,
+/// the entry that environment names, and the builder with the resolved
+/// spec.
+pub(crate) struct Prepared {
+    pub(crate) environment: String,
+    pub(crate) provider:    ProviderName,
+    pub(crate) builder:     SandboxBuilder,
+    /// Run credentials registered for this create, dropped once it settles.
+    pub(crate) credentials: Vec<String>,
+}
+
+/// Where a lease's sandbox is on its provider.
+enum Located {
+    Attached(Arc<dyn Sandbox>),
+    /// Not on the provider: never created, deleted, or, on a provider whose
+    /// sandboxes last as long as their owner process, gone with it.
+    Gone,
+}
+
+/// One live handle and a holder count per lease, over the run's catalog.
 pub struct SandboxLeaseManager {
-    source:       Arc<dyn ProviderSource>,
+    sandboxes:    Sandboxes,
+    credentials:  Arc<Credentials>,
     ledger:       Arc<dyn LeaseLedger>,
     identity:     Arc<RunIdentity>,
     lost_sandbox: LostSandbox,
@@ -271,13 +336,15 @@ pub struct SandboxLeaseManager {
 }
 
 impl SandboxLeaseManager {
-    pub fn new(
-        source: Arc<dyn ProviderSource>,
+    pub(crate) fn new(
+        sandboxes: Sandboxes,
+        credentials: Arc<Credentials>,
         ledger: Arc<dyn LeaseLedger>,
         identity: Arc<RunIdentity>,
     ) -> Self {
         Self {
-            source,
+            sandboxes,
+            credentials,
             ledger,
             identity,
             lost_sandbox: LostSandbox::Refuse,
@@ -294,8 +361,8 @@ impl SandboxLeaseManager {
         self
     }
 
-    pub fn source(&self) -> &Arc<dyn ProviderSource> {
-        &self.source
+    pub fn sandboxes(&self) -> &Sandboxes {
+        &self.sandboxes
     }
 
     fn slot(&self, lease: SandboxLeaseId) -> Arc<AsyncMutex<LeaseSlot>> {
@@ -318,186 +385,106 @@ impl SandboxLeaseManager {
 
     /// The sandbox for `request.lease`, allocating, attaching, or reusing
     /// as the lease's state requires, and counting the caller as a holder.
-    /// `build_spec` produces the create spec, given the labels every Petri
+    /// `prepare` resolves the create spec, given the labels every Petri
     /// sandbox carries.
     pub(crate) async fn acquire<Fut>(
         self: &Arc<Self>,
         request: LeaseRequest<'_>,
-        build_spec: impl FnOnce(Vec<(String, String)>, Arc<dyn sandbox_driver::SandboxProvider>) -> Fut
-        + Send,
+        prepare: impl FnOnce(Vec<(String, String)>) -> Fut + Send,
     ) -> Result<AcquiredSandbox, EnvError>
     where
-        Fut: Future<Output = Result<SandboxSpec, EnvError>> + Send,
+        Fut: Future<Output = Result<Prepared, EnvError>> + Send,
     {
         // An owned guard: a create hands it to its task, so an acquire that
         // is dropped mid-create still keeps the lease locked until the
         // create has settled one way or the other.
         let mut slot = self.slot(request.lease).lock_owned().await;
-        let (provider, generation) = self.source.current().await?;
         if let Some(live) = &slot.live {
-            if live.generation == generation {
-                let sandbox = Arc::clone(&live.sandbox);
-                slot.holders += 1;
-                return Ok(self.acquired(&request, sandbox));
-            }
-            // A new plugin generation: every old handle is dead, and the
-            // sandbox is fenced below before anyone resumes on it.
-            tracing::warn!(
-                lease = request.lease.raw(),
-                old_generation = live.generation,
-                generation,
-                "sandbox plugin generation changed; fencing the lease's sandbox"
-            );
-            slot.live = None;
+            let sandbox = Arc::clone(live);
+            slot.holders += 1;
+            return Ok(self.acquired(&request, sandbox));
         }
-
+        let lease = request.lease;
         let record = self
             .ledger
-            .lookup(request.lease)
+            .lookup(lease)
             .await
             .map_err(|error| Self::ledger_failed(&error))?;
-        let run_id = self.identity.run_id();
-        let workspace_label = self.identity.workspace_label(request.workspace_id);
-        let labels = self.identity.labels(request.lease, request.workspace_id);
-
-        let sandbox = match record {
-            Some(LeaseRecord {
-                state: LeaseState::Deleted,
-                ..
-            }) => {
-                return Err(EnvError::backend(
-                    BACKEND,
-                    "acquire",
-                    format!(
-                        "sandbox lease {} was deleted; its workspace is gone",
-                        request.lease
-                    ),
-                ));
-            }
-            Some(record) => {
-                self.check_fingerprint(request.lease, &record)?;
-                let matches = list_by_label(&*provider, &workspace_label).await?;
-                match matches.len() {
-                    0 if record.pending == Some(PendingIntent::Delete) => {
-                        // Delete completed before its confirmation was durable.
-                        // The missing resource is the requested result, so
-                        // finish the tombstone rather than report a lost lease.
-                        self.ledger
-                            .deleted(request.lease)
-                            .await
-                            .map_err(|error| Self::ledger_failed(&error))?;
-                        return Err(EnvError::backend(
-                            BACKEND,
-                            "acquire",
-                            format!(
-                                "sandbox lease {} was deleted; its workspace is gone",
-                                request.lease
-                            ),
-                        ));
+        let labels = self.identity.labels(lease, request.workspace_id);
+        let Some(record) = record.filter(attempted) else {
+            // Nothing was ever asked of a provider. A create a crash left
+            // unrecorded comes back as `AlreadyExists` and is adopted.
+            let prepared = match prepare(labels).await {
+                Ok(prepared) => prepared,
+                Err(error) => {
+                    // A refused scope still owes its lease a release, which
+                    // finds nothing on any provider and writes the
+                    // tombstone: the run records `scope.released` for every
+                    // lease it reserved.
+                    if let Err(ledger) = self.ledger.pending(lease, PendingIntent::Delete).await {
+                        tracing::warn!(lease = lease.raw(), error = %ledger, "the refused lease's release was not recorded");
                     }
-                    0 if record.state == LeaseState::Allocating => {
-                        // The record was reserved but no resource exists:
-                        // the create never happened or never completed.
-                        return self
-                            .create(&provider, &request, &labels, build_spec, slot, generation)
-                            .await;
-                    }
-                    0 if self.lost_sandbox == LostSandbox::Replace => {
-                        // The workspace went with the sandbox; the host
-                        // asked for a fresh one and restores it itself.
-                        tracing::warn!(
-                            lease = request.lease.raw(),
-                            state = ?record.state,
-                            "the lease's recorded sandbox is gone from the provider; creating a \
-                             fresh one with an empty workspace"
-                        );
-                        return self
-                            .create(&provider, &request, &labels, build_spec, slot, generation)
-                            .await;
-                    }
-                    0 => {
-                        return Err(EnvError::backend(
-                            BACKEND,
-                            "acquire",
-                            format!(
-                                "sandbox lease {} is recorded {:?} but no sandbox carries \
-                                 {WORKSPACE_LABEL}={workspace_label} on the provider; its \
-                                 workspace was lost and Petri will not replace it silently",
-                                request.lease, record.state
-                            ),
-                        ));
-                    }
-                    1 => {
-                        let found = &matches[0];
-                        if let Some(recorded) = &record.resource_id
-                            && recorded.as_str() != found.as_str()
-                        {
-                            return Err(EnvError::backend(
-                                BACKEND,
-                                "acquire",
-                                format!(
-                                    "sandbox lease {} records resource {recorded} but the \
-                                     provider holds {found} for its workspace",
-                                    request.lease
-                                ),
-                            ));
-                        }
-                        self.recover(&*provider, request.lease, found, record.pending)
-                            .await?
-                    }
-                    count => {
-                        return Err(EnvError::backend(
-                            BACKEND,
-                            "acquire",
-                            format!(
-                                "{count} sandboxes carry {WORKSPACE_LABEL}={workspace_label}; \
-                                 Petri does not choose one arbitrarily"
-                            ),
-                        ));
-                    }
+                    return Err(error);
                 }
-            }
-            None => {
-                // Nothing recorded: reconcile by label anyway, so a create
-                // that a crash left unrecorded is found, not duplicated.
-                let matches = list_by_label(&*provider, &workspace_label).await?;
-                match matches.len() {
-                    0 => {
-                        return self
-                            .create(&provider, &request, &labels, build_spec, slot, generation)
-                            .await;
-                    }
-                    1 => {
-                        self.ledger
-                            .allocating(
-                                request.lease,
-                                self.source.kind(),
-                                self.source.fingerprint(),
-                            )
-                            .await
-                            .map_err(|error| Self::ledger_failed(&error))?;
-                        self.recover(&*provider, request.lease, &matches[0], None)
-                            .await?
-                    }
-                    count => {
-                        return Err(EnvError::backend(
-                            BACKEND,
-                            "acquire",
-                            format!(
-                                "{count} sandboxes carry {WORKSPACE_LABEL}={workspace_label} \
-                                 (run {run_id}); Petri does not choose one arbitrarily"
-                            ),
-                        ));
-                    }
+            };
+            return self.create(&request, prepared, slot).await;
+        };
+        if record.state == LeaseState::Deleted {
+            return Err(deleted_lease(lease));
+        }
+        let sandbox = match self.locate(&record, lease).await? {
+            Located::Attached(sandbox) => self.recover(lease, &record, sandbox).await?,
+            Located::Gone => {
+                if record.pending == Some(PendingIntent::Delete) {
+                    // Delete completed before its confirmation was durable.
+                    self.finish_delete(lease, &record).await?;
+                    return Err(deleted_lease(lease));
                 }
+                let process = self.process_durable(&record).await?;
+                // The admitted spec, never the catalog's current template:
+                // a process-durable sandbox comes back over the same
+                // workspace, and a lost create is retried as admitted.
+                let prepared = match &record.admission {
+                    Some(admission) => self.readmit(admission).await?,
+                    None => prepare(labels).await?,
+                };
+                let workspace_lost = if process {
+                    match self.designated(prepared.builder.resolved_spec()) {
+                        Some(directory) => !fs::try_exists(&directory).await.map_err(|error| {
+                            EnvError::workspace("inspect", directory.display(), error)
+                        })?,
+                        None => false,
+                    }
+                } else {
+                    true
+                };
+                if record.state != LeaseState::Allocating
+                    && workspace_lost
+                    && self.lost_sandbox == LostSandbox::Refuse
+                {
+                    return Err(EnvError::backend(
+                        BACKEND,
+                        "acquire",
+                        format!(
+                            "sandbox lease {lease} is recorded {:?} but its sandbox is not on the \
+                             provider; its workspace was lost and Petri will not replace it \
+                             silently",
+                            record.state
+                        ),
+                    ));
+                }
+                if record.state != LeaseState::Allocating && workspace_lost {
+                    tracing::warn!(
+                        lease = lease.raw(),
+                        state = ?record.state,
+                        "the lease's recorded sandbox is gone from the provider; creating a \
+                         fresh one with an empty workspace"
+                    );
+                }
+                return self.create(&request, prepared, slot).await;
             }
         };
-        slot.live = Some(LiveSandbox {
-            sandbox: Arc::clone(&sandbox),
-            generation,
-        });
-        // Older generations can still have holders finishing or abandoning
-        // initialization. Their later release must not consume this holder.
+        slot.live = Some(Arc::clone(&sandbox));
         slot.holders += 1;
         Ok(self.acquired(&request, sandbox))
     }
@@ -515,63 +502,132 @@ impl SandboxLeaseManager {
         }
     }
 
-    fn check_fingerprint(
-        &self,
-        lease: SandboxLeaseId,
-        record: &LeaseRecord,
-    ) -> Result<(), EnvError> {
-        if let Some(recorded) = &record.fingerprint {
-            let current = self.source.fingerprint();
-            if recorded.as_str() != current {
-                return Err(EnvError::backend(
+    /// The prepared create of an admitted spec, on the entry it was
+    /// admitted to. An environment that now names another entry is
+    /// refused: the lease's sandbox lives where it was admitted.
+    async fn readmit(&self, admission: &SandboxAdmission) -> Result<Prepared, EnvError> {
+        let spec: SandboxSpec =
+            serde_json::from_value(admission.spec.clone()).map_err(|error| {
+                EnvError::backend(
                     BACKEND,
                     "acquire",
-                    format!(
-                        "sandbox lease {lease} was allocated on `{recorded}` but this run is \
-                         configured for `{current}`; a changed DOCKER_HOST, Daytona \
-                         organization or target must be restored before the run continues"
-                    ),
-                ));
-            }
+                    format!("the lease's admitted spec could not be read: {error}"),
+                )
+            })?;
+        let environment = self
+            .sandboxes
+            .environment(&admission.environment)
+            .await
+            .map_err(|error| acquire_failed(&error))?;
+        if environment.provider.as_str() != admission.provider {
+            return Err(EnvError::backend(
+                BACKEND,
+                "acquire",
+                format!(
+                    "environment `{}` now names provider entry `{}`, but the lease was admitted \
+                     to `{}`; restore the environment before the run continues",
+                    admission.environment, environment.provider, admission.provider
+                ),
+            ));
         }
-        Ok(())
+        let builder = self
+            .sandboxes
+            .builder(&admission.environment)
+            .await
+            .map_err(|error| acquire_failed(&error))?
+            .spec(spec);
+        Ok(Prepared {
+            environment: admission.environment.to_string(),
+            provider: environment.provider,
+            builder,
+            credentials: Vec::new(),
+        })
     }
 
-    /// Creates the sandbox, recording `allocating` first and `live` after,
-    /// so a crash on either side of the create is reconciled by label.
+    /// Creates the sandbox, recording the admission first and the reference
+    /// after, so a crash on either side of the create is reconciled.
     ///
     /// The create runs in its own task, which owns the lease's lock: an
     /// acquire nobody waited out (a cancelled scope, a sweep aborting the
-    /// run) drops this future, and the provider's create — already sent —
+    /// run) drops this future, and the provider's create, already sent,
     /// still completes, with the lease locked until it has. The task
     /// returns an acquisition guard. Dropping either the task's unread
     /// result or later environment initialization releases that holder.
-    async fn create<Fut>(
+    async fn create(
         self: &Arc<Self>,
-        provider: &Arc<dyn sandbox_driver::SandboxProvider>,
         request: &LeaseRequest<'_>,
-        labels: &[(String, String)],
-        build_spec: impl FnOnce(Vec<(String, String)>, Arc<dyn sandbox_driver::SandboxProvider>) -> Fut
-        + Send,
+        prepared: Prepared,
         mut slot: OwnedMutexGuard<LeaseSlot>,
-        generation: u64,
-    ) -> Result<AcquiredSandbox, EnvError>
-    where
-        Fut: Future<Output = Result<SandboxSpec, EnvError>> + Send,
-    {
+    ) -> Result<AcquiredSandbox, EnvError> {
         let lease = request.lease;
         let standalone = request.standalone;
+        let Prepared {
+            environment,
+            provider,
+            builder,
+            credentials,
+        } = prepared;
+        let spec = builder.resolved_spec().clone();
+        let namespace = self.describe(provider.as_str()).await?.namespace.id;
+        let admission = SandboxAdmission {
+            provider:    SmolStr::new(provider.as_str()),
+            namespace:   SmolStr::new(namespace.as_str()),
+            environment: SmolStr::new(&environment),
+            spec:        serde_json::to_value(&spec).map_err(|error| {
+                EnvError::backend(BACKEND, "acquire", format!("encoding the spec: {error}"))
+            })?,
+        };
+        if let Some(directory) = self.designated(&spec) {
+            fs::create_dir_all(&directory)
+                .await
+                .map_err(|error| EnvError::workspace("create", directory.display(), error))?;
+        }
         self.ledger
-            .allocating(lease, self.source.kind(), self.source.fingerprint())
+            .allocating(lease, &admission)
             .await
             .map_err(|error| Self::ledger_failed(&error))?;
-        let spec = build_spec(labels.to_vec(), provider.clone()).await?;
-        let provider = provider.clone();
         let manager = self.clone();
         let created = tokio::spawn(async move {
-            let sandbox = match provider.create(&spec, None).await {
+            let created = builder.create().await;
+            manager.credentials.remove(&credentials);
+            // A create a crash left unrecorded under the same name: the
+            // lease's own sandbox, adopted and fenced like a recovery.
+            let adopted = match created {
+                Ok(sandbox) => Ok(Arc::from(sandbox)),
+                Err(DriverError::AlreadyExists { id, .. }) => Err(Ok(SandboxRef {
+                    provider,
+                    namespace,
+                    id: SandboxId::try_new(id).map_err(|error| {
+                        EnvError::backend(BACKEND, "acquire", error.to_string())
+                    })?,
+                })),
+                // Providers must report AlreadyExists with the holder's id
+                // for adoption; an invalid spec is not evidence of ownership.
+                Err(error) => Err(Err(error)),
+            };
+            let sandbox: Arc<dyn Sandbox> = match adopted {
                 Ok(sandbox) => sandbox,
-                Err(error) => {
+                Err(Ok(reference)) => {
+                    tracing::info!(lease = lease.raw(), sandbox = %reference.id, "adopting an unrecorded create");
+                    let record = manager.record(lease).await?;
+                    match manager.attach(&reference, false).await? {
+                        Located::Attached(sandbox) => {
+                            manager.recover(lease, &record, sandbox).await?
+                        }
+                        Located::Gone => {
+                            return Err(EnvError::backend(
+                                BACKEND,
+                                "acquire",
+                                format!(
+                                    "the provider reported sandbox {} under this lease's name but \
+                                     it could not be attached",
+                                    reference.id
+                                ),
+                            ));
+                        }
+                    }
+                }
+                Err(Err(error)) => {
                     if standalone {
                         let report = manager
                             .release_locked(lease, Retention::Never, ScopeOutcome::Failed, slot)
@@ -593,14 +649,11 @@ impl SandboxLeaseManager {
                 standalone,
                 sandbox: Some(sandbox.clone()),
             };
-            slot.live = Some(LiveSandbox {
-                sandbox: sandbox.clone(),
-                generation,
-            });
+            slot.live = Some(sandbox.clone());
             slot.holders += 1;
             manager
                 .ledger
-                .live(lease, sandbox.id().as_str())
+                .live(lease, &to_reference(&sandbox.reference()))
                 .await
                 .map_err(|error| Self::ledger_failed(&error))?;
             drop(slot);
@@ -615,35 +668,222 @@ impl SandboxLeaseManager {
         })?
     }
 
-    /// Attaches a recorded sandbox and fences it: one stop, then one start.
-    async fn recover(
+    async fn record(&self, lease: SandboxLeaseId) -> Result<LeaseRecord, EnvError> {
+        self.ledger
+            .lookup(lease)
+            .await
+            .map_err(|error| Self::ledger_failed(&error))?
+            .ok_or_else(|| {
+                EnvError::backend(BACKEND, "acquire", format!("lease {lease} has no record"))
+            })
+    }
+
+    async fn describe(&self, entry: &str) -> Result<Descriptor, EnvError> {
+        self.sandboxes
+            .provider(entry)
+            .map_err(|error| acquire_failed(&error))?
+            .describe()
+            .await
+            .map_err(|error| acquire_failed(&error))
+    }
+
+    /// Whether the lease's sandbox lasts only as long as its owner process,
+    /// so that a missing one is expected after a restart.
+    async fn process_durable(&self, record: &LeaseRecord) -> Result<bool, EnvError> {
+        match &record.admission {
+            Some(admission) => {
+                Ok(self.describe(&admission.provider).await?.durability == Durability::Process)
+            }
+            None => Ok(record.provider.as_deref() == Some(LEGACY_HOST)),
+        }
+    }
+
+    /// Finds the lease's sandbox. A lease admitted through the shared API
+    /// is looked for only on its entry, after that entry's namespace is
+    /// checked against the admitted one; an older lease is found by the
+    /// run's label and its recorded id.
+    async fn locate(
         &self,
-        provider: &dyn sandbox_driver::SandboxProvider,
+        record: &LeaseRecord,
         lease: SandboxLeaseId,
-        id: &SandboxId,
-        pending: Option<PendingIntent>,
-    ) -> Result<Arc<dyn Sandbox>, EnvError> {
-        let sandbox = provider
-            .attach(id, None)
+    ) -> Result<Located, EnvError> {
+        let Some(admission) = &record.admission else {
+            return self.locate_legacy(record, lease).await;
+        };
+        let descriptor = self.check_namespace(admission).await?;
+        let process = descriptor.durability == Durability::Process;
+        let reference = if let Some(reference) = &record.reference {
+            sandbox_ref(reference)?
+        } else {
+            let entry = entry_name(&admission.provider)?;
+            let found = self.find_on(&entry, self.lease_filter(lease)).await?;
+            match found.as_slice() {
+                [] => return Ok(Located::Gone),
+                [one] => one.clone(),
+                many => {
+                    return Err(EnvError::backend(
+                        BACKEND,
+                        "acquire",
+                        format!(
+                            "{} sandboxes belong to lease {lease}; Petri does not choose one \
+                             arbitrarily",
+                            many.len()
+                        ),
+                    ));
+                }
+            }
+        };
+        self.attach(&reference, process).await
+    }
+
+    /// The run-label lookup of a lease recorded before the shared sandbox
+    /// API: exactly one sandbox under `petri.run` with the recorded id.
+    async fn locate_legacy(
+        &self,
+        record: &LeaseRecord,
+        lease: SandboxLeaseId,
+    ) -> Result<Located, EnvError> {
+        if record.provider.as_deref() == Some(LEGACY_HOST) {
+            return Ok(Located::Gone);
+        }
+        let found = self
+            .sandboxes
+            .find(LabelFilter::eq(RUN_LABEL, self.identity.run_id()))
             .await
             .map_err(|error| acquire_failed(&error))?;
-        if pending == Some(PendingIntent::Delete) {
+        let lease_value = lease.raw().to_string();
+        let matches: Vec<_> = found
+            .sandboxes
+            .iter()
+            .filter(|summary| match &record.resource_id {
+                Some(id) => summary.reference.id.as_str() == id.as_str(),
+                None => summary.labels.get(LEASE_LABEL) == Some(&lease_value),
+            })
+            .collect();
+        let unsearched: Vec<String> = found
+            .failures
+            .iter()
+            .map(|failure| format!("{}: {}", failure.entry, failure.error))
+            .collect();
+        match matches.as_slice() {
+            [one] => self.attach(&one.reference, false).await,
+            [] if record.resource_id.is_none() && unsearched.is_empty() => Ok(Located::Gone),
+            [] => Err(EnvError::backend(
+                BACKEND,
+                "acquire",
+                format!(
+                    "sandbox {} of lease {lease} (recorded on {} before the shared sandbox API) \
+                     was not found under {RUN_LABEL}={} on any provider entry{}; it is gone, or \
+                     its provider does not list sandboxes the legacy API created",
+                    record.resource_id.as_deref().unwrap_or("<unrecorded>"),
+                    record.provider.as_deref().unwrap_or("an unknown provider"),
+                    self.identity.run_id(),
+                    if unsearched.is_empty() {
+                        String::new()
+                    } else {
+                        format!(" (not searched: {})", unsearched.join("; "))
+                    }
+                ),
+            )),
+            many => Err(EnvError::backend(
+                BACKEND,
+                "acquire",
+                format!(
+                    "{} sandboxes match lease {lease} under {RUN_LABEL}; Petri does not choose \
+                     one arbitrarily",
+                    many.len()
+                ),
+            )),
+        }
+    }
+
+    async fn attach(&self, reference: &SandboxRef, process: bool) -> Result<Located, EnvError> {
+        match self.sandboxes.attach(reference).await {
+            Ok(sandbox) => Ok(Located::Attached(Arc::from(sandbox))),
+            Err(DriverError::NotFound { .. }) => Ok(Located::Gone),
+            // A process-durable sandbox is its owner's; another process's
+            // is gone with that process.
+            Err(DriverError::Unavailable { .. }) if process => Ok(Located::Gone),
+            Err(error) => Err(acquire_failed(&error)),
+        }
+    }
+
+    /// The entry's current descriptor, refusing a namespace other than the
+    /// admitted one: the entry now reaches a different backend.
+    async fn check_namespace(&self, admission: &SandboxAdmission) -> Result<Descriptor, EnvError> {
+        let descriptor = self.describe(&admission.provider).await?;
+        if descriptor.namespace.id.as_str() != admission.namespace {
+            return Err(EnvError::backend(
+                BACKEND,
+                "acquire",
+                format!(
+                    "provider entry `{}` now reaches namespace `{}`, but the lease was admitted \
+                     on `{}`; a changed DOCKER_HOST, Daytona organization or entry must be \
+                     restored before the run continues",
+                    admission.provider, descriptor.namespace.id, admission.namespace
+                ),
+            ));
+        }
+        Ok(descriptor)
+    }
+
+    fn lease_filter(&self, lease: SandboxLeaseId) -> LabelFilter {
+        let mut filter = LabelFilter::eq(RUN_LABEL, self.identity.run_id());
+        filter
+            .0
+            .insert(LEASE_LABEL.to_owned(), lease.raw().to_string());
+        filter
+    }
+
+    /// The matches on one entry. A failure to search that entry is an
+    /// error: it cannot vouch that nothing is there.
+    async fn find_on(
+        &self,
+        entry: &ProviderName,
+        filter: LabelFilter,
+    ) -> Result<Vec<SandboxRef>, EnvError> {
+        let found = self
+            .sandboxes
+            .find(filter)
+            .await
+            .map_err(|error| acquire_failed(&error))?;
+        if let Some(failure) = found
+            .failures
+            .iter()
+            .find(|failure| failure.entry == *entry)
+        {
+            return Err(acquire_failed(&failure.error));
+        }
+        Ok(found
+            .sandboxes
+            .into_iter()
+            .filter(|summary| summary.reference.provider == *entry)
+            .map(|summary| summary.reference)
+            .collect())
+    }
+
+    /// Fences an attached sandbox: one stop, then one start.
+    async fn recover(
+        &self,
+        lease: SandboxLeaseId,
+        record: &LeaseRecord,
+        sandbox: Arc<dyn Sandbox>,
+    ) -> Result<Arc<dyn Sandbox>, EnvError> {
+        let reference = sandbox.reference();
+        if record.pending == Some(PendingIntent::Delete) {
             // The invocation meant to delete it and died before the
             // provider confirmed; finish that, and the lease is gone.
-            delete_sandbox(provider, id)
+            self.destroy(&reference)
                 .await
                 .map_err(|error| acquire_failed(&error))?;
-            self.ledger
-                .deleted(lease)
-                .await
-                .map_err(|error| Self::ledger_failed(&error))?;
+            self.finish_delete(lease, record).await?;
             return Err(EnvError::backend(
                 BACKEND,
                 "acquire",
                 format!("sandbox lease {lease} was being deleted; its workspace is gone"),
             ));
         }
-        tracing::info!(lease = lease.raw(), sandbox = %id, "fencing a recorded sandbox");
+        tracing::info!(lease = lease.raw(), sandbox = %reference.id, "fencing a recorded sandbox");
         self.ledger
             .pending(lease, PendingIntent::Stop)
             .await
@@ -657,10 +897,59 @@ impl SandboxLeaseManager {
             .await
             .map_err(|error| acquire_failed(&error))?;
         self.ledger
-            .live(lease, id.as_str())
+            .live(lease, &to_reference(&reference))
             .await
             .map_err(|error| Self::ledger_failed(&error))?;
         Ok(sandbox)
+    }
+
+    /// Deletion is complete when the resource is already absent.
+    async fn destroy(&self, reference: &SandboxRef) -> Result<(), DriverError> {
+        match self.sandboxes.destroy(reference).await {
+            Ok(()) | Err(DriverError::NotFound { .. }) => Ok(()),
+            Err(error) => Err(error),
+        }
+    }
+
+    /// The designated host directory an admitted spec names, when it is
+    /// this run's: Petri chose it, so Petri makes it and removes it.
+    fn designated(&self, spec: &SandboxSpec) -> Option<PathBuf> {
+        if spec.source != Source::HostDirectory
+            || spec.workspace_ownership != Some(sandbox_driver::WorkspaceOwnership::Designated)
+        {
+            return None;
+        }
+        let directory = PathBuf::from(spec.working_directory.as_ref()?);
+        directory
+            .starts_with(self.identity.run_dir())
+            .then_some(directory)
+    }
+
+    /// Removes the run's designated workspace a deleted lease named, then
+    /// writes the tombstone. Returns whether a workspace was there.
+    async fn finish_delete(
+        &self,
+        lease: SandboxLeaseId,
+        record: &LeaseRecord,
+    ) -> Result<bool, EnvError> {
+        let spec = record.admission.as_ref().and_then(|admission| {
+            serde_json::from_value::<SandboxSpec>(admission.spec.clone()).ok()
+        });
+        let mut removed = false;
+        if let Some(directory) = spec.as_ref().and_then(|spec| self.designated(spec)) {
+            match fs::remove_dir_all(&directory).await {
+                Ok(()) => removed = true,
+                Err(error) if error.kind() == ErrorKind::NotFound => {}
+                Err(error) => {
+                    return Err(EnvError::workspace("remove", directory.display(), error));
+                }
+            }
+        }
+        self.ledger
+            .deleted(lease)
+            .await
+            .map_err(|error| Self::ledger_failed(&error))?;
+        Ok(removed)
     }
 
     /// Drops one holder. Never stops the sandbox: that is the lease
@@ -704,7 +993,7 @@ impl SandboxLeaseManager {
     pub async fn live(&self, lease: SandboxLeaseId) -> Option<Arc<dyn Sandbox>> {
         let slot = self.slot(lease);
         let slot = slot.lock().await;
-        slot.live.as_ref().map(|live| Arc::clone(&live.sandbox))
+        slot.live.clone()
     }
 
     /// Ends the lease: stops the sandbox, then keeps it stopped or deletes
@@ -731,53 +1020,43 @@ impl SandboxLeaseManager {
         let live = slot.live.take();
         slot.holders = 0;
         let record = match self.ledger.lookup(lease).await {
-            Ok(record) => record,
+            Ok(Some(record)) if record.state != LeaseState::Deleted => record,
+            Ok(_) => return report,
             Err(error) => return report.problem(error.to_string()),
         };
-        let Some(record) = record else {
-            return report;
-        };
-        if record.state == LeaseState::Deleted {
-            return report;
-        }
-        let resource_id = record.resource_id.clone().or_else(|| {
-            live.as_ref()
-                .map(|live| SmolStr::new(live.sandbox.id().as_str()))
-        });
-        if resource_id.is_none() && record.fingerprint.is_none() {
+        if live.is_none() && !attempted(&record) {
             // No allocation was attempted, so no provider cleanup is needed.
+            // A refused lease, marked for delete, ends as a tombstone.
+            if record.pending == Some(PendingIntent::Delete)
+                && let Err(error) = self.finish_delete(lease, &record).await
+            {
+                return report.problem(error.to_string());
+            }
             return report;
         }
-        let (provider, generation) = match self.source.current().await {
-            Ok(current) => current,
-            Err(error) => return report.problem(format!("sandbox provider unavailable: {error}")),
-        };
-        if let Err(error) = self.check_fingerprint(lease, &record) {
-            return report.problem(error.to_string());
-        }
-        let id = match resource_id {
-            Some(resource_id) => match SandboxId::try_new(resource_id.as_str()) {
-                Ok(id) => id,
-                Err(error) => return report.problem(error.to_string()),
-            },
-            None => match self.find_allocated(&*provider, lease).await {
-                // The create reached the provider but never its record: name
-                // the sandbox first, as reconciliation adopts one, so a kept
-                // lease names what it keeps.
-                Ok(Some(id)) => match self.ledger.live(lease, id.as_str()).await {
-                    Ok(()) => id,
-                    Err(error) => return report.problem(error.to_string()),
-                },
-                Ok(None) => {
-                    return match self.ledger.deleted(lease).await {
-                        Ok(()) => report,
-                        Err(error) => report.problem(error.to_string()),
-                    };
-                }
-                Err(error) => return report.problem(error.to_string()),
-            },
-        };
         let keep = record.pending != Some(PendingIntent::Delete) && retention.keeps(outcome);
+        let located = match live {
+            Some(sandbox) => Located::Attached(sandbox),
+            None => match self.locate(&record, lease).await {
+                Ok(located) => located,
+                Err(error) => return report.problem(error.to_string()),
+            },
+        };
+        let sandbox = match located {
+            Located::Attached(sandbox) => sandbox,
+            Located::Gone => return self.release_gone(lease, &record, keep, report).await,
+        };
+        let reference = sandbox.reference();
+        if reference.provider.as_str() != record.provider.as_deref().unwrap_or_default()
+            || record.reference.is_none()
+        {
+            // A create that reached the provider but never its record:
+            // name the sandbox first, so a kept lease names what it keeps.
+            if let Err(error) = self.ledger.live(lease, &to_reference(&reference)).await {
+                return report.problem(error.to_string());
+            }
+        }
+        let id = &reference.id;
         let intent = if keep {
             PendingIntent::Stop
         } else {
@@ -787,14 +1066,7 @@ impl SandboxLeaseManager {
             return report.problem(error.to_string());
         }
         if keep {
-            let outcome = match live {
-                Some(live) if live.generation == generation => live.sandbox.stop().await,
-                _ => match provider.attach(&id, None).await {
-                    Ok(sandbox) => sandbox.stop().await,
-                    Err(error) => Err(error),
-                },
-            };
-            match outcome {
+            match sandbox.stop().await {
                 Ok(()) => {
                     if let Err(error) = self.ledger.stopped(lease).await {
                         return report.problem(error.to_string());
@@ -813,60 +1085,54 @@ impl SandboxLeaseManager {
                 Err(error) => report.problem(format!("sandbox {id} stop failed: {error}")),
             }
         } else {
-            match delete_sandbox(&*provider, &id).await {
-                Ok(()) => {
-                    if let Err(error) = self.ledger.deleted(lease).await {
-                        return report.problem(error.to_string());
-                    }
-                    report.released(format!("sandbox {id} (lease {lease})"))
-                }
+            match self.destroy(&reference).await {
+                Ok(()) => match self.finish_delete(lease, &record).await {
+                    Ok(_) => report.released(format!("sandbox {id} (lease {lease})")),
+                    Err(error) => report.problem(error.to_string()),
+                },
                 Err(error) => report.problem(format!("sandbox {id} delete failed: {error}")),
             }
         }
     }
 
-    /// A create may have reached the provider without returning an id.
-    async fn find_allocated(
+    /// The release of a lease whose sandbox is not on its provider.
+    async fn release_gone(
         &self,
-        provider: &dyn SandboxProvider,
         lease: SandboxLeaseId,
-    ) -> Result<Option<SandboxId>, EnvError> {
-        let mut filter = SandboxFilter::default();
-        filter
-            .labels
-            .insert(RUN_LABEL.to_owned(), self.identity.run_id().to_owned());
-        filter
-            .labels
-            .insert(LEASE_LABEL.to_owned(), lease.raw().to_string());
-        let mut matches = provider
-            .list(&filter)
-            .await
-            .map_err(|error| acquire_failed(&error))?;
-        match matches.len() {
-            0 => Ok(None),
-            1 => Ok(matches.pop().map(|status| status.id)),
-            count => Err(EnvError::backend(
-                BACKEND,
-                "release",
-                format!(
-                    "{count} sandboxes belong to lease {lease}; Petri does not choose one arbitrarily"
-                ),
+        record: &LeaseRecord,
+        keep: bool,
+        report: ReleaseReport,
+    ) -> ReleaseReport {
+        let process = match self.process_durable(record).await {
+            Ok(process) => process,
+            Err(error) => return report.problem(error.to_string()),
+        };
+        // A process-durable sandbox went with its owner; its workspace, a
+        // directory of the run's, is what retention keeps or removes.
+        if process && keep {
+            return match self.ledger.stopped(lease).await {
+                Ok(()) => report.kept(format!(
+                    "workspace of lease {lease} (its sandbox ended with its owner process)"
+                )),
+                Err(error) => report.problem(error.to_string()),
+            };
+        }
+        let lost = record.state != LeaseState::Allocating && !process && keep;
+        match self.finish_delete(lease, record).await {
+            Ok(_) if lost => report.problem(format!(
+                "the sandbox of lease {lease} was gone before it could be kept; the lease is \
+                 deleted"
             )),
+            Ok(_) => report,
+            Err(error) => report.problem(error.to_string()),
         }
     }
 
     /// Deletes a recorded sandbox without a live handle: the prune path.
-    /// The fingerprint must match, the intent is written first, and the
-    /// record becomes a tombstone only after the provider confirms. A
-    /// record that never learned its resource id — a crash between create
-    /// and the `live` write — is reconciled by the workspace label of
-    /// `workspace_id`, the same key recovery uses. The ids deleted come
-    /// back; an empty list means nothing was on the provider.
-    pub async fn delete_recorded(
-        &self,
-        lease: SandboxLeaseId,
-        workspace_id: &str,
-    ) -> Result<Vec<SandboxId>, EnvError> {
+    /// The namespace must match, the intent is written first, and the
+    /// record becomes a tombstone only after the provider confirms. The ids
+    /// deleted come back; an empty list means nothing was on the provider.
+    pub async fn delete_recorded(&self, lease: SandboxLeaseId) -> Result<Vec<SandboxId>, EnvError> {
         let slot = self.slot(lease);
         let mut slot = slot.lock().await;
         slot.live = None;
@@ -882,82 +1148,77 @@ impl SandboxLeaseManager {
         if record.state == LeaseState::Deleted {
             return Ok(Vec::new());
         }
-        let (provider, _) = self.source.current().await?;
-        self.check_fingerprint(lease, &record)?;
-        let ids = if let Some(resource_id) = record.resource_id {
-            vec![
-                SandboxId::try_new(resource_id.as_str())
-                    .map_err(|error| EnvError::backend(BACKEND, "prune", error.to_string()))?,
-            ]
+        let located = if attempted(&record) {
+            self.locate(&record, lease).await?
         } else {
-            let label = self.identity.workspace_label(workspace_id);
-            list_by_label(&*provider, &label).await?
+            Located::Gone
         };
         self.ledger
             .pending(lease, PendingIntent::Delete)
             .await
             .map_err(|error| Self::ledger_failed(&error))?;
-        for id in &ids {
-            delete_sandbox(&*provider, id)
-                .await
-                .map_err(|error| EnvError::backend(BACKEND, "prune", error.to_string()))?;
+        let ids = match located {
+            Located::Attached(sandbox) => {
+                let reference = sandbox.reference();
+                self.destroy(&reference)
+                    .await
+                    .map_err(|error| EnvError::backend(BACKEND, "prune", error.to_string()))?;
+                vec![reference.id]
+            }
+            Located::Gone => Vec::new(),
+        };
+        let removed = self.finish_delete(lease, &record).await?;
+        if ids.is_empty() && removed {
+            // A process-durable sandbox ends with its owner, but the run's
+            // designated workspace outlives it: removing that is the delete.
+            return Ok(record
+                .reference
+                .as_ref()
+                .map(|reference| reference.id.clone())
+                .or(record.resource_id.clone())
+                .and_then(|id| SandboxId::try_new(id).ok())
+                .into_iter()
+                .collect());
         }
-        self.ledger
-            .deleted(lease)
-            .await
-            .map_err(|error| Self::ledger_failed(&error))?;
         Ok(ids)
     }
 
-    /// Every recorded lease's fingerprint against the provider's, before
-    /// reconciliation changes anything. A lease with no fingerprint never
-    /// sent a create, so it has nothing on any provider and cannot
-    /// disagree. The problems are every mismatch found, and any record that
-    /// could not be read: an unread record cannot vouch for the namespace
-    /// either.
-    async fn verify_namespace(&self, leases: &[RecordedLease]) -> Result<(), Vec<String>> {
-        let mut problems = Vec::new();
+    /// Reconcile the run's leases with their providers before any create:
+    /// the takeover step of a `Write` open. First every admitted lease's
+    /// namespace is checked against its entry's: the run's records name
+    /// the namespace their resources live in, and an entry that now reports
+    /// another one is the wrong place to adopt or remove anything, so a
+    /// mismatch is reported and nothing below runs. Then each lease
+    /// recorded `allocating` with a create attempted has its lost create
+    /// adopted, when there is one (attached, fenced with one stop and one
+    /// start, recorded live). Then every sandbox under the run's label that
+    /// no record names is garbage (a stale owner's late create) and is
+    /// removed. Invariant afterwards: a resource under the run's labels is
+    /// named by a live or stopped record.
+    pub async fn reconcile(&self, leases: &[RecordedLease]) -> ReconcileReport {
+        let mut report = ReconcileReport::default();
+        // The entries the run's records name: only their inventory failures
+        // matter to the sweep. `find` searches every entry in the catalog,
+        // and one the run never used (Daytona with no credential, a Docker
+        // daemon a host-only run never reached) cannot hold its sandboxes.
+        let mut named = BTreeSet::new();
         for recorded in leases {
             match self.ledger.lookup(recorded.lease).await {
                 Ok(Some(record)) => {
-                    if let Err(error) = self.check_fingerprint(recorded.lease, &record) {
-                        problems.push(error.to_string());
+                    named.extend(record.provider.iter().map(ToString::to_string));
+                    named.extend(record.admission.iter().map(|a| a.provider.to_string()));
+                    named.extend(record.reference.iter().map(|r| r.provider.to_string()));
+                    if let Some(admission) = &record.admission
+                        && let Err(error) = self.check_namespace(admission).await
+                    {
+                        report.problems.push(error.to_string());
                     }
                 }
                 Ok(None) => {}
-                Err(error) => problems.push(error.to_string()),
+                Err(error) => report.problems.push(error.to_string()),
             }
         }
-        if problems.is_empty() {
-            Ok(())
-        } else {
-            Err(problems)
-        }
-    }
-
-    /// Reconcile the run's leases with the provider before any create: the
-    /// takeover step of a `Write` open. First every recorded lease's
-    /// fingerprint is checked against the provider's: the run's records
-    /// name the namespace its resources live in, and a provider that
-    /// reports another one is the wrong place to adopt or remove anything,
-    /// so a mismatch is reported and nothing below runs. Then, for each
-    /// lease recorded `allocating` with a create attempted (a fingerprint),
-    /// a resource under its workspace label is the lost create's: it is
-    /// adopted (attached, fenced with one stop and one start, recorded
-    /// live). Then every resource under the run's label that no record
-    /// names by resource id is garbage — a stale owner's late create, whose
-    /// `live` write was refused — and is removed. Invariant afterwards: a
-    /// resource under the run's labels is named by a live or stopped record.
-    pub async fn reconcile(&self, leases: &[RecordedLease]) -> ReconcileReport {
-        let mut report = ReconcileReport::default();
-        let (provider, generation) = match self.source.current().await {
-            Ok(current) => current,
-            Err(error) => {
-                return report.with_problem(format!("sandbox provider unavailable: {error}"));
-            }
-        };
-        if let Err(problems) = self.verify_namespace(leases).await {
-            report.problems = problems;
+        if !report.problems.is_empty() {
             return report;
         }
         for recorded in leases {
@@ -972,58 +1233,56 @@ impl SandboxLeaseManager {
                 }
             };
             if record.state != LeaseState::Allocating
-                || record.fingerprint.is_none()
+                || !attempted(&record)
                 || record.pending.is_some()
                 || slot.live.is_some()
             {
                 continue;
             }
-            let label = self.identity.workspace_label(&recorded.workspace_id);
-            let matches = match list_by_label(&*provider, &label).await {
-                Ok(matches) => matches,
-                Err(error) => {
-                    report.problems.push(error.to_string());
-                    continue;
-                }
-            };
-            match matches.as_slice() {
-                [] => {}
-                [found] => match self.recover(&*provider, recorded.lease, found, None).await {
-                    Ok(sandbox) => {
-                        slot.live = Some(LiveSandbox {
-                            sandbox,
-                            generation,
-                        });
-                        report.adopted.push((recorded.lease, found.clone()));
+            match self.locate(&record, recorded.lease).await {
+                Ok(Located::Attached(sandbox)) => {
+                    match self.recover(recorded.lease, &record, sandbox).await {
+                        Ok(sandbox) => {
+                            report
+                                .adopted
+                                .push((recorded.lease, sandbox.reference().id));
+                            slot.live = Some(sandbox);
+                        }
+                        Err(error) => report.problems.push(error.to_string()),
                     }
-                    Err(error) => report.problems.push(error.to_string()),
-                },
-                found => report.problems.push(format!(
-                    "{} sandboxes carry {WORKSPACE_LABEL}={label}; Petri does not choose one \
-                     arbitrarily",
-                    found.len()
-                )),
+                }
+                Ok(Located::Gone) => {}
+                Err(error) => report.problems.push(error.to_string()),
             }
         }
-        report.merge(self.sweep_unrecorded(&*provider).await);
+        report.merge(self.sweep_unrecorded(&named).await);
         report
     }
 
-    /// Remove every resource under the run's label that no record names by
-    /// resource id. Action hosts carry no lease label and are left to their
-    /// own sweep.
-    async fn sweep_unrecorded(&self, provider: &dyn SandboxProvider) -> ReconcileReport {
+    /// Remove every sandbox under the run's label that no record names.
+    /// Action hosts carry no lease label and are left to their own sweep.
+    async fn sweep_unrecorded(&self, named: &BTreeSet<String>) -> ReconcileReport {
         let mut report = ReconcileReport::default();
-        let mut filter = SandboxFilter::default();
-        filter
-            .labels
-            .insert(RUN_LABEL.to_owned(), self.identity.run_id().to_owned());
-        let statuses = match provider.list(&filter).await {
-            Ok(statuses) => statuses,
+        let found = match self
+            .sandboxes
+            .find(LabelFilter::eq(RUN_LABEL, self.identity.run_id()))
+            .await
+        {
+            Ok(found) => found,
             Err(error) => return report.with_problem(acquire_failed(&error).to_string()),
         };
-        for status in statuses {
-            let Some(lease) = status
+        for failure in found
+            .failures
+            .iter()
+            .filter(|failure| named.contains(failure.entry.as_str()))
+        {
+            report.problems.push(format!(
+                "provider entry `{}` could not be searched for the run's sandboxes: {}",
+                failure.entry, failure.error
+            ));
+        }
+        for summary in found.sandboxes {
+            let Some(lease) = summary
                 .labels
                 .get(LEASE_LABEL)
                 .and_then(|raw| raw.parse::<u64>().ok())
@@ -1031,10 +1290,15 @@ impl SandboxLeaseManager {
             else {
                 continue;
             };
+            let id = &summary.reference.id;
             let named = match self.ledger.lookup(lease).await {
                 Ok(record) => record.is_some_and(|record| {
                     record.state != LeaseState::Deleted
-                        && record.resource_id.as_deref() == Some(status.id.as_str())
+                        && (record.resource_id.as_deref() == Some(id.as_str())
+                            || record
+                                .reference
+                                .as_ref()
+                                .is_some_and(|reference| reference.id == id.as_str()))
                 }),
                 Err(error) => {
                     report.problems.push(error.to_string());
@@ -1044,16 +1308,12 @@ impl SandboxLeaseManager {
             if named {
                 continue;
             }
-            tracing::warn!(
-                lease = lease.raw(),
-                sandbox = %status.id,
-                "removing a sandbox no lease record names"
-            );
-            match delete_sandbox(provider, &status.id).await {
-                Ok(()) => report.removed.push(status.id),
+            tracing::warn!(lease = lease.raw(), sandbox = %id, "removing a sandbox no lease record names");
+            match self.destroy(&summary.reference).await {
+                Ok(()) => report.removed.push(id.clone()),
                 Err(error) => report
                     .problems
-                    .push(format!("sandbox {} delete failed: {error}", status.id)),
+                    .push(format!("sandbox {id} delete failed: {error}")),
             }
         }
         report
@@ -1067,16 +1327,52 @@ impl ReconcileReport {
     }
 }
 
-/// Deletion is complete when the resource is already absent, including after
-/// an interrupted delete whose confirmation never reached the ledger.
-pub(crate) async fn delete_sandbox(
-    provider: &dyn SandboxProvider,
-    id: &SandboxId,
-) -> sandbox_driver::Result<()> {
-    match provider.delete(id, None).await {
-        Ok(()) | Err(DriverError::NotFound { .. }) => Ok(()),
-        Err(error) => Err(error),
+/// Whether anything about the lease was ever asked of a provider.
+fn attempted(record: &LeaseRecord) -> bool {
+    record.admission.is_some() || record.fingerprint.is_some() || record.reference.is_some()
+}
+
+fn deleted_lease(lease: SandboxLeaseId) -> EnvError {
+    EnvError::backend(
+        BACKEND,
+        "acquire",
+        format!("sandbox lease {lease} was deleted; its workspace is gone"),
+    )
+}
+
+/// The reference as Petri's records keep it.
+pub(crate) fn to_reference(reference: &SandboxRef) -> SandboxReference {
+    SandboxReference {
+        provider:  SmolStr::new(reference.provider.as_str()),
+        namespace: SmolStr::new(reference.namespace.as_str()),
+        id:        SmolStr::new(reference.id.as_str()),
     }
+}
+
+/// A recorded reference, back as the driver's.
+pub(crate) fn sandbox_ref(reference: &SandboxReference) -> Result<SandboxRef, EnvError> {
+    let invalid = |error: &dyn fmt::Display| {
+        EnvError::backend(
+            BACKEND,
+            "acquire",
+            format!("the recorded sandbox reference is invalid: {error}"),
+        )
+    };
+    Ok(SandboxRef {
+        provider:  entry_name(&reference.provider)?,
+        namespace: NamespaceId::try_new(reference.namespace.as_str()).map_err(|e| invalid(&e))?,
+        id:        SandboxId::try_new(reference.id.as_str()).map_err(|e| invalid(&e))?,
+    })
+}
+
+fn entry_name(name: &str) -> Result<ProviderName, EnvError> {
+    ProviderName::try_new(name).map_err(|error| {
+        EnvError::backend(
+            BACKEND,
+            "acquire",
+            format!("invalid provider entry name `{name}`: {error}"),
+        )
+    })
 }
 
 /// Owns a holder until environment initialization hands it to an EnvHandle.
@@ -1114,163 +1410,5 @@ impl Drop for AcquiredSandbox {
             self.manager
                 .abandon_in_background(self.lease, self.standalone);
         }
-    }
-}
-
-async fn list_by_label(
-    provider: &dyn sandbox_driver::SandboxProvider,
-    workspace_label: &str,
-) -> Result<Vec<SandboxId>, EnvError> {
-    let mut filter = SandboxFilter::default();
-    filter
-        .labels
-        .insert(WORKSPACE_LABEL.to_owned(), workspace_label.to_owned());
-    let matches = provider
-        .list(&filter)
-        .await
-        .map_err(|error| acquire_failed(&error))?;
-    Ok(matches.into_iter().map(|status| status.id).collect())
-}
-
-#[cfg(test)]
-mod identity_tests {
-    use std::sync::atomic::{AtomicBool, Ordering};
-
-    use sandbox_driver::{Capabilities, EventContext, Isolation, ProviderKind, SandboxStatus};
-    use testkit::RunDir;
-
-    use super::*;
-
-    struct UntouchedProvider {
-        kind:         ProviderKind,
-        capabilities: Capabilities,
-    }
-
-    #[async_trait::async_trait]
-    impl SandboxProvider for UntouchedProvider {
-        fn kind(&self) -> &ProviderKind {
-            &self.kind
-        }
-        fn capabilities(&self) -> &Capabilities {
-            &self.capabilities
-        }
-        async fn create(
-            &self,
-            _: &SandboxSpec,
-            _: Option<EventContext>,
-        ) -> sandbox_driver::Result<Arc<dyn Sandbox>> {
-            panic!("a changed account must not create resources during recovery")
-        }
-        async fn attach(
-            &self,
-            _: &SandboxId,
-            _: Option<EventContext>,
-        ) -> sandbox_driver::Result<Arc<dyn Sandbox>> {
-            panic!("a changed account must not attach or mutate recorded resources")
-        }
-        async fn list(&self, _: &SandboxFilter) -> sandbox_driver::Result<Vec<SandboxStatus>> {
-            panic!("a changed account must not search for recorded resources")
-        }
-    }
-
-    struct VerifiedSource {
-        provider: Arc<UntouchedProvider>,
-        verified: AtomicBool,
-    }
-
-    #[async_trait::async_trait]
-    impl ProviderSource for VerifiedSource {
-        async fn current(&self) -> Result<(Arc<dyn SandboxProvider>, u64), EnvError> {
-            self.verified.store(true, Ordering::SeqCst);
-            Ok((self.provider.clone(), 1))
-        }
-        fn fingerprint(&self) -> &str {
-            if self.verified.load(Ordering::SeqCst) {
-                "daytona:::organization:other"
-            } else {
-                "daytona:::"
-            }
-        }
-        #[expect(
-            clippy::unnecessary_literal_bound,
-            reason = "the trait fixes the signature"
-        )]
-        fn kind(&self) -> &str {
-            "daytona"
-        }
-    }
-
-    async fn manager(dir: &RunDir) -> (SandboxLeaseManager, Arc<MemoryLedger>) {
-        let ledger = Arc::new(MemoryLedger::default());
-        ledger
-            .allocating(SandboxLeaseId::new(0), "daytona", "daytona:::")
-            .await
-            .expect("allocation");
-        ledger
-            .live(SandboxLeaseId::new(0), "existing-resource")
-            .await
-            .expect("live record");
-        let source = Arc::new(VerifiedSource {
-            provider: Arc::new(UntouchedProvider {
-                kind:         ProviderKind::try_new("daytona").expect("kind"),
-                capabilities: Capabilities::minimal(Isolation::Vm),
-            }),
-            verified: AtomicBool::new(false),
-        });
-        (
-            SandboxLeaseManager::new(
-                source,
-                ledger.clone(),
-                Arc::new(RunIdentity::new(dir.path().to_path_buf(), "identity-test")),
-            ),
-            ledger,
-        )
-    }
-
-    #[tokio::test]
-    async fn release_verifies_account_identity_before_stop_or_delete() {
-        for retention in [Retention::Always, Retention::Never] {
-            let dir = RunDir::new("release-provider-identity");
-            let (manager, ledger) = manager(&dir).await;
-            let report = manager
-                .release_lease(SandboxLeaseId::new(0), retention, ScopeOutcome::Succeeded)
-                .await;
-            assert!(!report.is_clean());
-            assert!(
-                report
-                    .problems
-                    .iter()
-                    .any(|problem| problem.contains("organization:other"))
-            );
-            assert_eq!(
-                ledger
-                    .lookup(SandboxLeaseId::new(0))
-                    .await
-                    .unwrap()
-                    .unwrap()
-                    .state,
-                LeaseState::Live
-            );
-        }
-    }
-
-    #[tokio::test]
-    async fn prune_verifies_account_identity_before_deleting() {
-        let dir = RunDir::new("prune-provider-identity");
-        let (manager, ledger) = manager(&dir).await;
-        let error = manager
-            .delete_recorded(SandboxLeaseId::new(0), "workspace")
-            .await
-            .expect_err("different account");
-        assert!(error.to_string().contains("organization:other"));
-        assert_eq!(
-            ledger
-                .lookup(SandboxLeaseId::new(0))
-                .await
-                .unwrap()
-                .unwrap()
-                .state,
-            LeaseState::Live
-        );
     }
 }

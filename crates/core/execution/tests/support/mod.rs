@@ -25,7 +25,7 @@ use execution::{
     SandboxMode, SandboxResourceRecord, SecretBindings,
 };
 use executor::Retention;
-use executor_sandbox::{InProcessProviders, LostSandbox, SandboxBackend, SandboxOptions};
+use executor_sandbox::{LostSandbox, SandboxBackend, SandboxOptions};
 use ir::{FailureInfo, Graph, Outcome, RunStatus, Status, StepKindId};
 use runtime::{RunOptions, Runtime};
 use serde::{Deserialize, Serialize};
@@ -231,7 +231,7 @@ impl SimHost {
         };
         Runtime::bare()
             .steps(registry)
-            .in_process_providers(InProcessProviders::new().with(Arc::new(self.world.factory())))
+            .sandbox_catalog(self.world.catalog())
             .store(Arc::clone(&self.watched) as Arc<dyn store::RunStore>)
             .options(options)
             .recording_clock(driver::RecordingClock::new(move || {
@@ -444,7 +444,7 @@ impl LeaseRecords for StoredLeases {
             .map(|record| LeaseView {
                 state:       record.body.state,
                 pending:     record.body.pending,
-                fingerprint: record.body.fingerprint.is_some(),
+                admitted:    record.body.admission.is_some(),
                 resource_id: record.body.resource_id.map(|id| id.to_string()),
             })
     }
@@ -455,7 +455,7 @@ pub(crate) fn resource_kind(record: &SandboxResourceRecord) -> &'static str {
     match (record.state, record.pending) {
         (_, Some(PendingIntent::Stop)) => "pending stop",
         (_, Some(PendingIntent::Delete)) => "pending delete",
-        (LeaseState::Allocating, None) if record.fingerprint.is_some() => "allocating",
+        (LeaseState::Allocating, None) if record.admission.is_some() => "allocating",
         (LeaseState::Allocating, None) => "reserved",
         (LeaseState::Live, None) => "live",
         (LeaseState::Stopped, None) => "stopped",

@@ -242,13 +242,10 @@ while :; do sleep 0.1; done
     );
 }
 
-/// The fence half of the acquire contract (§9), across a driver's death: the
-/// driver dies with a container step running, a fresh executor over the same
-/// run dir acquires the same scope — the *same sandbox*, found by the run id
-/// recorded in the run dir and the workspace label — and the crashed step's
-/// beater stops mutating the workspace before the next step runs in it.
+/// A lost sandbox reference cannot be replaced by guessing from a name
+/// conflict. The Docker provider must return AlreadyExists with the id.
 #[tokio::test]
-async fn a_new_executor_over_the_run_dir_fences_the_crashed_container() {
+async fn a_name_conflict_without_a_sandbox_reference_fails_the_scope() {
     if !is_docker_ready().await {
         return;
     }
@@ -313,20 +310,25 @@ sleep 300
         .await;
     assert_eq!(
         report.status,
-        RunStatus::Success,
+        RunStatus::Failed,
         "{:?}",
         report.state.errors()
     );
-    let output = output_of(&report, "beat");
+    let record = report
+        .state
+        .history()
+        .iter()
+        .find(|r| r.name == "beat")
+        .expect("the scope failure is reported");
     assert_eq!(
-        output["before"], output["after"],
-        "the crashed container's beater kept writing: the fence missed it ({output})"
+        record
+            .outcome
+            .status
+            .failure_info()
+            .map(|f| f.class.as_str()),
+        Some("env_acquire")
     );
-    assert!(
-        output["before"].as_str().is_some_and(|n| n.trim() != "0"),
-        "the workspace survived the fence: {output}"
-    );
-    // The same sandbox served both runs, and release ended it.
+    // Refusing adoption still cleans up the run's resource.
     assert!(
         container_id(&sandbox).await.is_none(),
         "release removed the sandbox (was {crashed_id})"

@@ -2,15 +2,12 @@
 //! every label carries, and the per-scope layout the host backend uses.
 
 use std::fmt::Write as _;
-use std::fs::{self, File};
-use std::io::{self, Write as _};
+use std::fs;
 use std::path::{Path, PathBuf};
-use std::process;
 
-use executor::{EnvError, SandboxLeaseId};
+use executor::SandboxLeaseId;
 use sha2::{Digest as _, Sha256};
 use smol_str::SmolStr;
-use tokio::task::spawn_blocking;
 
 /// The label naming a sandbox's workspace: `<run id>/<workspace id>`. It
 /// is the reconcile key: recovery lists the provider by it and attaches the
@@ -99,97 +96,5 @@ impl RunIdentity {
                 self.workspace_label(workspace_id),
             ),
         ]
-    }
-}
-
-/// Persist recovery metadata before creating a provider resource. A reader
-/// sees a complete record, and both its content and directory entry survive
-/// a crash after this returns.
-pub(crate) async fn write_record(path: PathBuf, bytes: Vec<u8>) -> Result<(), EnvError> {
-    spawn_blocking(move || {
-        let staged = StagedRecord::new(&path, &bytes)?;
-        fs::rename(&staged.0, &path).map_err(|error| record_error("rename", &path, error))?;
-        sync_parent(&path)
-    })
-    .await
-    .map_err(|error| EnvError::backend(crate::BACKEND, "record", error.to_string()))?
-}
-
-struct StagedRecord(PathBuf);
-
-impl StagedRecord {
-    fn new(path: &Path, bytes: &[u8]) -> Result<Self, EnvError> {
-        if let Some(parent) = path.parent() {
-            fs::create_dir_all(parent).map_err(|error| record_error("create", parent, error))?;
-        }
-        let staged = path.with_extension(format!("{}.tmp", fresh_run_id()));
-        let mut file =
-            File::create_new(&staged).map_err(|error| record_error("create", &staged, error))?;
-        let staged = Self(staged);
-        file.write_all(bytes)
-            .and_then(|()| file.sync_all())
-            .map_err(|error| record_error("write", &staged.0, error))?;
-        Ok(staged)
-    }
-}
-
-impl Drop for StagedRecord {
-    fn drop(&mut self) {
-        let _ = fs::remove_file(&self.0);
-    }
-}
-
-fn sync_parent(path: &Path) -> Result<(), EnvError> {
-    if let Some(parent) = path.parent() {
-        File::open(parent)
-            .and_then(|directory| directory.sync_all())
-            .map_err(|error| record_error("sync", parent, error))?;
-    }
-    Ok(())
-}
-
-fn record_error(action: &'static str, path: &Path, error: io::Error) -> EnvError {
-    EnvError::workspace(action, path.display(), error)
-}
-
-/// Unique across processes and time.
-fn fresh_run_id() -> String {
-    use std::sync::atomic::{AtomicU64, Ordering};
-    use std::time::{SystemTime, UNIX_EPOCH};
-    static COUNTER: AtomicU64 = AtomicU64::new(0);
-    let nanos = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map_or(0, |d| d.as_nanos());
-    format!(
-        "{nanos:x}-{}-{}",
-        process::id(),
-        COUNTER.fetch_add(1, Ordering::Relaxed)
-    )
-}
-
-#[cfg(test)]
-mod tests {
-    use testkit::RunDir;
-    use tokio::task::JoinSet;
-
-    use super::*;
-
-    #[tokio::test]
-    async fn concurrent_marker_writes_publish_complete_records() {
-        let dir = RunDir::new("concurrent-marker-writes");
-        let path = dir.path().join("marker");
-        let mut tasks = JoinSet::new();
-        for index in 0u8..16 {
-            tasks.spawn(write_record(path.clone(), vec![index; 16 * 1024]));
-        }
-        while let Some(joined) = tasks.join_next().await {
-            joined
-                .expect("writer joined")
-                .expect("complete record published");
-        }
-        let recorded = fs::read(path).expect("published marker");
-        assert_eq!(recorded.len(), 16 * 1024);
-        assert!(recorded.iter().all(|byte| *byte == recorded[0]));
-        assert_eq!(fs::read_dir(dir.path()).expect("run directory").count(), 1);
     }
 }

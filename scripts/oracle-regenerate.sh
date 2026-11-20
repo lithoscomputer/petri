@@ -62,13 +62,6 @@ python3 "$HARNESS/oracle_harness.py" \
   --cases crates/fabro/oracle/cases --expected crates/fabro/oracle/expected \
   "${CASE_ARGS[@]+"${CASE_ARGS[@]}"}"
 
-# Petri's half runs under the sandbox plugins `mise run plugins:build` installs,
-# the same environment `mise run test` sets; without them every Petri run
-# fails at `start` and record mode would write those failures into the
-# fixtures' `petri` sections.
-PLUGINS="$PWD/target/plugins/bin"
-export PETRI_SANDBOX_HOST_PLUGIN="${PETRI_SANDBOX_HOST_PLUGIN:-$PLUGINS/sandbox-driver-host}"
-export PETRI_SANDBOX_DOCKER_PLUGIN="${PETRI_SANDBOX_DOCKER_PLUGIN:-$PLUGINS/sandbox-driver-docker}"
-[ -x "$PETRI_SANDBOX_HOST_PLUGIN" ] || { echo "error: no host plugin at $PETRI_SANDBOX_HOST_PLUGIN; run \`mise run plugins:build\`" >&2; exit 1; }
+# Petri's half runs on the Host and Docker providers built into the binary.
 PETRI_ORACLE_RECORD=1 cargo nextest run -p petri-fabro-acceptance --test routing every_case_matches_the_fabro_oracle
 echo "regenerated crates/fabro/oracle/expected at fabro $commit"

@@ -221,8 +221,7 @@ with no host filesystem mounts. `mise run check` includes this test. Set
 (`crates/core/executor-sandbox/tests/daytona_backend.rs`), the host's
 retention, prune and resume cells (`crates/petri/lib/tests/daytona.rs`), the
 CLI retention cell, and the GitHub Actions cell with a VM job and a nested
-container job. It builds the Daytona plugin (`mise run plugins:build:daytona`)
-and sets `PETRI_REQUIRE_DAYTONA=1`, so a missing credential or plugin fails
+container job. It sets `PETRI_REQUIRE_DAYTONA=1`, so a missing credential fails
 with its reason instead of skipping. Without the variable the same tests skip
 with a `skipping:` notice, which is what the routine suite does. No CI job has
 the credential, so the tier is run by hand before a change to the Daytona
