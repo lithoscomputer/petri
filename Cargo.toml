@@ -98,7 +98,6 @@ executor-sandbox = { package = "petri-executor-sandbox", path = "crates/core/exe
 sandbox-driver = { git = "https://github.com/lithoscomputer/sandbox-driver.git", branch = "main" }
 sandbox-driver-protocol = { git = "https://github.com/lithoscomputer/sandbox-driver.git", branch = "main" }
 sandbox-driver-docker-config = { git = "https://github.com/lithoscomputer/sandbox-driver.git", branch = "main" }
-sandbox-driver-daytona-config = { git = "https://github.com/lithoscomputer/sandbox-driver.git", branch = "main" }
 # The built-in providers, linked into the executor in-process.
 sandbox-driver-host = { git = "https://github.com/lithoscomputer/sandbox-driver.git", branch = "main" }
 sandbox-driver-docker = { git = "https://github.com/lithoscomputer/sandbox-driver.git", branch = "main" }

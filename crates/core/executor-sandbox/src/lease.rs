@@ -58,7 +58,7 @@ use tokio::fs;
 use tokio::sync::{Mutex as AsyncMutex, OwnedMutexGuard};
 use tokio::task::JoinSet;
 
-use crate::catalog::{self, Credentials};
+use crate::catalog::Credentials;
 use crate::run::{LEASE_LABEL, RUN_LABEL, RunIdentity};
 use crate::{BACKEND, LostSandbox, acquire_failed};
 
@@ -601,20 +601,8 @@ impl SandboxLeaseManager {
                         EnvError::backend(BACKEND, "acquire", error.to_string())
                     })?,
                 })),
-                // TODO(sandbox-driver): the Docker provider reports a name in
-                // use as `InvalidSpec` at `name`, not the contract's
-                // `AlreadyExists` with the holder's id. Until it does, the
-                // holder is the lease's one sandbox on the entry, by label.
-                Err(DriverError::InvalidSpec { path, message }) if path == "name" => {
-                    match manager
-                        .find_on(&provider, manager.lease_filter(lease))
-                        .await?
-                        .as_slice()
-                    {
-                        [one] => Err(Ok(one.clone())),
-                        _ => Err(Err(DriverError::InvalidSpec { path, message })),
-                    }
-                }
+                // Providers must report AlreadyExists with the holder's id
+                // for adoption; an invalid spec is not evidence of ownership.
                 Err(error) => Err(Err(error)),
             };
             let sandbox: Arc<dyn Sandbox> = match adopted {
@@ -758,12 +746,11 @@ impl SandboxLeaseManager {
         if record.provider.as_deref() == Some(LEGACY_HOST) {
             return Ok(Located::Gone);
         }
-        let found = catalog::find(
-            &self.sandboxes,
-            LabelFilter::eq(RUN_LABEL, self.identity.run_id()),
-        )
-        .await
-        .map_err(|error| acquire_failed(&error))?;
+        let found = self
+            .sandboxes
+            .find(LabelFilter::eq(RUN_LABEL, self.identity.run_id()))
+            .await
+            .map_err(|error| acquire_failed(&error))?;
         let lease_value = lease.raw().to_string();
         let matches: Vec<_> = found
             .sandboxes
@@ -855,7 +842,9 @@ impl SandboxLeaseManager {
         entry: &ProviderName,
         filter: LabelFilter,
     ) -> Result<Vec<SandboxRef>, EnvError> {
-        let found = catalog::find(&self.sandboxes, filter)
+        let found = self
+            .sandboxes
+            .find(filter)
             .await
             .map_err(|error| acquire_failed(&error))?;
         if let Some(failure) = found
@@ -1274,11 +1263,10 @@ impl SandboxLeaseManager {
     /// Action hosts carry no lease label and are left to their own sweep.
     async fn sweep_unrecorded(&self, named: &BTreeSet<String>) -> ReconcileReport {
         let mut report = ReconcileReport::default();
-        let found = match catalog::find(
-            &self.sandboxes,
-            LabelFilter::eq(RUN_LABEL, self.identity.run_id()),
-        )
-        .await
+        let found = match self
+            .sandboxes
+            .find(LabelFilter::eq(RUN_LABEL, self.identity.run_id()))
+            .await
         {
             Ok(found) => found,
             Err(error) => return report.with_problem(acquire_failed(&error).to_string()),

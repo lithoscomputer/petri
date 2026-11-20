@@ -19,11 +19,10 @@ fn output_of(report: &RunReportPlus, name: &str) -> ir::Value {
         .map_or(ir::Value::Null, |r| r.outcome.output.clone())
 }
 
-/// A `docker://` step runs in the daemon with the workspace mounted, sees the
-/// scope's `GITHUB_*` env and its `INPUT_*`, writes `GITHUB_OUTPUT`, and a
-/// later step of the (host) job reads the output back.
+/// A `docker://` step requires a containerized job until portable Host mounts
+/// are supported. Its environment and outputs still cross container boundaries.
 #[tokio::test]
-async fn a_docker_url_action_runs_in_a_host_job() {
+async fn a_docker_url_action_requires_a_containerized_job() {
     if !is_docker_ready().await {
         return;
     }
@@ -40,16 +39,34 @@ jobs:
           args: sh -c 'echo "hello $INPUT_WHO from $GITHUB_REPOSITORY"; echo "answer=42" >> "$GITHUB_OUTPUT"'
       - run: echo "carried ${{ steps.box.outputs.answer }}"
 "#;
-    let graph = lower_ok(text);
-    let report = run_host(graph, "docker-url-action").await;
-    assert_eq!(report.status, RunStatus::Success, "{:?}", errors(&report));
-    let lines = log_lines(&report);
-    assert!(
-        lines.iter().any(|l| l == "hello world from example/repo"),
-        "{lines:?}"
-    );
-    assert!(lines.iter().any(|l| l == "carried 42"), "{lines:?}");
-    assert_eq!(output_of(&report, "build/box")["answer"], "42");
+    for containerized in [false, true] {
+        let text = if containerized {
+            text.replace("    steps:", "    container: alpine:3.20\n    defaults:\n      run:\n        shell: sh\n    steps:")
+        } else {
+            text.to_owned()
+        };
+        let graph = lower_ok(&text);
+        let report = run_host(graph, "docker-url-action").await;
+        if !containerized {
+            assert_eq!(report.status, RunStatus::Failed);
+            let failures = errors(&report);
+            assert!(
+                failures
+                    .iter()
+                    .any(|message| message.contains("host-workspace mount")),
+                "{failures:?}"
+            );
+            continue;
+        }
+        assert_eq!(report.status, RunStatus::Success, "{:?}", errors(&report));
+        let lines = log_lines(&report);
+        assert!(
+            lines.iter().any(|l| l == "hello world from example/repo"),
+            "{lines:?}"
+        );
+        assert!(lines.iter().any(|l| l == "carried 42"), "{lines:?}");
+        assert_eq!(output_of(&report, "build/box")["answer"], "42");
+    }
 }
 
 #[tokio::test]
@@ -62,6 +79,10 @@ on: push
 jobs:
   build:
     runs-on: ubuntu-latest
+    container: alpine:3.20
+    defaults:
+      run:
+        shell: sh
     steps:
       - id: box
         background: true
@@ -96,6 +117,10 @@ on: push
 jobs:
   build:
     runs-on: ubuntu-latest
+    container: alpine:3.20
+    defaults:
+      run:
+        shell: sh
     steps:
       - run: |
           mkdir -p .github/actions/box

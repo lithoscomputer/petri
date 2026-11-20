@@ -2111,7 +2111,6 @@ dependencies = [
  "reqwest",
  "sandbox-driver",
  "sandbox-driver-daytona",
- "sandbox-driver-daytona-config",
  "sandbox-driver-docker",
  "sandbox-driver-host",
  "sandbox-driver-testing",

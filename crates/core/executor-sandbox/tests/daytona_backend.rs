@@ -211,7 +211,7 @@ async fn a_process_step_runs_in_the_runner_sandbox() {
         Some(wanted.memory_mb)
     );
     assert!(resources.disk_mb.is_some());
-    // TODO(parity): the sandbox's region. The shared API's status reports
+    // sandbox-driver's status reports
     // no placement, so the configured DAYTONA_TARGET is not checked here.
 
     let report = executor.release(handle, ScopeOutcome::Failed).await;

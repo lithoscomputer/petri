@@ -13,6 +13,7 @@ use execution::{
 use executor::{
     AcquireContext, Executor as _, OneShotContainer, Retention, ScopeOutcome, ScopeSpec,
 };
+use executor_sandbox::{SandboxCatalog, SandboxOptions};
 use ir::{GraphBuilder, Outcome, RunStatus, RuntimeSpec, Scope, ScopeId, StepRef};
 use runtime::steps::{Step, StepCtx};
 use runtime::store::{RunKey, RunStore as _};
@@ -154,10 +155,13 @@ impl Step for HostAction {
 
     async fn run(&self, (): (), ctx: StepCtx) -> Outcome {
         let runner = ctx.require_container_runner().expect("host runner");
-        let mut process = runner
+        let process = runner
             .run(OneShotContainer::registry("alpine:3.20").with_args(&["true"]))
-            .await
-            .expect("action starts");
+            .await;
+        let mut process = match process {
+            Ok(process) => process,
+            Err(error) => return Outcome::failure(error.to_string()),
+        };
         let mut lines = process.lines().expect("action output");
         while lines.recv().await.is_some() {}
         assert!(process.wait().await.expect("action finishes").is_success());
@@ -166,7 +170,7 @@ impl Step for HostAction {
 }
 
 #[tokio::test]
-async fn invocation_finish_releases_its_host_action_sandbox() {
+async fn a_refused_host_action_finishes_its_invocation_without_a_sandbox() {
     if !is_docker_ready().await {
         return;
     }
@@ -187,11 +191,14 @@ async fn invocation_finish_releases_its_host_action_sandbox() {
         .register_graph(&graph.build())
         .await
         .expect("graph");
-    let result = coordinator
-        .run_root(graph, BTreeMap::new())
-        .await
-        .expect("run");
-    assert_eq!(result.status, RunStatus::Success);
+    let result = timeout(
+        Duration::from_secs(5),
+        coordinator.run_root(graph, BTreeMap::new()),
+    )
+    .await
+    .expect("a refused action must not strand the invocation")
+    .expect("run");
+    assert_eq!(result.status, RunStatus::Failed);
     let prefix = format!("petri-{}-", testkit::recorded_run_id(directory.path()));
     assert!(testkit::list_containers(&prefix).await.is_empty());
     coordinator.finish().await;
@@ -401,16 +408,46 @@ async fn prune_removes_crashed_host_action_containers_including_tombstoned_lease
             .acquire(&scope, &AcquireContext::bare().with_lease(lease))
             .await
             .expect("host scope");
-        let mut process = handle
-            .container_runner()
-            .expect("action runner")
-            .run(OneShotContainer::registry("alpine:3.20").with_args(&["true"]))
-            .await
-            .expect("action starts");
-        let mut lines = process.lines().expect("action lines");
-        while lines.recv().await.is_some() {}
-        assert!(process.wait().await.expect("action finishes").is_success());
         let prefix = router.container_prefix();
+        // Seed an old action host through the shared API: new Host actions
+        // are refused, but recovery must still delete their predecessors.
+        let sandboxes = SandboxCatalog::from_options(&SandboxOptions::default())
+            .expect("catalog")
+            .open()
+            .expect("open catalog");
+        let mut spec = sandboxes
+            .environment("docker")
+            .await
+            .expect("environment")
+            .spec;
+        spec.name = Some(format!("{prefix}a-scope-0"));
+        spec.labels
+            .insert("petri.run".to_owned(), directory.run_id());
+        spec.labels.insert(
+            "petri.actions".to_owned(),
+            format!("{}/{}", directory.run_id(), scope.workspace_id),
+        );
+        let sandbox = sandboxes
+            .builder("docker")
+            .await
+            .expect("builder")
+            .spec(spec)
+            .create()
+            .await
+            .expect("seed old action host");
+        let reference = sandbox.reference();
+        let marker =
+            serde_json::json!({"provider": reference.provider, "namespace": reference.namespace});
+        fs::write(
+            directory
+                .path()
+                .join("scopes")
+                .join(scope.workspace_id.as_str())
+                .join("action-host"),
+            serde_json::to_vec(&marker).expect("marker serializes"),
+        )
+        .expect("old action marker");
+        sandboxes.shutdown().await.expect("catalog shuts down");
         assert_eq!(testkit::list_containers(&prefix).await.len(), 1);
         // A fresh router has only durable records, just as after a crash.
         router.shutdown().await;

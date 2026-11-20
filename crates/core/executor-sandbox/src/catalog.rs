@@ -21,13 +21,11 @@ use std::{env, fs};
 
 use async_trait::async_trait;
 use sandbox_driver::{
-    CatalogOptions, Environment, EnvironmentName, EnvironmentSource, Error, Found, LabelFilter,
-    MutationOutcome, ProviderEntry, ProviderFactory, ProviderKind, ProviderName, Registry,
-    SandboxSpec, Sandboxes, SecretResolver, Source, StaticEnvironments, Timers,
+    CatalogOptions, Environment, EnvironmentName, EnvironmentSource, Error, ProviderEntry,
+    ProviderFactory, ProviderKind, ProviderName, Registry, SandboxSpec, Sandboxes, SecretResolver,
+    Source, StaticEnvironments, Timers,
 };
 use serde::Deserialize;
-use tokio::runtime::Handle;
-use tokio::task;
 
 use crate::backend::{DaytonaSandboxKind, SandboxBackend, SandboxOptions};
 use crate::simulated::{SIMULATED_KIND, SimulatedFactory};
@@ -189,11 +187,8 @@ impl SandboxCatalog {
         providers.insert(provider_name("daytona"), entry("daytona", daytona, secrets));
 
         if options.daytona_kind == DaytonaSandboxKind::VirtualMachine {
-            // TODO(parity): Daytona VM sandboxes. The built-in Daytona
-            // provider creates container sandboxes only until the shared API
-            // carries the sandbox class (parity plan,
-            // https://ampcode.com/threads/T-7b304bcd-d83a-42ed-818f-ffc6c291814c).
-            // Refused loudly rather than placed on a container.
+            // sandbox-driver's Daytona provider lacks VM sandbox creation.
+            // Refuse rather than silently place the workload on a container.
             return Err(
                 "--daytona-kind vm is not yet carried by sandbox-driver's shared sandbox \
                         API; Petri supports it again once the API addition lands"
@@ -387,28 +382,6 @@ impl SecretResolver for Layered {
             None => self.application.resolve(name).await,
         }
     }
-}
-
-/// [`Sandboxes::find`], run so that its caller's future stays `Send`.
-///
-/// The future `Sandboxes::find` returns is not `Send` as rustc sees it: its
-/// per-entry closure trips the higher-ranked lifetime limitation
-/// (rust-lang/rust#102211), so it cannot be awaited inside a spawned task or
-/// an `async_trait` method. It runs here on a blocking thread, driven by the
-/// current runtime, which never moves the future across threads.
-// TODO(sandbox-driver): await `find` directly once sandbox-driver makes its
-// future provably `Send`.
-pub(crate) async fn find(sandboxes: &Sandboxes, filter: LabelFilter) -> Result<Found, Error> {
-    let sandboxes = sandboxes.clone();
-    let runtime = Handle::current();
-    task::spawn_blocking(move || runtime.block_on(sandboxes.find(filter)))
-        .await
-        .unwrap_or_else(|error| {
-            Err(Error::Transport {
-                message: format!("the inventory task failed: {error}"),
-                outcome: MutationOutcome::NotStarted,
-            })
-        })
 }
 
 #[cfg(test)]

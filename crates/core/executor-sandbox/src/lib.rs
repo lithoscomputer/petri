@@ -4,10 +4,10 @@
 //! one durable lease per workspace on the sandbox it gets. Providers own
 //! process execution, files, one-shot containers, and cleanup; Petri names
 //! environments and stores references, and never builds a provider's recipe.
-//! [`RoutingExecutor`] adds what a process scope on a host directory needs
-//! beside its sandbox (an action host for Docker actions) and is what the
-//! runtime registers. [`HostExecutor`] is a convenience wrapper for standalone
-//! Host execution.
+//! [`RoutingExecutor`] also recovers old action hosts and refuses new Host
+//! container actions until portable host-workspace mounts are available.
+//! It is what the runtime registers. [`HostExecutor`] is a convenience wrapper
+//! for standalone Host execution.
 //!
 //! Host, Docker and Daytona are built-in providers linked into this crate and
 //! registered with [`sandbox_driver::Registry::builtin`]
@@ -87,12 +87,7 @@ pub(crate) fn acquire_failed(error: &DriverError) -> EnvError {
     EnvError::backend(BACKEND, "acquire", error.to_string())
 }
 
-/// What Petri did before the shared sandbox API and that API cannot express
-/// yet. Every caller is a parity gap tracked in the sandbox refactor's parity
-/// plan (https://ampcode.com/threads/T-7b304bcd-d83a-42ed-818f-ffc6c291814c);
-/// none is a decision to drop the feature.
-// TODO(parity): remove each caller once sandbox-driver's shared API carries
-// the feature it names.
+/// Refuse a feature the shared sandbox API cannot express yet.
 pub(crate) fn parity_gap(feature: &str) -> EnvError {
     EnvError::backend(
         BACKEND,
@@ -439,7 +434,7 @@ impl SandboxExecutor {
                 },
             ) => {
                 if credentials.is_some() {
-                    // TODO(parity): workload image registry credentials.
+                    // sandbox-driver lacks workload image registry credentials.
                     return Err(parity_gap("a registry credential for the job image"));
                 }
                 spec.source = Source::Image(image.to_string());
@@ -470,15 +465,10 @@ impl SandboxExecutor {
                         .extra_hosts
                         .insert(DOCKER_HOST_ALIAS.to_owned(), "host-gateway".to_owned());
                 }
+                // Providers must advertise portable platform support before
+                // admission accepts it; never substitute a provider option.
                 if let Some(platform) = &options.platform {
-                    // Docker's own per-sandbox option; a provider whose
-                    // spec_schema lacks it refuses it at admission.
-                    // TODO(parity): a portable platform field, if the parity
-                    // plan adds one.
-                    spec.provider_config.insert(
-                        "platform".to_owned(),
-                        serde_json::Value::String(platform.to_string()),
-                    );
+                    container.platform = Some(platform.to_string());
                 }
             }
         }
@@ -523,8 +513,7 @@ impl SandboxExecutor {
         let mut credentials = Vec::new();
         for service in &scope.services {
             let typed = &service.options;
-            // TODO(parity): service user, entrypoint, dns, cap_add and
-            // privileged.
+            // sandbox-driver's ServiceSpec lacks these container options.
             for (set, option) in [
                 (typed.user.is_some(), "user"),
                 (typed.entrypoint.is_some(), "entrypoint"),

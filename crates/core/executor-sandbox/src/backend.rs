@@ -144,8 +144,7 @@ impl Default for DaytonaResources {
 
 impl DaytonaResources {
     pub(crate) fn validated(self) -> Result<Resources, EnvError> {
-        let memory_mb = sandbox_driver_daytona_config::allocation_mib(self.memory_mb);
-        if self.cpu_cores < 2 || memory_mb < 4096 || self.disk_mb == Some(0) {
+        if self.cpu_cores < 2 || self.memory_mb < 4096 || self.disk_mb == Some(0) {
             return Err(EnvError::backend(
                 "daytona",
                 "configure",
@@ -154,11 +153,8 @@ impl DaytonaResources {
         }
         Ok(Resources {
             cpu_cores: NonZeroU32::new(self.cpu_cores),
-            memory_mb: NonZeroU64::new(memory_mb),
-            disk_mb:   self
-                .disk_mb
-                .map(sandbox_driver_daytona_config::allocation_mib)
-                .and_then(NonZeroU64::new),
+            memory_mb: NonZeroU64::new(self.memory_mb),
+            disk_mb:   self.disk_mb.and_then(NonZeroU64::new),
             gpus:      None,
         })
     }
@@ -392,7 +388,7 @@ mod tests {
             .validated()
             .is_err()
         );
-        for disk in [1024, 3 * 1024, 4096, 20 * 1024] {
+        for disk in [1, 1024, 3073, 4096, 20 * 1024] {
             let resources = DaytonaResources {
                 disk_mb: Some(disk),
                 ..Default::default()
@@ -417,8 +413,8 @@ mod tests {
     }
 
     #[test]
-    fn daytona_validates_the_effective_memory_allocation() {
-        for memory_mb in [0, 1, 2048, 3072] {
+    fn daytona_validates_requested_memory_without_rounding() {
+        for memory_mb in [0, 1, 2048, 3072, 3073, 3815, 4095] {
             assert!(
                 DaytonaResources {
                     memory_mb,
@@ -428,14 +424,14 @@ mod tests {
                 .is_err()
             );
         }
-        for memory_mb in [3073, 3815, 4096] {
+        for memory_mb in [4096, 4097, 8191] {
             let resources = DaytonaResources {
                 memory_mb,
                 ..Default::default()
             }
             .validated()
             .unwrap();
-            assert_eq!(resources.memory_mb.map(NonZeroU64::get), Some(4096));
+            assert_eq!(resources.memory_mb.map(NonZeroU64::get), Some(memory_mb));
             assert_eq!(resources.disk_mb, None);
         }
     }

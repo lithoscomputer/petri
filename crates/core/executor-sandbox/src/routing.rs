@@ -1,8 +1,8 @@
 //! An [`Executor`] over one run's sandbox catalog: each scope goes to the
 //! catalog environment its runtime names, through one [`SandboxExecutor`],
-//! and a process scope on a host directory gets an action host on the
-//! container environment for its Docker actions. It is the composition the
-//! runtime registers for a run.
+//! with recovery for action hosts left by earlier runs. Host container actions
+//! are refused until sandbox-driver supports portable host-workspace mounts.
+//! It is the composition the runtime registers for a run.
 
 use std::collections::BTreeMap;
 use std::path::PathBuf;
@@ -19,11 +19,10 @@ use crate::actions::{ActionHost, ActionHostRunner, remove_recorded};
 use crate::catalog::Credentials;
 use crate::gate::{DRAIN_BUDGET, RunGate};
 use crate::lease::{LeaseLedger, MemoryLedger, ReconcileReport, RecordedLease};
-use crate::run::{RunIdentity, workspace_dir};
+use crate::run::RunIdentity;
 use crate::simulated::SIMULATED_KIND;
 use crate::{
-    BACKEND, DOCKER_HOST_ALIAS, SandboxCatalog, SandboxExecutor, SandboxOptions, SandboxTeardown,
-    acquire_failed,
+    BACKEND, SandboxCatalog, SandboxExecutor, SandboxOptions, SandboxTeardown, acquire_failed,
 };
 
 /// The environment container scopes go to when the options name no other.
@@ -244,25 +243,13 @@ impl RoutingExecutor {
         self.identity.container_prefix()
     }
 
-    /// The action host of a host scope's workspace. Nothing here contacts
-    /// a provider: the container environment is checked, and its entry
-    /// activated, when the first action runs.
+    /// Recovery state for action hosts created by an earlier version.
     fn action_host(
         &self,
         owner: ActionOwner,
         scope: &ScopeSpec,
     ) -> Result<Arc<ActionHost>, EnvError> {
         let sandboxes = self.sandboxes()?;
-        let environment = self.options.container_environment();
-        // The action host binds this machine's workspace, so it is on a
-        // local daemon and reaches this machine through the host alias,
-        // unless the operator named another route.
-        let host_address = self
-            .catalog
-            .as_ref()
-            .ok()
-            .and_then(|catalog| catalog.host_addresses().get(environment).cloned().flatten())
-            .unwrap_or_else(|| DOCKER_HOST_ALIAS.to_owned());
         let key = (owner, scope.workspace_id.clone());
         let mut hosts = self
             .action_hosts
@@ -273,11 +260,8 @@ impl RoutingExecutor {
             .or_insert_with(|| {
                 Arc::new(ActionHost::new(
                     sandboxes.clone(),
-                    self.options.container_environment().to_owned(),
                     self.identity.clone(),
-                    workspace_dir(self.identity.run_dir(), scope.workspace_id.as_str()),
                     scope.workspace_id.as_str().to_owned(),
-                    host_address.clone(),
                 ))
             })
             .clone())
@@ -408,8 +392,8 @@ impl Executor for RoutingExecutor {
         if self.simulated {
             return executor.acquire(scope, ctx).await;
         }
-        // A process scope on a host directory runs its Docker actions on an
-        // action host; every other scope runs them on its own sandbox.
+        // Host scopes retain action-host recovery but refuse new container
+        // actions. Other scopes run actions on their own sandbox.
         let environment = executor.environment_for(&scope.runtime);
         let template = executor
             .manager()
@@ -428,11 +412,9 @@ impl Executor for RoutingExecutor {
             host.prepare().await;
         }
         let handle = executor.acquire(scope, ctx).await?;
-        Ok(handle.with_runner(Arc::new(ActionHostRunner::new(
-            action_host,
-            scope,
-            self.gate.clone(),
-        ))))
+        Ok(handle.with_runner(Arc::new(ActionHostRunner {
+            gate: self.gate.clone(),
+        })))
     }
 
     async fn release(&self, env: EnvHandle, outcome: ScopeOutcome) -> ReleaseReport {
