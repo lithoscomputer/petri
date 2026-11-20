@@ -720,7 +720,8 @@ cancelled firing no longer waits for them. Hook output reaches the run log
 through the same event pipeline as every other step output, so Petri's
 secret masking applies to it. What a prompt or agent hook spent is on its
 record (`usage` on the hook's entry of the `hook` note or `attractor.hook`
-event: requests, tool calls, tokens, cost, timings), and every event an
+event: requests, tool calls, tokens, cost, timings; `trace`, the span its
+model requests went under, "Native Pebble"), and every event an
 agent hook's agent produced is recorded under the hook's identity as a
 `hook.activity` note (`parsed.hook_activity` in the public stream), apart
 from the stage's own agent activity and usage
@@ -914,7 +915,21 @@ context. Petri owns these two headers on the calls it makes: a
 (Pebble does the same on its requests), and a provider's catalog
 `default_headers` entry of either name still wins in lithos-llm. `http` MCP
 requests carry no trace headers; the context travels in each `tools/call`
-instead. Hooks and ACP agents send no trace context.
+instead.
+
+A prompt or agent hook run for a step sends trace context too, beneath a
+span of its own: a fresh random span under the step attempt's, recorded on
+the hook's entry of its report (`trace`: `trace_id`, `span_id`,
+`parent_span_id`; `crates/core/execution/HOOKS.md`, "Recording"), with the
+same `run_id` and `run_step` baggage. A prompt hook sends `traceparent`
+naming that span and `baggage` on its one call; an agent hook gives it to
+its Pebble session as the parent, which opens its request and tool spans
+beneath it as an agent node's does, and records them on the hook's
+activity. This holds at every point that has a firing, whether the driver
+or the step asks it; the step-asked points (the start stage's, a fork's,
+the tool boundary) need the coordinator, as the stage's own requests do. A
+run-level hook (`run_finished`, `sandbox_cleanup`) has no step and sends
+none, and neither do command and HTTP hooks or ACP agents.
 
 An application may also give every native session tools of its own: register
 an `attractor_steps::host_tools::HostTools` capability holding builders of

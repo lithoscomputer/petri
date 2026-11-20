@@ -37,6 +37,7 @@ use lithos_llm::types::{Message, Request, ResponseFormat, Role};
 use pebble_coding_agent::events::{CodingAgentEvent, CodingEvent, EventSink, EventSinkError};
 use pebble_coding_agent::{
     CodingAgent, CodingAgentOptions, Error as AgentError, PromptReport, ShutdownReason,
+    TraceContext,
 };
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -48,6 +49,7 @@ use tokio_util::sync::CancellationToken;
 use super::{Context, Decision, IN_HOOK};
 use crate::pebble::PebbleClient;
 use crate::pebble::environment::PebbleEnvironment;
+use crate::pebble::identity::Propagation;
 use crate::permissions;
 
 /// Fabro's prompt for its hook evaluator.
@@ -131,13 +133,16 @@ impl HttpClients {
     }
 }
 
-/// Run one hook.
+/// Run one hook. A prompt or agent hook run for a step sends its model
+/// requests with `trace`: beneath the hook's own span, with the run and the
+/// step in baggage.
 pub async fn execute(
     hook: &HookDefinition,
     context: &Context,
     env: Option<&Arc<dyn ExecEnv>>,
     client: Option<&PebbleClient>,
     http: &HttpClients,
+    trace: Option<&Propagation>,
 ) -> Execution {
     match &hook.kind {
         HookKind::Command { command } => {
@@ -147,7 +152,7 @@ pub async fn execute(
             Execution::of(http_hook(hook, url, headers, *tls, context, http).await)
         }
         HookKind::Prompt { prompt, model } => {
-            prompt_hook(hook, prompt, model.as_deref(), context, client).await
+            prompt_hook(hook, prompt, model.as_deref(), context, client, trace).await
         }
         HookKind::Agent {
             prompt,
@@ -162,6 +167,7 @@ pub async fn execute(
                 context,
                 env,
                 client,
+                trace,
             )
             .await
         }
@@ -423,11 +429,25 @@ async fn prompt_hook(
     model: Option<&str>,
     context: &Context,
     client: Option<&PebbleClient>,
+    trace: Option<&Propagation>,
 ) -> Execution {
     let Some(client) = client else {
         return Execution::of(Executed::Unsupported(
             "a prompt hook needs the application's model client".into(),
         ));
+    };
+    let traced;
+    let client = match trace.map(|trace| client.0.with_default_headers(trace.headers())) {
+        None => client,
+        Some(Ok(client)) => {
+            traced = PebbleClient(client);
+            &traced
+        }
+        Some(Err(error)) => {
+            return Execution::of(Executed::FailedOpen(format!(
+                "prompt hook trace context: {error}"
+            )));
+        }
     };
     let model = model.unwrap_or(DEFAULT_MODEL);
     let schema = json!({
@@ -501,11 +521,20 @@ async fn agent_hook(
     context: &Context,
     env: Option<&Arc<dyn ExecEnv>>,
     client: Option<&PebbleClient>,
+    trace: Option<&Propagation>,
 ) -> Execution {
     let Some(client) = client else {
         return Execution::of(Executed::Unsupported(
             "an agent hook needs the application's model client".into(),
         ));
+    };
+    let trace = match trace.map(Propagation::pebble).transpose() {
+        Ok(trace) => trace,
+        Err(error) => {
+            return Execution::of(Executed::FailedOpen(format!(
+                "agent hook trace context: {error}"
+            )));
+        }
     };
     let Some(env) = env else {
         return Execution::of(Executed::Unsupported(
@@ -525,18 +554,19 @@ async fn agent_hook(
         return Execution::of(Executed::FailedOpen(ROUNDS_EXHAUSTED.into()));
     };
     let work = AgentWork {
-        permissions:  context.permissions,
-        client:       client.clone(),
-        env:          env.clone(),
-        model:        model.unwrap_or(DEFAULT_MODEL).to_owned(),
+        permissions: context.permissions,
+        client: client.clone(),
+        env: env.clone(),
+        model: model.unwrap_or(DEFAULT_MODEL).to_owned(),
         instructions: format!(
             "{EVALUATOR_SYSTEM}\n\n{}\n\nWhen you have decided, reply with only a JSON object: \
              {{\"ok\": true}} or {{\"ok\": false, \"reason\": \"...\"}}. You may use at most \
              {max_tool_rounds} tool rounds.",
             evaluator_message(prompt, context)
         ),
-        rounds:       usize::try_from(rounds).unwrap_or(usize::MAX),
-        budget:       hook.timeout(),
+        rounds: usize::try_from(rounds).unwrap_or(usize::MAX),
+        budget: hook.timeout(),
+        trace,
     };
     // The agent and its tool belong to a task of their own, not to this
     // future: the driver drops the awaiting callback on a root kill, and a
@@ -626,6 +656,8 @@ struct AgentWork {
     rounds:       usize,
     /// The hook's timeout: the whole of environment, agent start and prompt.
     budget:       Duration,
+    /// The parent the agent's spans go beneath: the hook's span.
+    trace:        Option<TraceContext>,
 }
 
 /// Why a prompt did not run to its end.
@@ -744,11 +776,15 @@ impl AgentWork {
             PebbleEnvironment::prepare(self.env.clone(), cancel.clone(), kill.clone())
                 .await
                 .map_err(|e| format!("agent hook environment: {e}"))?;
-        CodingAgent::builder(self.client.0.clone(), Arc::new(environment))
+        let mut builder = CodingAgent::builder(self.client.0.clone(), Arc::new(environment))
             .model(&self.model)
             .options(CodingAgentOptions::default().with_max_tool_rounds(self.rounds))
             .permission_level(permissions::pebble(self.permissions))
-            .event_sink(events)
+            .event_sink(events);
+        if let Some(trace) = self.trace.clone() {
+            builder = builder.trace_context(trace);
+        }
+        builder
             .build()
             .await
             .map_err(|e| format!("agent hook could not start: {e}"))

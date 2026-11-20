@@ -30,7 +30,7 @@ use ir::{Outcome, ScopeId, StepKindId, Value};
 use serde::Deserialize;
 use steps::{Step, StepCtx};
 
-use crate::hooks::{BLOCKED_CLASS, record_report, view_of};
+use crate::hooks::{BLOCKED_CLASS, record_report, step_identity, view_of};
 use crate::outcome::Stage;
 use crate::pebble::PebbleClient;
 use crate::{checkout, fallback, permissions};
@@ -267,6 +267,7 @@ async fn start_hooks(
                 outcome: None,
                 routes: Vec::new(),
                 payload,
+                identity: step_identity(ctx),
             })
             .await;
         record_report(

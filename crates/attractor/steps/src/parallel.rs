@@ -66,7 +66,7 @@ use smol_str::SmolStr;
 use steps::{Step, StepCtx};
 
 use crate::blobs::{self, BlobStore, OutputStore};
-use crate::hooks::{record_report, step_view};
+use crate::hooks::{record_report, step_identity, step_view};
 use crate::permissions;
 use crate::stage::record;
 use crate::workflow::ChildInvoker;
@@ -753,17 +753,18 @@ async fn parallel_start(ctx: &StepCtx, config: &ForkConfig) {
     let report = handle
         .0
         .run(HookRequest {
-            point:   HookPoint::ForkStarted,
-            view:    Some(step_view(
+            point:    HookPoint::ForkStarted,
+            view:     Some(step_view(
                 ctx,
                 "parallel",
                 &config.label,
                 &config.kv,
                 permissions::effective(config.permissions, ctx),
             )),
-            outcome: None,
-            routes:  Vec::new(),
-            payload: Value::Null,
+            outcome:  None,
+            routes:   Vec::new(),
+            payload:  Value::Null,
+            identity: step_identity(ctx),
         })
         .await;
     record_report(
@@ -796,17 +797,18 @@ pub async fn parallel_complete(
     let report = handle
         .0
         .run(HookRequest {
-            point:   HookPoint::ForkCompleted,
-            view:    Some(step_view(
+            point:    HookPoint::ForkCompleted,
+            view:     Some(step_view(
                 ctx,
                 "fan_in",
                 label,
                 &Value::Null,
                 permissions::effective(fork_permissions, ctx),
             )),
-            outcome: None,
-            routes:  Vec::new(),
-            payload: serde_json::to_value(payload).unwrap_or(Value::Null),
+            outcome:  None,
+            routes:   Vec::new(),
+            payload:  serde_json::to_value(payload).unwrap_or(Value::Null),
+            identity: step_identity(ctx),
         })
         .await;
     record_report(

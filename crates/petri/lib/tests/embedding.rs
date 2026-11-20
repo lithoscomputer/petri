@@ -509,6 +509,7 @@ impl HookService for FakeHooks {
                 duration_ms: Some(3),
                 message:     None,
                 usage:       None,
+                trace:       None,
             });
         }
         report

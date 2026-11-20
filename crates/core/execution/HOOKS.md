@@ -22,7 +22,13 @@ pub trait HookService: Send + Sync {
 its `meta`, visit, attempt, inputs, run context, `BranchRole`), the outcome
 where one exists, the selected routes at `RouteSelected`, and an opaque
 `payload` for the points that carry one (the tool boundary, `ScopeReady`,
-`ForkCompleted`, the two run-level points). `HookReport` carries the
+`ForkCompleted`, the two run-level points), and the `ExecutionIdentity` the
+point runs in when the caller knows it: the adapter always does, a step that
+asks a point itself passes its own, which a driver outside the coordinator
+lacks, and the run-level points carry none. With the view's firing and
+attempt the identity names the step attempt's span in the run's trace
+(`execution::StepTrace`, `EVENTS.md`, "Trace context"), which a hook that
+calls a model sends its requests beneath. `HookReport` carries the
 decision, one `HookRun` per hook that ran or could not run (`executed`,
 `skipped`, `failed_open`, `unsupported`) with what the hook's own model and
 tool work cost (`HookUsage`: requests made, tool calls started, the
@@ -210,7 +216,12 @@ siblings produce two effects, and a reissued routing decision produces one.
 Every non-silent report is recorded as a `hook` note on the firing, so it is in
 the engine log, replayed, and visible in the public event stream as a
 `step.progress.recorded` whose `parsed.note.kind` is `hook`. The note carries the point, the decision, each hook's
-name, state, duration, message and usage, and the fail-open warnings.
+name, state, duration, message, usage and `trace`, and the fail-open
+warnings. `HookRun::trace` (`execution::ChildSpan`: `trace_id`, `span_id`,
+`parent_span_id`) is the span a prompt or agent hook run for a step sent its
+model requests under: a fresh random span beneath the step attempt's, one
+per hook run, since one attempt may run a hook many times (a tool hook per
+tool call).
 Executed hooks and hooks that could not run are told apart by
 `HookRun::state`.
 

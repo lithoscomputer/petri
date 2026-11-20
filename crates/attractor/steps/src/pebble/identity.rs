@@ -25,8 +25,8 @@
 //! run's trace ([`execution::StepTrace`]) and the baggage entries
 //! [`RUN_ID_BAGGAGE`] (the run key) and [`RUN_STEP_BAGGAGE`] (the node's
 //! instance name). An agent node hands both to its Pebble session
-//! ([`trace_context`]), which sends a `traceparent` naming its own span per
-//! model request and per tool call beneath the step's, and adds its
+//! ([`Propagation::pebble`]), which sends a `traceparent` naming its own span
+//! per model request and per tool call beneath the step's, and adds its
 //! `session_id` and `tool_call_id` to the baggage. A prompt node's one call
 //! goes through no session, so its client sends the step's own
 //! `traceparent` and `baggage` ([`prompt_client`]). Without the
@@ -80,30 +80,57 @@ pub(crate) fn client(client: &Client, ctx: &StepCtx) -> Result<Client, lithos_ll
     client.with_default_headers(headers(ctx))
 }
 
-/// The step attempt's span and its baggage entries, unencoded, when the
-/// coordinator named the run.
-fn trace(ctx: &StepCtx) -> Option<(StepTrace, [(&'static str, String); 2])> {
-    let identity = ctx.capability::<ExecutionIdentity>()?;
-    Some((StepTrace::of(&identity, ctx.firing, ctx.attempt), [
-        (RUN_ID_BAGGAGE, identity.run.as_str().to_owned()),
-        (RUN_STEP_BAGGAGE, ctx.node.to_string()),
-    ]))
+/// The trace context a stage's requests carry: the `traceparent` of the
+/// span they go beneath, and the run and the step for the baggage.
+pub struct Propagation {
+    traceparent: String,
+    run:         String,
+    step:        String,
 }
 
-/// The parent an agent node's Pebble session opens its spans under: the
-/// step's span, with the run and the step in baggage. `None` outside the
-/// coordinator.
-pub(crate) fn trace_context(ctx: &StepCtx) -> Option<Result<TraceContext, TraceContextError>> {
-    let (trace, baggage) = trace(ctx)?;
-    Some(
-        TraceContext::from_traceparent(&trace.traceparent()).and_then(|context| {
-            baggage
-                .into_iter()
-                .try_fold(context, |context, (key, value)| {
-                    context.with_baggage(key, &value)
-                })
-        }),
-    )
+impl Propagation {
+    /// Beneath `traceparent`, for the step `step` of the run `run`.
+    pub fn new(traceparent: String, run: &str, step: &str) -> Self {
+        Self {
+            traceparent,
+            run: run.to_owned(),
+            step: step.to_owned(),
+        }
+    }
+
+    /// Beneath the step attempt's own span. `None` outside the
+    /// coordinator, which names the run.
+    pub(crate) fn of_step(ctx: &StepCtx) -> Option<Self> {
+        let identity = ctx.capability::<ExecutionIdentity>()?;
+        let trace = StepTrace::of(&identity, ctx.firing, ctx.attempt);
+        Some(Self::new(
+            trace.traceparent(),
+            identity.run.as_str(),
+            &ctx.node,
+        ))
+    }
+
+    fn baggage(&self) -> [(&'static str, &str); 2] {
+        [(RUN_ID_BAGGAGE, &self.run), (RUN_STEP_BAGGAGE, &self.step)]
+    }
+
+    /// `traceparent` and `baggage`, for a call made outside any Pebble
+    /// session.
+    pub(crate) fn headers(&self) -> [(&'static str, String); 2] {
+        [
+            (TRACEPARENT_HEADER, self.traceparent.clone()),
+            (BAGGAGE_HEADER, baggage_header(&self.baggage())),
+        ]
+    }
+
+    /// The parent a Pebble session opens its spans under, with the run and
+    /// the step in its baggage.
+    pub(crate) fn pebble(&self) -> Result<TraceContext, TraceContextError> {
+        self.baggage().into_iter().try_fold(
+            TraceContext::from_traceparent(&self.traceparent)?,
+            |context, (key, value)| context.with_baggage(key, value),
+        )
+    }
 }
 
 /// A prompt node's client: the stage's identity headers, and the step's own
@@ -111,16 +138,15 @@ pub(crate) fn trace_context(ctx: &StepCtx) -> Option<Result<TraceContext, TraceC
 /// node and its model call.
 pub(crate) fn prompt_client(client: &Client, ctx: &StepCtx) -> Result<Client, lithos_llm::Error> {
     let mut headers = headers(ctx);
-    if let Some((trace, baggage)) = trace(ctx) {
-        headers.push((TRACEPARENT_HEADER, trace.traceparent()));
-        headers.push((BAGGAGE_HEADER, baggage_header(&baggage)));
+    if let Some(propagation) = Propagation::of_step(ctx) {
+        headers.extend(propagation.headers());
     }
     client.with_default_headers(headers)
 }
 
 /// A W3C `baggage` value: `key=value` entries joined by `,`, each value
 /// percent-encoded outside the baggage octets (and `%` itself).
-fn baggage_header(entries: &[(&str, String)]) -> String {
+fn baggage_header(entries: &[(&str, &str)]) -> String {
     let mut header = String::new();
     for (key, value) in entries {
         if !header.is_empty() {
@@ -171,8 +197,8 @@ mod tests {
     fn a_baggage_value_encodes_the_baggage_delimiters() {
         assert_eq!(
             baggage_header(&[
-                ("run_id", "01JDQ7ZK3V8Y2M4N6P8R0T2W4X".to_owned()),
-                ("run_step", "a,b;c=\"d\\ é%#2".to_owned()),
+                ("run_id", "01JDQ7ZK3V8Y2M4N6P8R0T2W4X"),
+                ("run_step", "a,b;c=\"d\\ é%#2"),
             ]),
             "run_id=01JDQ7ZK3V8Y2M4N6P8R0T2W4X,run_step=a%2Cb%3Bc=%22d%5C%20%C3%A9%25#2"
         );

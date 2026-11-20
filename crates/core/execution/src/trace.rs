@@ -79,6 +79,41 @@ impl StepTrace {
     pub fn traceparent(&self) -> String {
         format!("00-{}-{}-01", self.trace_id, self.span_id)
     }
+
+    /// A fresh span beneath this one, for work the step has done outside a
+    /// Pebble session of its own (a hook that calls a model). Its ID is
+    /// random, not derived: one attempt may run the same hook many times
+    /// (a tool hook per tool call), so the span is recorded where the work
+    /// is reported rather than recomputed.
+    pub fn child(&self) -> ChildSpan {
+        let mut span = [0; 8];
+        // A failed OS random source leaves zeros, which `nonzero` turns into
+        // a valid ID; the record still names the span it sent.
+        let _ = getrandom::fill(&mut span);
+        ChildSpan {
+            trace_id:       self.trace_id.clone(),
+            span_id:        hex(&nonzero::<8>(span)),
+            parent_span_id: self.span_id.clone(),
+        }
+    }
+}
+
+/// A span beneath a step attempt's, as lowercase hex.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ChildSpan {
+    /// The run's trace.
+    pub trace_id:       String,
+    /// This span.
+    pub span_id:        String,
+    /// The step attempt's span ([`StepTrace::span_id`]).
+    pub parent_span_id: String,
+}
+
+impl ChildSpan {
+    /// The `traceparent` header naming this span as the parent.
+    pub fn traceparent(&self) -> String {
+        format!("00-{}-{}-01", self.trace_id, self.span_id)
+    }
 }
 
 /// The leading `N` bytes of a digest; W3C forbids an all-zero ID, so that
@@ -123,6 +158,20 @@ mod tests {
         assert_eq!(
             trace.traceparent(),
             "00-6a83a73da1129431875b9c1d1105e0a3-1e5230205362b186-01"
+        );
+    }
+
+    #[test]
+    fn a_child_span_is_a_fresh_span_beneath_its_step() {
+        let step = step("run", 3, 1);
+        let (first, second) = (step.child(), step.child());
+        assert_eq!(first.trace_id, step.trace_id);
+        assert_eq!(first.parent_span_id, step.span_id);
+        assert_ne!(first.span_id, step.span_id);
+        assert_ne!(first.span_id, second.span_id);
+        assert_eq!(
+            first.traceparent(),
+            format!("00-{}-{}-01", step.trace_id, first.span_id)
         );
     }
 

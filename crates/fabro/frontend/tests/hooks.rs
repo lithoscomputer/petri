@@ -27,10 +27,11 @@ use execution::hooks::{
 use execution::host::{self, HostRun};
 use frontend::{CompileInputs, Lowered, MapFiles};
 use ir::{Graph, RunStatus, StepEvent, Value};
+use lithos_llm::middleware::{Call, Middleware, Next, Operation, Output};
 use lithos_llm::types::{ErrorKind, Message, Role, Speed};
 use pebble_coding_agent::test_support::{
     ScriptedCall, ScriptedCompletion, ScriptedFailure, ScriptedProvider, client_from, message_text,
-    text_response, tool_call_response,
+    scripted_client_builder, text_response, tool_call_response,
 };
 use runtime::driver::lifecycle::Note;
 use runtime::driver::{EventObserver, ExecutionReport};
@@ -334,6 +335,7 @@ impl HookService for HostService {
                 duration_ms: Some(1),
                 message:     None,
                 usage:       None,
+                trace:       None,
             });
         }
         report
@@ -1260,6 +1262,210 @@ script = "echo tool-guard-ran >> tool-hooks.log"
         .expect("the hook note on b");
     let payload = &hook_note.note().expect("a note").payload;
     assert_eq!(payload["hooks"][0]["usage"]["requests"], 2);
+}
+
+/// One model call: its operation, its `traceparent` and its `baggage`.
+type TracedCall = (Operation, Option<String>, Option<String>);
+
+/// Every model call the client made, in order.
+#[derive(Default)]
+struct TraceHeaders(Mutex<Vec<TracedCall>>);
+
+#[async_trait::async_trait]
+impl Middleware for TraceHeaders {
+    async fn handle(&self, call: Call, next: Next) -> Result<Output, lithos_llm::Error> {
+        let headers = call.context().default_headers();
+        let header = |name: &str| {
+            headers
+                .get(name)
+                .map(|value| value.to_str().unwrap_or_default().to_owned())
+        };
+        let seen = (call.operation(), header("traceparent"), header("baggage"));
+        self.0.lock().expect("not poisoned").push(seen);
+        next.run(call).await
+    }
+}
+
+/// The trace ID and span ID of a W3C version 00 `traceparent` with the
+/// sampled flag.
+fn traceparent_ids(value: &str) -> (String, String) {
+    let parts: Vec<&str> = value.split('-').collect();
+    assert!(
+        parts.len() == 4
+            && parts[0] == "00"
+            && parts[1].len() == 32
+            && parts[2].len() == 16
+            && parts[3] == "01",
+        "a traceparent: {value}"
+    );
+    (parts[1].to_owned(), parts[2].to_owned())
+}
+
+/// Prompt and agent hooks send their model requests beneath a span of their
+/// own, under the step attempt they run for, with the run and the step in
+/// baggage: a prompt hook names its span itself, an agent hook's Pebble
+/// session opens its request spans beneath it. Each hook's run records its
+/// span. Both the points the driver asks (`stage_start`) and the points the
+/// stage asks itself (`pre_tool_use`) are covered.
+#[tokio::test]
+async fn prompt_and_agent_hooks_send_trace_context_under_their_step() {
+    let dir = RunDir::new("hooks-trace");
+    let provider = ScriptedProvider::new(vec![
+        // The agent hook's verdict, then the stage's own two rounds.
+        ScriptedCall::response(text_response(r#"{"ok": true}"#)),
+        ScriptedCall::response(tool_call_response(
+            "shell",
+            "look",
+            json!({"command": "true"}),
+        )),
+        ScriptedCall::response(text_response("Done.")),
+    ])
+    .completing(vec![
+        ScriptedCompletion::response(text_response(r#"{"ok": true}"#)),
+        ScriptedCompletion::response(text_response(r#"{"ok": true}"#)),
+    ]);
+    let recorded = Arc::new(TraceHeaders::default());
+    let (builder, _) = scripted_client_builder(provider);
+    let client = builder
+        .middleware_arc(recorded.clone())
+        .build()
+        .expect("the client builds")
+        .client;
+    let graph = lower(
+        r#"digraph W {
+        graph [backend="api", default_model="test/model"]
+        start [shape=Mdiamond]
+        exit [shape=Msquare]
+        a [prompt="Look around."]
+        start -> a -> exit
+    }"#,
+        r#"
+[[run.hooks]]
+name = "judge"
+event = "stage_start"
+matcher = "^a$"
+prompt = "Should this stage proceed?"
+model = "test/model"
+
+[[run.hooks]]
+name = "verify"
+event = "stage_start"
+matcher = "^a$"
+agent = "enabled"
+prompt = "Decide."
+model = "test/model"
+max_tool_rounds = 2
+
+[[run.hooks]]
+name = "tool-judge"
+event = "pre_tool_use"
+prompt = "May this tool run?"
+model = "test/model"
+"#,
+    );
+    let (report, customs) = run_replayable(&dir, graph, Some(client)).await;
+    assert_eq!(
+        report.status,
+        RunStatus::Success,
+        "{:?}",
+        report.state.errors()
+    );
+
+    // The run's trace and `a`'s span, from the public stream.
+    let events: Vec<Value> = replay_run_dir(dir.path())
+        .await
+        .expect("replays")
+        .iter()
+        .map(|event| serde_json::to_value(event).expect("an event"))
+        .collect();
+    let run_key = events
+        .iter()
+        .find(|e| e["record"]["body"]["event"] == "run.started")
+        .and_then(|e| e["record"]["body"]["key"].as_str())
+        .expect("run.started")
+        .to_owned();
+    let step = events
+        .iter()
+        .find(|e| {
+            e["record"]["body"]["event"] == "step.started" && e["subject"]["node"]["name"] == "a"
+        })
+        .map(|e| e["derived"]["trace"].clone())
+        .expect("a's step.started");
+    let (trace_id, step_span) = (
+        step["trace_id"].as_str().expect("trace").to_owned(),
+        step["span_id"].as_str().expect("span").to_owned(),
+    );
+
+    // Each hook's span, as its run records it: beneath the step's.
+    let stage_start = customs
+        .hook_notes()
+        .into_iter()
+        .find(|(n, r)| n == "a" && r["point"] == "before_attempt")
+        .map(|(_, r)| r)
+        .expect("a's stage_start report");
+    let pre_tool = customs
+        .reports()
+        .into_iter()
+        .find(|(n, e)| n == "a" && e["event"] == "pre_tool_use")
+        .map(|(_, e)| e["report"].clone())
+        .expect("a's pre_tool_use report");
+    let span_of = |run: &Value| {
+        let trace = &run["trace"];
+        assert_eq!(trace["trace_id"], trace_id.as_str(), "{run}");
+        assert_eq!(trace["parent_span_id"], step_span.as_str(), "{run}");
+        trace["span_id"].as_str().expect("a span").to_owned()
+    };
+    let (judge, verify, tool_judge) = (
+        span_of(&stage_start["hooks"][0]),
+        span_of(&stage_start["hooks"][1]),
+        span_of(&pre_tool["hooks"][0]),
+    );
+    assert_eq!(stage_start["hooks"][1]["name"], "verify");
+    assert!(judge != verify && judge != tool_judge && verify != tool_judge);
+
+    // On the wire, in order: the prompt hook, the agent hook, the stage's
+    // first round, the tool hook, the stage's second round.
+    let calls = recorded.0.lock().expect("not poisoned").clone();
+    let operations: Vec<Operation> = calls.iter().map(|(operation, ..)| *operation).collect();
+    assert_eq!(operations, [
+        Operation::Complete,
+        Operation::Stream,
+        Operation::Stream,
+        Operation::Complete,
+        Operation::Stream,
+    ]);
+    let baggage = format!("run_id={run_key},run_step=a");
+    for (index, span) in [(0, &judge), (3, &tool_judge)] {
+        assert_eq!(
+            (calls[index].1.as_deref(), calls[index].2.as_deref()),
+            (
+                Some(format!("00-{trace_id}-{span}-01").as_str()),
+                Some(baggage.as_str())
+            ),
+            "call {index}"
+        );
+    }
+    // The agent hook's request names its Pebble request span, which the
+    // hook's own activity records beneath the hook's span.
+    let (call_trace, request_span) = traceparent_ids(calls[1].1.as_deref().expect("a traceparent"));
+    assert_eq!(call_trace, trace_id);
+    assert!(
+        calls[1]
+            .2
+            .as_deref()
+            .is_some_and(|b| b.starts_with(&format!("{baggage},session_id="))),
+        "{:?}",
+        calls[1].2
+    );
+    let request = customs
+        .hook_activity()
+        .into_iter()
+        .map(|(_, activity)| activity["envelope"].clone())
+        .find(|envelope| envelope["event"].get("LlmRequestStarted").is_some())
+        .expect("the hook agent's request");
+    assert_eq!(request["trace_id"], trace_id.as_str());
+    assert_eq!(request["span_id"], request_span.as_str());
+    assert_eq!(request["parent_span_id"], verify.as_str());
 }
 
 /// A stage that runs its own native agent, guarded by an agent hook: the
