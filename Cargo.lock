@@ -1667,6 +1667,7 @@ name = "petri-execution"
 version = "0.1.0"
 dependencies = [
  "async-trait",
+ "getrandom 0.3.4",
  "petri-driver",
  "petri-engine",
  "petri-executor",

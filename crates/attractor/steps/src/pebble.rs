@@ -198,7 +198,8 @@ impl NativeSession {
             .map_err(|e| AgentError::failed("pebble_config", chain(&e)))?;
         let identity_headers = identity::headers(ctx);
         // The step's span, the parent of every span the session opens.
-        let trace_context = identity::trace_context(ctx)
+        let trace_context = identity::Propagation::of_step(ctx)
+            .map(|propagation| propagation.pebble())
             .transpose()
             .map_err(|e| AgentError::failed("pebble_config", chain(&e)))?;
         if config.acp.is_some() {
@@ -319,13 +320,7 @@ impl NativeSession {
         let provider = questions.clone();
         let tool_hooks = hook_service.map(|handle| {
             let view = hooks::step_view(ctx, "agent", &config.label, &config.kv, level);
-            let binding = hooks::ToolHookBinding::new(
-                handle.0.clone(),
-                view,
-                ctx.node.clone(),
-                ctx.firing,
-                ctx.attempt,
-            );
+            let binding = hooks::ToolHookBinding::new(handle.0.clone(), view, ctx);
             Arc::new(ToolHooks::new(binding, ctx.logs.clone()))
         });
         let mcps = if full_access {

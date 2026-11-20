@@ -250,9 +250,12 @@ the source run's.
 
 The attractor steps send this context on their model and MCP requests
 (`crates/attractor/FORMAT.md`, "Native Pebble"). A Pebble session opens its
-own span per model request and per tool call beneath the step's span and
+own span per model request and per tool call beneath the step's span (a
+prompt or agent hook's beneath the hook's own span, a child of the step's
+recorded on the hook's run; `HOOKS.md`, "Recording") and
 records it on its events (`trace_id`, `span_id`, and `parent_span_id`, the
-step's span, on the backend envelope's `event`); a prompt node's call names the step's span itself.
+span it was opened beneath, on the backend envelope's `event`); a prompt
+node's call names the step's span itself.
 
 ## Source metadata
 

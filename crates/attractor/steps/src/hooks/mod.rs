@@ -39,8 +39,9 @@ use execution::hooks::{
     HookPoint, HookReport, HookRequest, HookRun, HookService, RunFinishedPayload,
     ScopeReleasedPayload,
 };
+use execution::{ExecutionIdentity, StepTrace};
 use executor::ExecEnv;
-use frontend_attractor::hooks::{HookDefinition, HookEvent};
+use frontend_attractor::hooks::{HookDefinition, HookEvent, HookKind};
 use frontend_attractor::kinds::GOAL_CHECK_NODE;
 use ir::{EdgeId, Outcome, RunStatus, Status, Value};
 use runtime::driver::lifecycle::Note;
@@ -52,6 +53,7 @@ use smol_str::SmolStr;
 
 use crate::outcome::reported_outcome;
 use crate::pebble::PebbleClient;
+use crate::pebble::identity::Propagation;
 use crate::stage::{RunInfo, ScopeEnvironments};
 
 /// The `kind` of the `StepEvent::Custom` payload a report a step asked for
@@ -203,27 +205,28 @@ pub struct ToolPayload {
 /// and warning is attributed to. Both agent backends ask through one: the
 /// native agent's tool middleware ([`tools::ToolHooks`]) and the ACP client.
 pub(crate) struct ToolHookBinding {
-    service: Arc<dyn HookService>,
-    view:    Arc<FiringView>,
-    node:    SmolStr,
-    firing:  ir::FiringId,
-    attempt: ir::Attempt,
+    service:  Arc<dyn HookService>,
+    view:     Arc<FiringView>,
+    node:     SmolStr,
+    firing:   ir::FiringId,
+    attempt:  ir::Attempt,
+    identity: Option<ExecutionIdentity>,
 }
 
 impl ToolHookBinding {
+    /// The binding of the step `ctx` runs, asking about `view`.
     pub(crate) fn new(
         service: Arc<dyn HookService>,
         view: Arc<FiringView>,
-        node: SmolStr,
-        firing: ir::FiringId,
-        attempt: ir::Attempt,
+        ctx: &steps::StepCtx,
     ) -> Self {
         Self {
             service,
             view,
-            node,
-            firing,
-            attempt,
+            node: ctx.node.clone(),
+            firing: ctx.firing,
+            attempt: ctx.attempt,
+            identity: step_identity(ctx),
         }
     }
 
@@ -243,6 +246,7 @@ impl ToolHookBinding {
                 outcome: None,
                 routes: Vec::new(),
                 payload: serde_json::to_value(&payload).unwrap_or(Value::Null),
+                identity: self.identity.clone(),
             })
             .await;
         record_report(
@@ -312,6 +316,42 @@ pub struct LocalHooks {
     client:  Mutex<Option<PebbleClient>>,
     envs:    ScopeEnvironments,
     http:    executors::HttpClients,
+}
+
+/// The execution a step runs in, for a hook request the step makes itself.
+/// `None` outside the coordinator.
+pub(crate) fn step_identity(ctx: &steps::StepCtx) -> Option<ExecutionIdentity> {
+    ctx.capability::<ExecutionIdentity>()
+        .map(|identity| (*identity).clone())
+}
+
+/// The step attempt a request's hooks run for, in its run's trace.
+#[derive(Clone)]
+struct StepSpan {
+    trace: StepTrace,
+    run:   String,
+    node:  String,
+}
+
+impl StepSpan {
+    /// The span a request names: its execution with its view's firing and
+    /// attempt. `None` for a run-level point or a caller that does not know
+    /// its execution.
+    fn of(request: &HookRequest) -> Option<Self> {
+        let identity = request.identity.as_ref()?;
+        let view = request.view.as_deref()?;
+        Some(Self {
+            trace: StepTrace::of(identity, view.firing, view.attempt),
+            run:   identity.run.as_str().to_owned(),
+            node:  view.node_name().to_owned(),
+        })
+    }
+}
+
+tokio::task_local! {
+    /// The step attempt the request being served runs for, so a prompt or
+    /// agent hook sends its model requests beneath that step's span.
+    static STEP_SPAN: Option<StepSpan>;
 }
 
 tokio::task_local! {
@@ -501,6 +541,7 @@ impl LocalHooks {
                             .into(),
                     ),
                     usage:       None,
+                    trace:       None,
                 });
             }
             return (Decision::Proceed, report);
@@ -512,8 +553,23 @@ impl LocalHooks {
             .unwrap_or_else(PoisonError::into_inner)
             .clone();
         let mut merged = Decision::Proceed;
+        let step = STEP_SPAN.try_with(Clone::clone).ok().flatten();
         for hook in matched {
             let started = Instant::now();
+            // A hook that calls a model gets a span of its own beneath the
+            // step's, recorded on its run.
+            let span = step
+                .as_ref()
+                .filter(|_| {
+                    matches!(
+                        hook.definition.kind,
+                        HookKind::Prompt { .. } | HookKind::Agent { .. }
+                    )
+                })
+                .map(|step| (step.trace.child(), step));
+            let propagation = span
+                .as_ref()
+                .map(|(span, step)| Propagation::new(span.traceparent(), &step.run, &step.node));
             let executors::Execution {
                 outcome: result,
                 usage,
@@ -527,6 +583,7 @@ impl LocalHooks {
                         env.as_ref(),
                         client.as_ref(),
                         &self.http,
+                        propagation.as_ref(),
                     ),
                 )
                 .await;
@@ -549,6 +606,7 @@ impl LocalHooks {
                 duration_ms: Some(duration),
                 message: None,
                 usage,
+                trace: span.map(|(span, _)| span),
             };
             let decision = match result {
                 executors::Executed::Decided(decision) => decision,
@@ -975,6 +1033,23 @@ pub async fn record_report(
 #[async_trait::async_trait]
 impl HookService for LocalHooks {
     async fn run(&self, request: HookRequest) -> HookReport {
+        STEP_SPAN
+            .scope(StepSpan::of(&request), self.serve(request))
+            .await
+    }
+
+    fn configured_hooks(&self, point: HookPoint) -> Vec<String> {
+        events_of(point)
+            .iter()
+            .flat_map(|event| self.hooks_for(*event))
+            .map(|hook| hook.name)
+            .collect()
+    }
+}
+
+impl LocalHooks {
+    /// Serve one request, the step it runs for in scope.
+    async fn serve(&self, request: HookRequest) -> HookReport {
         let Some(view) = request.view.as_deref() else {
             if !self.is_configured() {
                 return HookReport::proceed(request.point);
@@ -1011,14 +1086,6 @@ impl HookService for LocalHooks {
                 self.tool_point(request.point, view, &request.payload).await
             }
         }
-    }
-
-    fn configured_hooks(&self, point: HookPoint) -> Vec<String> {
-        events_of(point)
-            .iter()
-            .flat_map(|event| self.hooks_for(*event))
-            .map(|hook| hook.name)
-            .collect()
     }
 }
 

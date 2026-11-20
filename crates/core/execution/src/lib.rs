@@ -73,4 +73,4 @@ pub use store::{
     CoordinatorStore, StoreError, decode_coordinator_records, encode_record, open_run_dir,
     read_coordinator_log,
 };
-pub use trace::StepTrace;
+pub use trace::{ChildSpan, StepTrace};

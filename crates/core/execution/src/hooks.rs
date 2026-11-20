@@ -43,6 +43,8 @@ use ir::{EdgeId, Outcome, Status, Value};
 use serde::{Deserialize, Serialize};
 use smol_str::SmolStr;
 
+use crate::{ChildSpan, ExecutionIdentity};
+
 /// The note kind the adapter records for every service report.
 pub const HOOK_NOTE_KIND: &str = "hook";
 
@@ -168,6 +170,10 @@ pub struct HookRun {
     /// What the hook's own model and tool work cost, when it did any.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub usage:       Option<HookUsage>,
+    /// The span the hook's model requests were sent under, beneath the
+    /// step attempt's span: a prompt or agent hook run for a step.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub trace:       Option<ChildSpan>,
 }
 
 /// The hook operation an activity record belongs to: the point and the
@@ -278,20 +284,27 @@ pub struct ForkCompletedPayload {
 
 /// What a service is asked about.
 pub struct HookRequest {
-    pub point:   HookPoint,
+    pub point:    HookPoint,
     /// The firing the point belongs to. `None` for the run-level points
     /// (`RunFinished`, `ScopeReleased`), which have no firing. A point a
     /// step asks itself carries the view the step built from its context:
     /// the node, its `meta`, the firing, attempt and scope, and the step's
     /// resolved config.
-    pub view:    Option<Arc<FiringView>>,
+    pub view:     Option<Arc<FiringView>>,
     /// The attempt's outcome (`AfterAttempt`, `AfterVisit`, `RouteSelected`).
-    pub outcome: Option<Outcome>,
+    pub outcome:  Option<Outcome>,
     /// The selected routes (`RouteSelected`), one decision per group.
-    pub routes:  Vec<(u32, RouteDecision)>,
+    pub routes:   Vec<(u32, RouteDecision)>,
     /// Point-specific data a caller at the tool boundary supplies: the tool
     /// name and input, the result. Opaque here.
-    pub payload: Value,
+    pub payload:  Value,
+    /// The run, invocation and execution the point runs in, when the caller
+    /// knows them. With the view's firing and attempt it names the step
+    /// attempt's span in the run's trace ([`crate::StepTrace`]), which a
+    /// hook that calls a model sends its requests beneath. The adapter
+    /// always knows them; a step that asks for itself passes its
+    /// [`ExecutionIdentity`], which a driver outside the coordinator lacks.
+    pub identity: Option<ExecutionIdentity>,
 }
 
 /// The one interface a hook executor implements. The local implementation
@@ -341,6 +354,15 @@ impl HookAdapter {
     }
 }
 
+/// The execution a driver-asked point runs in.
+fn identity(context: &HookContext) -> ExecutionIdentity {
+    ExecutionIdentity {
+        run:        context.run_key.clone(),
+        invocation: context.invocation,
+        execution:  context.execution,
+    }
+}
+
 /// Whether a node is a lowering artifact rather than a stage: the frontend
 /// marked it `synthetic` (a goal check, a parallel branch's delegate node, a
 /// synthetic fan-in). No hook point fires for one; its stage, when it has
@@ -367,7 +389,7 @@ fn step_admits(view: &FiringView) -> bool {
 impl ExecutionHooks for HookAdapter {
     async fn before_attempt(
         &self,
-        _context: &HookContext,
+        context: &HookContext,
         request: AdmitAttempt,
     ) -> AttemptDecision {
         if is_synthetic(&request.view) || step_admits(&request.view) {
@@ -389,6 +411,7 @@ impl ExecutionHooks for HookAdapter {
                     outcome: None,
                     routes: Vec::new(),
                     payload: Value::Null,
+                    identity: Some(identity(context)),
                 })
                 .await;
             notes.extend(report.notes());
@@ -415,7 +438,7 @@ impl ExecutionHooks for HookAdapter {
 
     async fn prepare_result(
         &self,
-        _context: &HookContext,
+        context: &HookContext,
         request: PrepareResult,
     ) -> Result<Prepared, PrepareError> {
         if is_synthetic(&request.view) {
@@ -424,11 +447,12 @@ impl ExecutionHooks for HookAdapter {
         let report = self
             .service
             .run(HookRequest {
-                point:   HookPoint::AfterAttempt,
-                view:    Some(request.view.clone()),
-                outcome: Some(request.outcome.clone()),
-                routes:  Vec::new(),
-                payload: Value::Null,
+                point:    HookPoint::AfterAttempt,
+                view:     Some(request.view.clone()),
+                outcome:  Some(request.outcome.clone()),
+                routes:   Vec::new(),
+                payload:  Value::Null,
+                identity: Some(identity(context)),
             })
             .await;
         let mut prepared = Prepared::unchanged();
@@ -440,18 +464,19 @@ impl ExecutionHooks for HookAdapter {
         Ok(prepared)
     }
 
-    async fn after_record(&self, _context: &HookContext, recorded: Recorded) -> Vec<Note> {
+    async fn after_record(&self, context: &HookContext, recorded: Recorded) -> Vec<Note> {
         if is_synthetic(&recorded.view) {
             return Vec::new();
         }
         let report = self
             .service
             .run(HookRequest {
-                point:   HookPoint::AfterVisit,
-                view:    Some(recorded.view),
-                outcome: Some(recorded.outcome),
-                routes:  Vec::new(),
-                payload: Value::Null,
+                point:    HookPoint::AfterVisit,
+                view:     Some(recorded.view),
+                outcome:  Some(recorded.outcome),
+                routes:   Vec::new(),
+                payload:  Value::Null,
+                identity: Some(identity(context)),
             })
             .await;
         report.notes()
@@ -459,7 +484,7 @@ impl ExecutionHooks for HookAdapter {
 
     async fn transition(
         &self,
-        _context: &HookContext,
+        context: &HookContext,
         transition: Transition,
     ) -> Result<TransitionReport, TransitionError> {
         if is_synthetic(&transition.view) {
@@ -468,15 +493,16 @@ impl ExecutionHooks for HookAdapter {
         let report = self
             .service
             .run(HookRequest {
-                point:   HookPoint::RouteSelected,
-                view:    Some(transition.view),
-                outcome: Some(transition.outcome),
-                routes:  transition
+                point:    HookPoint::RouteSelected,
+                view:     Some(transition.view),
+                outcome:  Some(transition.outcome),
+                routes:   transition
                     .groups
                     .iter()
                     .map(|group| (group.group, group.decision.clone()))
                     .collect(),
-                payload: Value::Null,
+                payload:  Value::Null,
+                identity: Some(identity(context)),
             })
             .await;
         let mut out = TransitionReport {
@@ -534,6 +560,7 @@ impl HookAdapter {
                 outcome: None,
                 routes: Vec::new(),
                 payload: serde_json::to_value(payload).unwrap_or(Value::Null),
+                identity: None,
             })
             .await
     }

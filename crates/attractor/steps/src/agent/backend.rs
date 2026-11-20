@@ -192,9 +192,7 @@ impl Session {
                             &config.kv,
                             permissions::effective(config.permissions, ctx),
                         ),
-                        ctx.node.clone(),
-                        ctx.firing,
-                        ctx.attempt,
+                        ctx,
                     );
                     let hooks = AcpHooks::new(
                         binding,
