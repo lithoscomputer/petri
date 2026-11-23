@@ -17,6 +17,7 @@ use std::time::Duration;
 use attractor_steps::acp::ENVELOPE_KIND;
 use attractor_steps::register;
 use frontend_attractor::load;
+use lithos_llm::types::TokenCounts;
 use runtime::driver::ExecutionReport;
 use runtime::engine::Event;
 use runtime::executor::{MapSecrets, Retention};
@@ -253,7 +254,14 @@ async fn every_session_update_is_recorded_as_the_acp_envelope() {
     assert_eq!(metrics["acp.usage"]["tokens"]["output"], json!(50));
     assert_eq!(metrics["acp.usage"]["tokens"]["reasoning"], json!(5));
     assert_eq!(metrics["acp.usage"]["tokens"]["cache_read"], json!(20));
-    assert_eq!(metrics["acp.usage"]["tokens"]["cache_write"], json!(0));
+    assert_eq!(metrics["acp.usage"]["tokens"]["cache_write"], json!(7));
+    let tokens: TokenCounts =
+        serde_json::from_value(metrics["acp.usage"]["tokens"].clone()).expect("valid token counts");
+    assert_eq!(
+        tokens.long_cache_write, 0,
+        "ACP reports no cache-lifetime split"
+    );
+    assert_eq!(tokens.total(), 182);
     assert_eq!(
         metrics["acp.usage"]["cost"]["usd_micros"],
         json!(12_500),
