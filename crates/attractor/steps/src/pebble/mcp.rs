@@ -27,6 +27,9 @@
 //! under it ([`SSE_PATH`]), where Fabro has always reached one. Pebble
 //! releases the route when the server stops. Secrets in `env` and `headers`
 //! are resolved here, when the servers are named, and never written down.
+//! An `http` server's requests also carry the stage's identity headers
+//! ([`super::identity`]) beneath its configured `headers`: a configured
+//! header of the same name, in any case, is sent instead of the stage's.
 //!
 //! Failure behavior follows Fabro: a server that does not start (a spawn
 //! error, a handshake timeout, a protocol error) is reported by Pebble
@@ -85,18 +88,20 @@ pub(super) struct Prepared {
 /// Map every configured server onto Pebble's, resolving `{"$secret": name}`
 /// values through the run's secret provider now and nowhere else; the
 /// resolved values go into the process or the request and are never written
-/// down.
+/// down. `identity` is the stage's identity headers, added to every `http`
+/// server's headers that do not already name them.
 pub(super) fn pebble_servers(
     servers: &[McpServer],
     env: &dyn ExecEnv,
     secrets: &dyn SecretProvider,
+    identity: &[(&str, String)],
 ) -> Prepared {
     let mut prepared = Prepared {
         servers:     Vec::with_capacity(servers.len()),
         unavailable: Vec::new(),
     };
     for server in servers {
-        match pebble_server(server, env, secrets) {
+        match pebble_server(server, env, secrets, identity) {
             Ok(server) => prepared.servers.push(server),
             Err(error) => prepared
                 .unavailable
@@ -119,6 +124,7 @@ fn pebble_server(
     server: &McpServer,
     env: &dyn ExecEnv,
     secrets: &dyn SecretProvider,
+    identity: &[(&str, String)],
 ) -> Result<PebbleServer, SecretUnavailable> {
     let placement = match &server.transport {
         McpTransport::Stdio { command, env: vars } => McpPlacement::Stdio {
@@ -133,11 +139,19 @@ fn pebble_server(
             protocol,
             url,
             headers,
-        } => McpPlacement::Http {
-            url:      url.clone(),
-            headers:  resolve_values(headers, secrets, "headers")?,
-            protocol: pebble_protocol(*protocol),
-        },
+        } => {
+            let mut headers = resolve_values(headers, secrets, "headers")?;
+            for (name, value) in identity {
+                if !headers.keys().any(|key| key.eq_ignore_ascii_case(name)) {
+                    headers.insert((*name).to_owned(), value.clone());
+                }
+            }
+            McpPlacement::Http {
+                url: url.clone(),
+                headers,
+                protocol: pebble_protocol(*protocol),
+            }
+        }
         McpTransport::Sandbox {
             protocol,
             command,
@@ -235,7 +249,7 @@ mod tests {
     }
 
     fn placement_of(server: &McpServer) -> McpPlacement {
-        let prepared = pebble_servers(slice::from_ref(server), &NoEnv, &MapSecrets::empty());
+        let prepared = pebble_servers(slice::from_ref(server), &NoEnv, &MapSecrets::empty(), &[]);
         assert!(
             prepared.unavailable.is_empty(),
             "{:?}",
@@ -284,6 +298,45 @@ mod tests {
             McpPlacement::Http { protocol, .. } => {
                 assert_eq!(protocol, PebbleProtocol::StreamableHttp);
             }
+            other => panic!("expected an http placement, got {other:?}"),
+        }
+    }
+
+    /// An `http` server gets the stage's identity headers beside its own,
+    /// and a configured header of the same name, in any case, is sent
+    /// instead of the stage's.
+    #[test]
+    fn an_http_server_gets_the_identity_headers_its_configuration_does_not_name() {
+        let remote = server("remote", McpTransport::Http {
+            protocol: McpHttpProtocol::StreamableHttp,
+            url:      "http://127.0.0.1:1/mcp".into(),
+            headers:  BTreeMap::from([
+                (
+                    "X-Petri-Node".to_owned(),
+                    McpValue::Literal("configured".into()),
+                ),
+                ("X-Case".to_owned(), McpValue::Literal("kept".into())),
+            ]),
+        });
+        let identity = [
+            ("x-petri-node", "build#2".to_owned()),
+            ("x-petri-firing", "7".to_owned()),
+        ];
+        let prepared = pebble_servers(
+            slice::from_ref(&remote),
+            &NoEnv,
+            &MapSecrets::empty(),
+            &identity,
+        );
+        match prepared.servers[0].placement() {
+            McpPlacement::Http { headers, .. } => assert_eq!(
+                headers,
+                &BTreeMap::from([
+                    ("X-Case".to_owned(), "kept".to_owned()),
+                    ("X-Petri-Node".to_owned(), "configured".to_owned()),
+                    ("x-petri-firing".to_owned(), "7".to_owned()),
+                ])
+            ),
             other => panic!("expected an http placement, got {other:?}"),
         }
     }

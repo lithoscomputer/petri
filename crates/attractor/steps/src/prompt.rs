@@ -57,7 +57,7 @@ use crate::fidelity::{self, Fidelity, Incoming, Preamble, StageInfo, ThreadConfi
 use crate::outcome::{ExplicitRoutes, Stage};
 use crate::parallel::{BRANCH_COUNT_KEY, RESULTS_KEY, parallel_complete, strip_placeholders};
 use crate::pebble::environment::PebbleEnvironment;
-use crate::pebble::{PebbleClient, profile_of};
+use crate::pebble::{PebbleClient, identity, profile_of};
 use crate::stage::{self, RunInfo};
 
 pub const KIND: StepKindId = PROMPT_KIND;
@@ -293,6 +293,12 @@ impl Step for PromptStep {
                     .into(),
                 "pebble_unconfigured",
             );
+        };
+        // The stage's identity on its model call, as on an agent node's,
+        // and the step's trace context, which no session sends for it.
+        let client = match identity::prompt_client(&client.0, &ctx) {
+            Ok(client) => PebbleClient(client),
+            Err(error) => return fail(error.to_string(), "pebble_config"),
         };
         let contract = match Contract::from_config(config.output_schema.as_ref()) {
             Ok(contract) => contract,

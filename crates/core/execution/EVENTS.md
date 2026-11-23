@@ -14,6 +14,12 @@ The run format moves to 9; version 8 runs are refused, never migrated.
 The engine log remains version 12. Update stream readers and storage
 readers together; do not infer final success from invocation completion.
 
+Added within version 6 on 2026-11-19: a `step.started` event derives
+`trace`, the attempt's place in its run's W3C trace (`trace_id`,
+`span_id`; "Trace context" below). Nothing recorded changes: the value is
+derived from the run key and the event's identity, the same live and on
+replay, so the run format and the engine log keep their versions.
+
 Version 5 (2026-09-26) changes one shape inside a record: a partial
 success's `underlying` (in a `step.finished` record's `outcome.status`) is
 now the whole failure it was converted from, `{"failure": {"message": ...,
@@ -218,6 +224,36 @@ branches with the same target on it, never on the most recent fork it saw.
 The static `BranchRef {fork, index}` beside it names the branch within the
 fork's shape.
 
+### Trace context
+
+Every step attempt is a span in its run's W3C trace (`execution::StepTrace`),
+so a request the step makes can be placed under it by whoever records the
+request. The trace ID is one per run, the first 16 bytes of SHA-256 over
+`petri.trace.v1`, a NUL and the run key. The span ID is one per attempt, the
+first 8 bytes of SHA-256 over `petri.span.v1`, a NUL, the 16 trace ID bytes,
+and `context.invocation`, `context.execution`, `subject.firing` (each a
+big-endian `u64`) and `subject.attempt` (a big-endian `u32`). An ID that
+comes out all zero ends in `01` instead. Both are lowercase hex on the
+`step.started` event's `derived.trace`; read them there rather than
+recomputing them.
+
+They are derived, not minted, so a resumed run keeps its trace and a
+resumed attempt its span with nothing recorded, and replay gives the values
+the live run sent. They are not the run key: a host's key is any string (Fabro
+passes its run ULID; Petri's own keys are not ULIDs), and a trace ID that
+spelled the key would collide with any other producer that did the same. The
+derivation does make the trace computable from the run key, which is not a
+secret either: requests carry it beside the trace, as the `run_id` baggage
+entry. A forked run's copied `step.started` events derive the fork's trace,
+from the fork's key, though the steps ran, and sent their requests, under
+the source run's.
+
+The attractor steps send this context on their model and MCP requests
+(`crates/attractor/FORMAT.md`, "Native Pebble"). A Pebble session opens its
+own span per model request and per tool call beneath the step's span and
+records it on its events (`trace_id`, `span_id`, and `parent_span_id`, the
+step's span, on the backend envelope's `event`); a prompt node's call names the step's span itself.
+
 ## Source metadata
 
 `subject.node.meta` is the frontend's node metadata. The Fabro frontend sets
@@ -278,7 +314,7 @@ where one exists.
 | --- | --- | --- | --- |
 | `execution.started` | external | `Event::ExecutionStarted` | the engine start, flattened: `entry`, `context`, `prior_firings`, `execution_index`, `max_executions`. Nothing derived |
 | `admission.decided` | external | `AdmissionDecided` | `decision_id` (`execution_start`, or `attempt_start {firing, attempt}`, which gives the event its subject), `decision` (`admit`, `skip {outcome}`, `block {reason}`), `trace` (the middleware keys). Nothing derived |
-| `step.started` | external | `StepStarted` | `firing`, `attempt`: the attempt was dispatched to its step. Nothing derived; `wait.state.changed {running}` follows |
+| `step.started` | external | `StepStarted` | `firing`, `attempt`: the attempt was dispatched to its step. Derived: `trace` (`trace_id`, `span_id`), the attempt's span in its run's W3C trace ("Trace context" above); `wait.state.changed {running}` follows |
 | `step.progress.recorded` | external | `StepProgressRecorded` | `firing`, `ev`: a log line (`log {stream, line}`), an artifact (`artifact {name, uri}`) or a step-defined payload (`custom`). Derived: `parsed`, when the payload is a protocol Petri owns (below) |
 | `step.finished` | external | `StepFinished` | `firing`, `attempt`, `outcome` (status, output, `metrics`, context updates, splices). Derived: `final` (whether the engine recorded it as the firing's outcome; a non-final attempt is followed by a retry) and `exhausted` (the retry policy allowed no further attempt while the status was retryable). `retry.scheduled` and `wait.state.changed {awaiting_retry}` follow a non-final attempt |
 | `routing.resolved` | external | `RoutingResolved` | `decision_id` (`route {firing, attempt}`), `groups`: per group the decision (`emit`, `none`, `block {reason}`), the interventions (`override`, `block`, outermost first) and the weighted `draw` (tier, candidates, roll, total) when one happened. Derived: `groups[].target`, the node each decision leads to |
@@ -597,6 +633,12 @@ backend payloads survive the round trip exactly because the workspace's
   the agent does not report are not observable.
 - Agent facts are Pebble's; Petri adds run, invocation, node and attempt
   attribution and does not restate them.
+- A native stage's model and `http` MCP requests carry the same attribution
+  as `x-petri-*` headers (run key, `context.invocation`,
+  `context.execution`, `subject.node.name`, `subject.firing`,
+  `subject.attempt`), so a proxy's record of the exchange joins to these
+  events, and W3C `traceparent` and `baggage` under the step's span
+  ("Trace context"); see `crates/attractor/FORMAT.md`, "Native Pebble".
 - A backend envelope is a custom payload with a string `kind` and an
   `event` **object**. A step's own payload may carry a string `event` (a
   hook report names its hook event); it is not a backend envelope.

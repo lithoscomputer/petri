@@ -19,6 +19,7 @@ mod resource;
 mod secret;
 mod state;
 mod store;
+mod trace;
 pub mod watchdog;
 
 /// The run store seam and the run-directory layout, re-exported for hosts.
@@ -72,3 +73,4 @@ pub use store::{
     CoordinatorStore, StoreError, decode_coordinator_records, encode_record, open_run_dir,
     read_coordinator_log,
 };
+pub use trace::StepTrace;

@@ -1225,7 +1225,7 @@ checksum = "47d9d19d1d6efa0109d2f65ff4c85cddd50bd572e5a00127ab10987290bcefae"
 [[package]]
 name = "lithos-llm"
 version = "0.1.0"
-source = "git+https://github.com/lithoscomputer/lithos-llm?branch=main#decb8f9cfc930700f882b407b545b708de63a96e"
+source = "git+https://github.com/lithoscomputer/lithos-llm?branch=main#e758e7b7291f38c7c825b421f42efd06d26f176f"
 dependencies = [
  "async-trait",
  "futures-core",
@@ -1488,7 +1488,7 @@ dependencies = [
 [[package]]
 name = "pebble-agent"
 version = "0.1.0"
-source = "git+https://github.com/lithoscomputer/pebble.git?branch=main#948e65a7038d3303065673ced3f7f37fa17362c5"
+source = "git+https://github.com/lithoscomputer/pebble.git?branch=w3c-trace-context#6aa3f35213b3974f9d78ac84cdc0b96f1d9b5092"
 dependencies = [
  "async-trait",
  "futures-util",
@@ -1505,7 +1505,7 @@ dependencies = [
 [[package]]
 name = "pebble-coding-agent"
 version = "0.1.0"
-source = "git+https://github.com/lithoscomputer/pebble.git?branch=main#948e65a7038d3303065673ced3f7f37fa17362c5"
+source = "git+https://github.com/lithoscomputer/pebble.git?branch=w3c-trace-context#6aa3f35213b3974f9d78ac84cdc0b96f1d9b5092"
 dependencies = [
  "async-trait",
  "futures-util",
@@ -1679,6 +1679,7 @@ dependencies = [
  "regex",
  "serde",
  "serde_json",
+ "sha2",
  "smol_str",
  "thiserror",
  "tokio",
