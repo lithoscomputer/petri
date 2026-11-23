@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 # Prepare an Amp orb: the locked mise tools, the Rust style guide, a warm
-# Cargo build of the routine test suite, the sandbox plugins, Docker, and
-# the review bundle's Python requirements. Amp runs this on fresh orbs and
-# again on stale snapshots, so every step skips work that is already done.
+# Cargo build of the routine test suite, the sandbox plugins, and Docker.
+# Amp runs this on fresh orbs and again on stale snapshots, so every step
+# skips work that is already done.
 set -euo pipefail
 
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -51,17 +51,17 @@ install_mise() {
 step "mise $mise_version" install_mise
 
 # Amp and orb services start non-interactive login shells, which read
-# ~/.bash_profile. The shims put the locked tools, Cargo's binaries, and the
-# review bundle's Python on PATH there.
+# ~/.bash_profile. The shims put the locked tools and Cargo's binaries on
+# PATH there.
 profile_marker="# petri orb toolchain"
 if ! grep -Fqx "$profile_marker" "$HOME/.bash_profile" 2>/dev/null; then
   cat >>"$HOME/.bash_profile" <<'EOF'
 
 # petri orb toolchain
-export PATH="$HOME/.venvs/fabro-python/bin:$HOME/.local/share/mise/shims:$HOME/.cargo/bin:$HOME/.local/bin:$PATH"
+export PATH="$HOME/.local/share/mise/shims:$HOME/.cargo/bin:$HOME/.local/bin:$PATH"
 EOF
 fi
-export PATH="$HOME/.venvs/fabro-python/bin:$HOME/.local/share/mise/shims:$HOME/.cargo/bin:$HOME/.local/bin:$PATH"
+export PATH="$HOME/.local/share/mise/shims:$HOME/.cargo/bin:$HOME/.local/bin:$PATH"
 
 step "mise tools" bash -c 'mise trust --quiet && mise install --locked --jobs=1'
 
@@ -93,16 +93,6 @@ EOF
   docker image inspect alpine:3.20 >/dev/null 2>&1 || docker pull --quiet alpine:3.20
 }
 step "docker" setup_docker
-
-# The code-review bundle's rule loader imports PyYAML; CI installs the
-# bundle's hash-pinned requirements into a virtual environment first on PATH.
-setup_python() {
-  local venv="$HOME/.venvs/fabro-python"
-  [[ -x "$venv/bin/python" ]] || python3 -m venv "$venv"
-  "$venv/bin/python" -m pip install --quiet --disable-pip-version-check --require-hashes \
-    -r crates/fabro/acceptance/bundles/code-review/.fabro/workflows/code-review/requirements-rules.txt
-}
-step "python requirements" setup_python
 
 step "sandbox plugins" mise run plugins:build
 
