@@ -155,11 +155,12 @@ def tools_turn(message):
     respond(message, {
         "stopReason": "end_turn",
         "usage": {
-            "totalTokens": 175,
+            "totalTokens": 182,
             "inputTokens": 100,
             "outputTokens": 50,
             "thoughtTokens": 5,
             "cachedReadTokens": 20,
+            "cachedWriteTokens": 7,
         },
     })
 

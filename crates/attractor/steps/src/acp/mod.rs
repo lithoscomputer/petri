@@ -606,11 +606,13 @@ impl Client {
         let count = |key: &str| usage.get(key).and_then(Value::as_u64).unwrap_or(0);
         let turn = Usage {
             tokens: TokenCounts {
-                input:       count("inputTokens"),
-                output:      count("outputTokens"),
-                reasoning:   count("thoughtTokens"),
-                cache_read:  count("cachedReadTokens"),
-                cache_write: count("cachedWriteTokens"),
+                input:            count("inputTokens"),
+                output:           count("outputTokens"),
+                reasoning:        count("thoughtTokens"),
+                cache_read:       count("cachedReadTokens"),
+                cache_write:      count("cachedWriteTokens"),
+                // ACP reports cache writes without a cache-lifetime split.
+                long_cache_write: 0,
             },
             cost:   None,
         };
