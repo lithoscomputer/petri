@@ -6,7 +6,8 @@ use std::fmt;
 
 use ir::{
     Attempt, CancelScopeId, Completion, EdgeId, EdgeTransition, EvalError, FiringId, Generation,
-    Graph, Node, NodeId, NodeRecord, Outcome, RunContext, RunStatus, ScopeId, Status, Token, Value,
+    Graph, JoinPolicy, Node, NodeId, NodeRecord, Outcome, RunContext, RunStatus, ScopeId, Status,
+    Token, Value,
 };
 use serde::{Deserialize, Serialize};
 use smol_str::SmolStr;
@@ -1234,6 +1235,63 @@ impl EngineState {
             clone_bindings,
             superseded: false,
         });
+    }
+
+    /// Where a token arriving at an `All` or `Quorum` join waits when it comes
+    /// from a clone of a `for_each` expansion: the bucket that already holds
+    /// tokens from the other clones of the same expansion only, moved to the
+    /// later of the two generations. A clone that took a back edge before the
+    /// collector carries a later generation than its siblings, so without
+    /// this its token and theirs wait apart and the join never fills. `None`
+    /// keeps the token in its own generation. A bucket is moved only to a key
+    /// that is still free, so nothing already parked, fired or retracted is
+    /// touched.
+    pub(crate) fn expansion_join_generation(
+        &mut self,
+        node: NodeId,
+        join: JoinPolicy,
+        token: &Token,
+    ) -> Option<Generation> {
+        if !matches!(join, JoinPolicy::All | JoinPolicy::Quorum { .. }) {
+            return None;
+        }
+        let source = self.graph.edge_source(token.edge)?;
+        let batch = self.expansion_batch(source)?;
+        let buckets = self.pending.get(&node)?;
+        let (&found, _) = buckets.iter().find(|(_, tokens)| {
+            !tokens.contains_key(&token.edge)
+                && tokens.keys().all(|edge| {
+                    let parked = self.graph.edge_source(*edge);
+                    parked != Some(source)
+                        && parked.and_then(|parked| self.expansion_batch(parked)) == Some(batch)
+                })
+        })?;
+        let target = found.max(token.generation);
+        if target == found {
+            return Some(found);
+        }
+        let blocked = buckets.contains_key(&target)
+            || self.fired.contains(&(node, target))
+            || self.forced_entries.contains(&(node, found))
+            || self.deferred.contains(&(node, found))
+            || self.is_admission_retracted(node, target);
+        if blocked {
+            return None;
+        }
+        let buckets = self.pending.get_mut(&node)?;
+        let mut moved = buckets.remove(&found)?;
+        for parked in moved.values_mut() {
+            parked.generation = target;
+        }
+        buckets.insert(target, moved);
+        Some(target)
+    }
+
+    /// The `for_each` expansion batch a clone node came from, if it is one.
+    fn expansion_batch(&self, node: NodeId) -> Option<SpliceBatchId> {
+        self.splice_for_node(node)
+            .filter(|splice| splice.origin == SpliceOrigin::Expansion)
+            .map(|splice| splice.batch)
     }
 
     pub(crate) fn splice_for_node(&self, node: NodeId) -> Option<&AppliedSplice> {

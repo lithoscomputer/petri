@@ -82,6 +82,69 @@ fn for_each_clones_the_node_and_the_collector_waits_for_all_of_them() {
     assert_eq!(clone.meta, json!({ "label": "Deploy" }));
 }
 
+/// A clone that loops back to itself before it reaches the collector still
+/// meets its sibling clones there: the collector's `All` join fires once and
+/// the run ends, instead of the looped clone's token waiting apart from the
+/// others.
+#[test]
+fn a_clone_that_loops_before_the_collector_still_meets_its_siblings() {
+    let mut b = GraphBuilder::new();
+    let scope = ir::ScopeId::new(0);
+    let plan = b.add_step("plan", scope, NOOP);
+    let deploy = b.add_step("deploy", scope, NOOP);
+    let collect = b.add_step("collect", scope, NOOP);
+    let end = b.add_step("end", scope, NOOP);
+
+    let collector = collector_exprs(b.exprs());
+    let items = b.exprs().var("input");
+    let item = b.exprs().var("item");
+    let again = {
+        let e = b.exprs();
+        let output = e.var("output");
+        let zero = e.lit(0);
+        e.binary(ir::BinOp::Eq, output, zero)
+    };
+    b.link(plan, deploy);
+    b.set_join(deploy, JoinPolicy::Any);
+    b.set_budget(deploy, ir::Budget::looped(2));
+    b.select(deploy, vec![
+        Arm::when(deploy, again).with_back(),
+        Arm::always(collect).with_map(collector.indexed),
+    ]);
+    b.set_join(collect, JoinPolicy::All);
+    b.link(collect, end);
+    b.node_mut(deploy).step = StepRef::new(
+        NOOP,
+        json!({ "region": { EXPR_PLACEHOLDER_KEY: item.raw() } }),
+    );
+    parallel_for_each(&mut b, deploy, items, ExpandTarget::Node, None, false);
+    let graph = b.build();
+    validate(&graph).expect("valid");
+
+    let visits = Rc::new(RefCell::new(0));
+    let seen = visits.clone();
+    let mut h = Harness::new(graph).respond_with(move |info| match info.base.as_str() {
+        "plan" => Outcome::success(json!(["us-east", "us-west", "eu"])),
+        // us-west answers 0 on its first visit, so it loops once; every other
+        // visit answers 1 and goes on to the collector.
+        "deploy" if info.config.get("region") == Some(&json!("us-west")) => {
+            *seen.borrow_mut() += 1;
+            Outcome::success(json!(match *seen.borrow() {
+                1 => 0,
+                _ => 1,
+            }))
+        }
+        "deploy" => Outcome::success(json!(1)),
+        _ => Outcome::success(Value::Null),
+    });
+    assert_eq!(h.run(), RunStatus::Success);
+    h.verify_replay();
+    assert_eq!(*visits.borrow(), 2, "us-west looped once");
+    assert_eq!(h.start_count("deploy"), 4);
+    assert_eq!(h.start_count("collect"), 1);
+    assert_eq!(h.start_count("end"), 1);
+}
+
 /// `index` and `item` are bound inside each clone, so the collector can put the
 /// results back in order.
 #[test]

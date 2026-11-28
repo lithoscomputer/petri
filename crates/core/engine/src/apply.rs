@@ -311,6 +311,16 @@ fn on_token(
     if state.is_admission_retracted(target, token.generation) {
         return;
     }
+    // The clones of one `for_each` expansion meet at their collector whatever
+    // loops each took: the join waits in the latest generation among them.
+    let mut token = token;
+    let join = state
+        .graph
+        .node(target)
+        .map_or(JoinPolicy::Any, |node| node.join);
+    if let Some(generation) = state.expansion_join_generation(target, join, &token) {
+        token.generation = generation;
+    }
     let key = (target, token.generation);
     // `Any` fires on the first token; later same-generation tokens are dropped.
     // The same rule stops a satisfied `All` from firing twice.
