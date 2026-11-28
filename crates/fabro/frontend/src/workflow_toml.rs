@@ -1222,13 +1222,16 @@ fn size_mb(value: &toml::Value) -> Option<u64> {
 }
 
 /// The top-level keys Fabro's settings parser accepts; anything else is a
-/// hard error there and here.
+/// hard error there and here. `schedule` is the Fabro platform's: the
+/// scheduler reads it before a scheduled fire (denkhaus/work#1716) and
+/// nothing here does.
 const WORKFLOW_TOML_TOP_LEVEL: &[&str] = &[
     "_version",
     "project",
     "workflow",
     "environments",
     "run",
+    "schedule",
     "cli",
     "server",
     "llm",
@@ -1315,6 +1318,11 @@ const WORKFLOW_TOML_INERT: &[(&str, &str)] = &[
 /// `[run.*]` sections the standalone runner reads but does not act on, each
 /// with why.
 const RUN_SECTIONS_IGNORED: &[(&str, &str)] = &[
+    (
+        "grants",
+        "grants are the Fabro platform's door permissions; the standalone runner opens no \
+         doors",
+    ),
     (
         "working_dir",
         "the working directory is the sandbox workspace the run was given",
